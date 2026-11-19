@@ -22,7 +22,7 @@ from app.local_state import LocalStateStore
 from app.network.guest_client import GuestClient
 from app.network.host_client import HostLocalClient
 from app.network.host_server import HostServer
-from app.replica import ReplicaStore, ReplicaSync
+from app.replica import ReplicaStore, ReplicaSync, build_host_database
 from app.settings import AppSettings, get_windows_autostart, set_windows_autostart
 from app.sync.history_tracker import HistoryTracker
 from app.sync.lock_manager import LockManager
@@ -159,6 +159,42 @@ def _recover_database(db_path: Path,
         return None
 
 
+WAIT_PID_FLAG = "--wait-pid"
+
+
+def _wait_for_previous_instance(argv: list[str]) -> None:
+    """다시 시작한 경우, 앞선 프로세스가 완전히 끝날 때까지 기다린다.
+
+    기다리지 않으면 앞선 프로세스가 아직 쥐고 있는 파이프 이름과 포트를 새
+    프로세스가 잡지 못한다."""
+    if WAIT_PID_FLAG not in argv or sys.platform != "win32":
+        return
+    try:
+        pid = int(argv[argv.index(WAIT_PID_FLAG) + 1])
+        import ctypes
+        SYNCHRONIZE = 0x00100000
+        handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+        if handle:
+            ctypes.windll.kernel32.WaitForSingleObject(handle, 15000)
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except (ValueError, IndexError, OSError):
+        pass
+
+
+def _restart_app(window: MainWindow) -> None:
+    """프로그램을 끄고 같은 방식으로 다시 켠다(역할을 바꾼 뒤)."""
+    import os
+
+    from PySide6.QtCore import QProcess
+    extra = [WAIT_PID_FLAG, str(os.getpid())]
+    if getattr(sys, "frozen", False):
+        program, arguments = sys.executable, extra
+    else:
+        program, arguments = sys.executable, [str(Path(__file__).resolve())] + extra
+    QProcess.startDetached(program, arguments)
+    window._quit_app()
+
+
 def _open_replica() -> ReplicaStore | None:
     """이 PC 에 두는 메모 사본. 열지 못해도 앱은 그대로 쓴다(사본만 없다)."""
     try:
@@ -168,6 +204,7 @@ def _open_replica() -> ReplicaStore | None:
 
 
 def main() -> int:
+    _wait_for_previous_instance(sys.argv)
     # 작업 표시줄 목록이나 바탕 화면 우클릭 메뉴의 '새 메모'로 실행됐는가.
     new_note_cmd = new_note_command(sys.argv)
 
@@ -358,6 +395,32 @@ def main() -> int:
                 # app 에 매달아 둔다(창보다 오래 살아 마지막 변경까지 적는다).
                 ReplicaSync(replica, client,
                             address=f"{choice.host_ip}:{choice.port}", parent=app)
+
+            def _on_takeover(copy_path: str, nickname=choice.nickname):
+                # 공유 PC 를 다시 쓸 수 없을 때, 받아 둔 사본으로 이 PC 가 공유를 잇는다.
+                parent = QApplication.activeModalWidget() or window
+                if not confirm.ask(
+                        parent, i18n.t("copies.btn_takeover"),
+                        i18n.t("copies.takeover_body"),
+                        detail=i18n.t("copies.takeover_detail"),
+                        action=i18n.t("copies.takeover_action"), danger=True):
+                    return
+                try:
+                    build_host_database(Path(copy_path), config.default_db_path(),
+                                        nickname)
+                except (OSError, sqlite3.Error, ValueError) as e:
+                    confirm.notify(
+                        parent, i18n.t("boot.start_failed_title"),
+                        i18n.t("copies.takeover_failed", message=str(e)),
+                        icon=QMessageBox.Critical)
+                    return
+                # 다음 실행부터 이 PC 가 공유 PC 다. 곧바로 다시 시작한다.
+                local_store.state.last_mode = "host"
+                local_store.state.last_host_port = settings.default_port
+                local_store.save()
+                _restart_app(window)
+
+            window.takeoverRequested.connect(_on_takeover)
             client.start()
 
             def _shutdown_guest():

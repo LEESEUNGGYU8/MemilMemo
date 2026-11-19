@@ -90,7 +90,8 @@ def make_window(qapp, tmp_path, monkeypatch):
                          role=role, settings=settings or AppSettings(),
                          replica=replica)
         shown: list[str] = []
-        monkeypatch.setattr(win, "_show_notification", shown.append)
+        monkeypatch.setattr(win, "_show_notification",
+                            lambda text, warn=False: shown.append(text))
         win.shown = shown
         made.append(win)
         return win, client
@@ -124,7 +125,7 @@ def test_copy_is_shown_read_only_until_the_host_answers(make_window, replica):
     assert set(win._notes) == {"a", "b"} and set(win._cards) == {"a", "b"}
     assert "f1" in win._folders
     assert not win._replica_banner.isHidden()
-    assert "사본" in win._replica_banner.text()
+    assert "사본" in win._replica_text.text()
     # 읽기만 한다. 편집을 시작하지 않고 잠금도 청하지 않는다.
     sticky = win._stickies["a"]
     assert sticky._offline
@@ -271,37 +272,34 @@ def test_note_made_public_is_announced(make_window):
                          "민수님이 메모 4개를 공개했습니다."]
 
 
-def test_notice_uses_the_tray_or_the_status_bar(qapp, tmp_path, monkeypatch):
+def test_notice_does_not_depend_on_windows_notifications(qapp, tmp_path, monkeypatch):
+    """Windows 에서 알림을 꺼 둔 PC 에서도 뜨도록, 트레이 풍선을 쓰지 않는다."""
+    from app.ui import toast
+    monkeypatch.setattr(toast, "user_is_busy", lambda: False)
     monkeypatch.setattr(StickyNoteWidget, "bring_to_front",
                         lambda self, *, start_editing=False: None)
     win = MainWindow(client=FakeClient(), local_state=LocalStateStore(tmp_path / "l.json"),
                      role="guest", settings=AppSettings())
 
     class Tray:
-        def __init__(self, visible):
-            self.visible, self.said = visible, []
+        said: list = []
 
         def isVisible(self):
-            return self.visible
+            return True
 
-        def showMessage(self, title, text, *rest):
-            self.said.append((title, text))
+        def showMessage(self, *args):
+            self.said.append(args)
 
         def hide(self):
             pass
 
-    from PySide6.QtWidgets import QSystemTrayIcon
-    monkeypatch.setattr(QSystemTrayIcon, "supportsMessages", staticmethod(lambda: True))
-    win._tray = Tray(visible=True)
+    win._tray = Tray()
     win._show_notification("민수님이 새 메모를 생성했습니다.")
-    assert win._tray.said == [("메밀메모", "민수님이 새 메모를 생성했습니다.")]
-
-    # 트레이 아이콘을 꺼 두었으면 상태줄에 적는다.
-    win._tray = Tray(visible=False)
-    win._show_notification("서연님이 새 메모를 생성했습니다.")
-    assert win._tray.said == []
-    assert win._status.currentMessage() == "서연님이 새 메모를 생성했습니다."
+    assert Tray.said == []
+    assert [t.text() for t in win._toasts.toasts()] == ["민수님이 새 메모를 생성했습니다."]
+    assert win._status.currentMessage() == "민수님이 새 메모를 생성했습니다."
     win._tray = None
+    win._toasts.close_all()
     win._force_quit = True
     win.close()
     win.deleteLater()

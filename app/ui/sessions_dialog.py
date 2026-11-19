@@ -1,3 +1,11 @@
+"""참가자 창: 공유 PC 의 주소와 지금 접속한 사람.
+
+이 창에서 사람이 찾는 것은 둘이다. 다른 PC 에 알려 줄 주소, 그리고 누가 들어와
+있는가. 그래서 주소를 맨 위에 두고 복사 단추를 붙이며, 사람은 접속한 사람과
+지난 접속자로만 나눈다. 연결 확인 주기 같은 내부 값은 적지 않는다.
+
+모양은 메인 창과 같다. 흰 바탕, 옅은 회색 칸, 검은 단추. 사람 표시의 색은 메모
+색에서 가져온다."""
 from __future__ import annotations
 
 from typing import Mapping
@@ -8,7 +16,6 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QScrollArea,
@@ -17,39 +24,44 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import datetime_fmt, i18n
+from .. import config, i18n
 from ..local_state import UserRecord
 from .theme import RoundedScrollBar
 
-
-def _fmt_heartbeat(ms: int) -> str:
-    return datetime_fmt.fmt_heartbeat(ms)
+# 사람 표시에 쓰는 색. 어두운 메모 색과 흰색은 글자가 묻혀 뺀다.
+_AVATAR_COLORS = [c for c in config.COLORS if c not in ("#F5F5F5", "#3A3A3A")]
+_SURFACE = "#FAFBFD"
+_LINE = "#ECECEC"
 
 
 def _avatar_color(nick: str, *, online: bool) -> QColor:
     if not online:
-        return QColor("#B5B5B5")
-    seed = sum(ord(c) for c in nick) if nick else 0
-    hue = (seed * 53 + 23) % 360
-    return QColor.fromHsv(hue, 130, 195)
+        return QColor("#EDEDED")
+    # 글자 자리까지 섞어, 성이 같거나 글자 합이 비슷한 이름이 같은 색으로 몰리지 않게 한다.
+    seed = 0
+    for i, ch in enumerate(nick or ""):
+        seed = (seed * 31 + ord(ch) * (i + 1)) % 100003
+    return QColor(_AVATAR_COLORS[seed % len(_AVATAR_COLORS)])
 
 
-def _avatar_pixmap(nick: str, *, online: bool, size: int = 36) -> QPixmap:
-    pix = QPixmap(size, size)
+def _avatar_pixmap(nick: str, *, online: bool, size: int = 32) -> QPixmap:
+    scale = 2
+    pix = QPixmap(size * scale, size * scale)
     pix.fill(Qt.transparent)
     p = QPainter(pix)
     p.setRenderHint(QPainter.Antialiasing)
     p.setPen(Qt.NoPen)
     p.setBrush(_avatar_color(nick, online=online))
-    p.drawEllipse(0, 0, size, size)
+    p.drawEllipse(0, 0, size * scale, size * scale)
     letter = (nick[0] if nick else "?").upper()
     f = p.font()
     f.setBold(True)
-    f.setPointSizeF(size * 0.42)
+    f.setPixelSize(int(size * scale * 0.44))
     p.setFont(f)
-    p.setPen(QColor("#FFFFFF"))
-    p.drawText(0, 0, size, size, Qt.AlignCenter, letter)
+    p.setPen(QColor("#1F1F1F" if online else "#8A8A8A"))
+    p.drawText(0, 0, size * scale, size * scale, Qt.AlignCenter, letter)
     p.end()
+    pix.setDevicePixelRatio(scale)
     return pix
 
 
@@ -67,23 +79,24 @@ class _SectionLabel(QWidget):
     def __init__(self, title: str, count: int, parent: QWidget | None = None):
         super().__init__(parent)
         row = QHBoxLayout(self)
-        row.setContentsMargins(2, 8, 2, 4)
+        row.setContentsMargins(4, 8, 4, 4)
         row.setSpacing(8)
         lbl = QLabel(title)
-        lbl.setStyleSheet(
-            "font-size: 12px; font-weight: 700; color: #6B6B6B; "
-            "letter-spacing: 0.4px; text-transform: uppercase;")
-        row.addWidget(lbl)
+        lbl.setStyleSheet("font-size: 12px; font-weight: 700; color: #4B5563;")
+        row.addWidget(lbl, 0, Qt.AlignVCenter)
         chip = QLabel(str(count))
         chip.setStyleSheet(
-            "background:#EEEEEE; color:#5B5B5B; "
+            "background: rgba(17, 24, 39, 0.07); color: #4B5563; "
             "border-radius: 9px; padding: 1px 8px; "
             "font-size: 10.5px; font-weight: 700;")
-        row.addWidget(chip)
+        row.addWidget(chip, 0, Qt.AlignVCenter)
         row.addStretch(1)
 
 
 class _UserCard(QFrame):
+    """한 사람. 접속 여부는 묶음(참가자 목록, 지난 접속자)이 알려 주므로 줄마다
+    되풀이해 적지 않는다."""
+
     def __init__(
         self,
         nickname: str,
@@ -91,219 +104,119 @@ class _UserCard(QFrame):
         is_host: bool,
         is_self: bool,
         online: bool,
-        status_text: str,
-        sub_text: str,
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
         self.setObjectName("ParticipantCard")
-        # 본인 행에만 틴트를 적용한다. 호스트는 행 배경 대신 이름 줄의 칩으로만
-        # 표시해, 강조된 행이 두 개가 되지 않도록 한다.
-        tint = "#EFF6FF" if is_self else "#FFFFFF"
         self.setStyleSheet(
             "QFrame#ParticipantCard {"
-            f"  background: {tint};"
-            "  border: 1px solid #ECECEC;"
+            "  background: #FFFFFF;"
+            f"  border: 1px solid {_LINE};"
             "  border-radius: 10px;"
             "}"
         )
         row = QHBoxLayout(self)
-        row.setContentsMargins(12, 10, 14, 10)
-        row.setSpacing(12)
+        row.setContentsMargins(12, 9, 14, 9)
+        row.setSpacing(10)
 
         avatar = QLabel()
-        avatar.setFixedSize(36, 36)
+        avatar.setFixedSize(32, 32)
         avatar.setPixmap(_avatar_pixmap(nickname, online=online))
-        row.addWidget(avatar, 0, Qt.AlignTop)
+        row.addWidget(avatar, 0, Qt.AlignVCenter)
 
-        col = QVBoxLayout()
-        col.setContentsMargins(0, 0, 0, 0)
-        col.setSpacing(2)
-
-        name_row = QHBoxLayout()
-        name_row.setContentsMargins(0, 0, 0, 0)
-        name_row.setSpacing(6)
         name_lbl = QLabel(nickname)
         name_lbl.setStyleSheet(
-            "font-size: 13.5px; font-weight: 700; color: #1F1F1F;")
-        name_row.addWidget(name_lbl)
+            "font-size: 13.5px; font-weight: 700; "
+            f"color: {'#1F1F1F' if online else '#707070'};")
+        row.addWidget(name_lbl, 0, Qt.AlignVCenter)
         if is_host:
-            name_row.addWidget(_Chip(i18n.t("sessions.chip_host"), fg="#FFFFFF", bg="#1F2937"))
-        else:
-            name_row.addWidget(_Chip(i18n.t("sessions.chip_guest"), fg="#374151", bg="#E5E7EB"))
+            row.addWidget(_Chip(i18n.t("sessions.chip_host"),
+                                fg="#FFFFFF", bg="#1F1F1F"), 0, Qt.AlignVCenter)
         if is_self:
-            name_row.addWidget(_Chip(i18n.t("sessions.chip_self"), fg="#1D4ED8", bg="#DBEAFE"))
-        name_row.addStretch(1)
-        col.addLayout(name_row)
-
-        status_row = QHBoxLayout()
-        status_row.setContentsMargins(0, 0, 0, 0)
-        status_row.setSpacing(6)
-        dot = _Dot(online=online)
-        status_row.addWidget(dot, 0, Qt.AlignVCenter)
-        status_lbl = QLabel(status_text)
-        status_lbl.setStyleSheet(
-            "color: #15803D; font-size: 11.5px; font-weight: 600;"
-            if online else
-            "color: #6B6B6B; font-size: 11.5px; font-weight: 600;"
-        )
-        status_row.addWidget(status_lbl)
-        if sub_text:
-            status_row.addSpacing(6)
-            sub_lbl = QLabel(sub_text)
-            sub_lbl.setStyleSheet("color: #6B6B6B; font-size: 11.5px;")
-            status_row.addWidget(sub_lbl)
-        status_row.addStretch(1)
-        col.addLayout(status_row)
-
-        row.addLayout(col, 1)
-
-
-class _Dot(QLabel):
-    def __init__(self, *, online: bool, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setFixedSize(10, 10)
-        pix = QPixmap(10, 10)
-        pix.fill(Qt.transparent)
-        p = QPainter(pix)
-        p.setRenderHint(QPainter.Antialiasing)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor("#22C55E" if online else "#B5B5B5"))
-        p.drawEllipse(1, 1, 8, 8)
-        p.end()
-        self.setPixmap(pix)
-
-
-def _kv_tile(key: str) -> tuple[QWidget, QLabel]:
-    w = QWidget()
-    col = QVBoxLayout(w)
-    col.setContentsMargins(0, 0, 0, 0)
-    col.setSpacing(2)
-    k = QLabel(key)
-    k.setStyleSheet(
-        "color: #6B7280; font-size: 10.5px; font-weight: 700; "
-        "letter-spacing: 0.3px;")
-    col.addWidget(k)
-    v = QLabel("")
-    v.setStyleSheet(
-        "color: #1F2937; font-size: 13px; font-weight: 700;")
-    v.setWordWrap(True)
-    v.setTextInteractionFlags(Qt.TextSelectableByMouse)
-    col.addWidget(v)
-    return w, v
+            row.addWidget(_Chip(i18n.t("sessions.chip_self"),
+                                fg="#374151", bg="#E5E7EB"), 0, Qt.AlignVCenter)
+        row.addStretch(1)
+        state = (i18n.t("sessions.status_online") if online
+                 else i18n.t("sessions.status_offline"))
+        self.setAccessibleName(f"{nickname}, {state}")
 
 
 class _SessionHeader(QFrame):
+    """공유 PC 의 이름과 주소. 주소는 다른 PC 가 접속할 때 넣는 값이다."""
+
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("SessionHeader")
         self.setStyleSheet(
             "QFrame#SessionHeader {"
-            "  background: qlineargradient(x1:0, y1:0, x2:1, y2:1, "
-            "    stop:0 #FFFCF0, stop:1 #F3F8FF);"
-            "  border: 1px solid #ECECEC;"
-            "  border-radius: 12px;"
+            f"  background: {_SURFACE};"
+            f"  border: 1px solid {_LINE};"
+            "  border-radius: 14px;"
             "}"
         )
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(18, 16, 18, 16)
-        outer.setSpacing(10)
+        outer.setContentsMargins(18, 14, 16, 14)
+        outer.setSpacing(4)
 
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
         top.setSpacing(8)
+        caption = QLabel(i18n.t("sessions.caption_host"))
+        caption.setStyleSheet(
+            "color: #6B7280; font-size: 11px; font-weight: 700;")
+        top.addWidget(caption, 0, Qt.AlignVCenter)
+        top.addStretch(1)
+        self._count_pill = QLabel("")
+        self._count_pill.setStyleSheet(
+            "background: rgba(17, 24, 39, 0.07); color: #1F2937; "
+            "border-radius: 10px; padding: 3px 10px; "
+            "font-size: 11.5px; font-weight: 700;")
+        top.addWidget(self._count_pill, 0, Qt.AlignVCenter)
+        outer.addLayout(top)
 
         self._host_name = QLabel("")
         self._host_name.setStyleSheet(
             "color: #1F1F1F; font-size: 17px; font-weight: 800;")
         self._host_name.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        top.addWidget(self._host_name, 0, Qt.AlignVCenter)
+        outer.addWidget(self._host_name)
 
-        self._host_badge = QLabel(i18n.t("sessions.chip_host"))
-        self._host_badge.setStyleSheet(
-            "background: #1F2937; color: #FFFFFF; "
-            "border-radius: 7px; padding: 2px 8px; "
-            "font-size: 10.5px; font-weight: 800; letter-spacing: 0.4px;")
-        top.addWidget(self._host_badge, 0, Qt.AlignVCenter)
-        top.addStretch(1)
-
-        self._count_pill = QLabel("")
-        self._count_pill.setStyleSheet(
-            "background: rgba(31, 41, 55, 0.08); color: #1F2937; "
-            "border-radius: 10px; padding: 4px 12px; "
-            "font-size: 12px; font-weight: 700;")
-        top.addWidget(self._count_pill, 0, Qt.AlignVCenter)
-        outer.addLayout(top)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet(
-            "color: rgba(0, 0, 0, 0.08); "
-            "background: rgba(0, 0, 0, 0.08); "
-            "max-height: 1px; border: none;")
-        outer.addWidget(sep)
-
-        kv_grid = QGridLayout()
-        kv_grid.setContentsMargins(0, 0, 0, 0)
-        kv_grid.setHorizontalSpacing(18)
-        kv_grid.setVerticalSpacing(10)
-        name_tile, self._name_value = _kv_tile(i18n.t("sessions.kv_nickname"))
-        role_tile, self._role_value = _kv_tile(i18n.t("sessions.kv_role"))
-        addr_tile, self._addr_value = _kv_tile(i18n.t("sessions.kv_connection"))
+        addr_row = QHBoxLayout()
+        addr_row.setContentsMargins(0, 2, 0, 0)
+        addr_row.setSpacing(10)
+        self._addr_value = QLabel("")
+        self._addr_value.setStyleSheet(
+            "color: #374151; font-size: 13px; font-weight: 600;")
+        self._addr_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        addr_row.addWidget(self._addr_value, 0, Qt.AlignVCenter)
+        addr_row.addStretch(1)
         # 다른 PC 가 '공유 PC 주소'에 넣을 값이다. 바로 옮겨 적을 수 있게 한다.
         self._copy_btn = QToolButton()
         self._copy_btn.setText(i18n.t("sessions.btn_copy_address"))
         self._copy_btn.setCursor(Qt.PointingHandCursor)
         self._copy_btn.setStyleSheet(
-            "QToolButton { border: 1px solid #C9CDD3; border-radius: 6px; "
-            "background: #FFFFFF; color: #1F2937; font-size: 11px; "
-            "font-weight: 600; padding: 3px 8px; }"
-            "QToolButton:hover { background: #F3F4F6; }")
+            "QToolButton { border: 1px solid #D5D5D5; border-radius: 8px; "
+            "background: #FFFFFF; color: #1F1F1F; font-size: 11.5px; "
+            "font-weight: 700; padding: 5px 12px; }"
+            "QToolButton:hover { background: #F3F4F6; }"
+            "QToolButton:pressed { background: #E5E7EB; }")
         self._copy_btn.clicked.connect(self._copy_address)
-        addr_tile.layout().addWidget(self._copy_btn, 0, Qt.AlignLeft)
+        addr_row.addWidget(self._copy_btn, 0, Qt.AlignVCenter)
+        outer.addLayout(addr_row)
+
         self._copy_reset = QTimer(self)
         self._copy_reset.setSingleShot(True)
         self._copy_reset.setInterval(1500)
         self._copy_reset.timeout.connect(
             lambda: self._copy_btn.setText(i18n.t("sessions.btn_copy_address")))
-        hb_tile, self._heartbeat_value = _kv_tile(i18n.t("sessions.kv_heartbeat"))
-        kv_grid.addWidget(name_tile, 0, 0)
-        kv_grid.addWidget(role_tile, 0, 1)
-        kv_grid.addWidget(addr_tile, 1, 0)
-        kv_grid.addWidget(hb_tile, 1, 1)
-        kv_grid.setColumnStretch(0, 1)
-        kv_grid.setColumnStretch(1, 1)
-        outer.addLayout(kv_grid)
 
-    def update_text(
-        self,
-        *,
-        host: str,
-        online_count: int,
-        total_count: int,
-        my_role: str,
-        my_nickname: str,
-        peer_address: str,
-        heartbeat_ms: int,
-        connected: bool,
-    ) -> None:
+    def update_text(self, *, host: str, online_count: int,
+                    peer_address: str) -> None:
         self._host_name.setText(host or i18n.t("sessions.host_unknown"))
-        # 호스트를 아직 모를 때는 배지를 숨긴다. 플레이스홀더 이름 옆의 배지는
-        # 의미 없는 장식이 되기 때문이다.
-        self._host_badge.setVisible(bool(host))
-        self._count_pill.setText(i18n.t(
-            "sessions.count_pill", online=online_count, total=total_count))
-
-        self._name_value.setText(my_nickname or i18n.t("sessions.nickname_unknown"))
-
-        self._role_value.setText(
-            i18n.t("sessions.chip_host") if my_role == "host"
-            else i18n.t("sessions.chip_guest"))
-
-        self._addr_value.setText(peer_address or i18n.t("sessions.address_unknown"))
+        self._count_pill.setText(
+            i18n.t("sessions.count_online", online=online_count))
+        self._addr_value.setText(
+            peer_address or i18n.t("sessions.address_unknown"))
         self._copy_btn.setVisible(bool(peer_address))
-
-        self._heartbeat_value.setText(_fmt_heartbeat(heartbeat_ms))
 
     def _copy_address(self) -> None:
         QGuiApplication.clipboard().setText(self._addr_value.text())
@@ -315,11 +228,11 @@ class SessionsDialog(QDialog):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle(i18n.t("sessions.window_title"))
-        self.resize(480, 560)
-        self.setMinimumSize(420, 380)
+        self.resize(420, 520)
+        self.setMinimumSize(360, 340)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(18, 16, 18, 16)
+        root.setContentsMargins(16, 16, 16, 14)
         root.setSpacing(10)
 
         self._header = _SessionHeader()
@@ -333,8 +246,8 @@ class SessionsDialog(QDialog):
         scroll.setVerticalScrollBar(RoundedScrollBar())
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setStyleSheet(
-            "QScrollArea { background: #F8F9FB; "
-            "border: 1px solid #ECECEC; border-radius: 12px; }"
+            f"QScrollArea {{ background: {_SURFACE}; "
+            f"border: 1px solid {_LINE}; border-radius: 14px; }}"
         )
         scroll.viewport().setStyleSheet("background: transparent;")
         scroll.viewport().setAutoFillBackground(False)
@@ -342,7 +255,7 @@ class SessionsDialog(QDialog):
         self._content = QWidget()
         self._content.setStyleSheet("background: transparent;")
         self._content_layout = QVBoxLayout(self._content)
-        self._content_layout.setContentsMargins(10, 10, 10, 10)
+        self._content_layout.setContentsMargins(10, 8, 10, 10)
         self._content_layout.setSpacing(6)
         self._content_layout.addStretch(1)
         scroll.setWidget(self._content)
@@ -408,12 +321,7 @@ class SessionsDialog(QDialog):
         self._header.update_text(
             host=host,
             online_count=len(online_nicks),
-            total_count=len(all_nicks),
-            my_role=my_role,
-            my_nickname=my_nickname,
             peer_address=peer_address,
-            heartbeat_ms=heartbeat_ms,
-            connected=connected,
         )
 
         self._clear_content()
@@ -424,29 +332,16 @@ class SessionsDialog(QDialog):
         self._empty.hide()
         self._content.show()
 
-        if online_nicks:
-            self._add_section(i18n.t("sessions.section_online"), len(online_nicks))
-            for nick in online_nicks:
-                rec = records.get(nick) or UserRecord()
-                self._add_user_card(
-                    nick,
-                    online=True,
-                    is_host=(nick == host),
-                    is_self=(nick == my_nickname),
-                    rec=rec,
-                )
-
-        if offline_nicks:
-            self._add_section(i18n.t("sessions.section_offline"), len(offline_nicks))
-            for nick in offline_nicks:
-                rec = records.get(nick) or UserRecord()
-                self._add_user_card(
-                    nick,
-                    online=False,
-                    is_host=(nick == host),
-                    is_self=(nick == my_nickname),
-                    rec=rec,
-                )
+        for title, nicks, is_online in (
+                (i18n.t("sessions.section_online"), online_nicks, True),
+                (i18n.t("sessions.section_offline"), offline_nicks, False)):
+            if not nicks:
+                continue
+            self._add_section(title, len(nicks))
+            for nick in nicks:
+                self._add_user_card(nick, online=is_online,
+                                    is_host=(nick == host),
+                                    is_self=(nick == my_nickname))
 
     def _clear_content(self) -> None:
         while self._content_layout.count() > 1:
@@ -463,25 +358,9 @@ class SessionsDialog(QDialog):
         self._content_layout.insertWidget(
             self._content_layout.count() - 1, sec)
 
-    def _add_user_card(
-        self,
-        nickname: str,
-        *,
-        online: bool,
-        is_host: bool,
-        is_self: bool,
-        rec: UserRecord,
-    ) -> None:
-        # 접속 지속 시간이나 마지막 접속 시각 같은 부가 정보는 정보 밀도를
-        # 낮추려고 의도적으로 생략한다.
-        status_text = i18n.t("sessions.status_online") if online else i18n.t("sessions.status_offline")
-        card = _UserCard(
-            nickname=nickname,
-            is_host=is_host,
-            is_self=is_self,
-            online=online,
-            status_text=status_text,
-            sub_text="",
-        )
+    def _add_user_card(self, nickname: str, *, online: bool, is_host: bool,
+                       is_self: bool) -> None:
+        card = _UserCard(nickname=nickname, is_host=is_host, is_self=is_self,
+                         online=online)
         self._content_layout.insertWidget(
             self._content_layout.count() - 1, card)

@@ -5,8 +5,8 @@ import platform
 from typing import Any
 
 from PySide6.QtCore import (
-    QCoreApplication, QEasingCurve, QEvent, QObject, QPoint, QPointF, QRect,
-    QRectF, QSize, Qt, QTimer, QVariantAnimation, Signal,
+    QCoreApplication, QEasingCurve, QEvent, QMimeData, QObject, QPoint, QPointF,
+    QRect, QRectF, QSize, Qt, QTimer, QVariantAnimation, Signal,
 )
 from PySide6.QtGui import (
     QBrush,
@@ -46,8 +46,11 @@ from PySide6.QtWidgets import (
 
 from .. import config, i18n
 from .. import file_links as fl
-from ..image_export import open_data_url_externally
+from ..image_export import (
+    open_data_url_externally, parse_data_url, sniff_extension,
+)
 from ..settings import IMAGE_VIEWER_SYSTEM
+from . import edit_menu
 from . import note_fold as nf
 from .icons import color_swatch_icon, svg_icon
 from .image_viewer import ImageViewerWindow
@@ -79,6 +82,8 @@ from .rich_text import (
     RichTextEdit,
     bullet_qicon,
     checkbox_qicon,
+    data_url_image,
+    html_to_plain,
     marker_code_for_url,
     marker_url_for_code,
     strip_link_icons,
@@ -592,6 +597,20 @@ class StickyNoteWidget(QWidget):
         self._idle_save_timer.setInterval(self._IDLE_SAVE_MS)
         self._idle_save_timer.timeout.connect(self._idle_save)
         self._text.textChanged.connect(self._on_body_changed)
+        # 이미지를 넣으면 크기와 상관없이 곧바로 한 번 보낸다. 큰 메모는 입력이
+        # 멈출 때마다 보내지 않으므로(_IDLE_SAVE_MAX_CHARS), 그대로 두면 이미지만
+        # 넣은 메모가 다른 사람과 목록에는 한참 빈 메모로 보인다.
+        self._image_save_timer = QTimer(self)
+        self._image_save_timer.setSingleShot(True)
+        self._image_save_timer.setInterval(400)
+        self._image_save_timer.timeout.connect(self._save_after_image)
+        self._text.imageInserted.connect(self._image_save_timer.start)
+        # 편집 중이 아닐 때 끌어다 놓은 것. 잠금을 받은 뒤에 넣는다.
+        self._pending_drop: QMimeData | None = None
+        self._pending_drop_pos = -1
+        # 접힌 아이콘에 넣는 첫 이미지의 작은 그림(내용이 바뀌면 다시 만든다).
+        self._thumb_src: str | None = None
+        self._thumb_pix: QPixmap | None = None
 
         self.resize(int(note.get("width", config.DEFAULT_NOTE_WIDTH)),
                     int(note.get("height", config.DEFAULT_NOTE_HEIGHT)))
@@ -791,6 +810,7 @@ class StickyNoteWidget(QWidget):
             # 잠금만 돌려주므로 서버는 이력 행을 남기지 않는다(변경 없는 편집
             # 종료와 같은 경로). 접힌 메모가 보이지 않는 채로 잠금을 쥐면 안 된다.
             self._abandon_grant = False
+            self._pending_drop = None
             self.releaseLock.emit(self.note_id)
             return
         self._edit_mode = True
@@ -804,6 +824,7 @@ class StickyNoteWidget(QWidget):
         # 변화 없는 focus→blur 가 updated_at 을 건드리거나 no-op 이력
         # 행을 남기지 않도록 비교 기준 스냅샷을 떠 둔다.
         self._edit_baseline = self._edit_snapshot()
+        self._apply_pending_drop()
         if pending_check is not None:
             # 체크박스 한 번 누르기: 그 상자만 바꾸고 곧바로 저장하고 잠금을 푼다.
             block = self._text.document().findBlockByNumber(pending_check)
@@ -816,9 +837,59 @@ class StickyNoteWidget(QWidget):
         return (self._current_content(), self.color,
                 self.width(), self.height())
 
+    def _queue_drop(self, event) -> None:
+        """편집 중이 아닌 메모에 이미지나 파일을 끌어다 놓았다.
+
+        그대로 넣으면 화면에만 들어가고 호스트로는 가지 않는다(잠금 없이는
+        보낼 수 없다). 놓은 것을 들고 있다가 잠금을 받은 뒤에 넣는다."""
+        source = event.mimeData()
+        if not self._text.canInsertFromMimeData(source):
+            return
+        kept = QMimeData()
+        if source.hasUrls():
+            kept.setUrls(source.urls())
+        if source.hasImage():
+            kept.setImageData(source.imageData())
+        if source.hasText():
+            kept.setText(source.text())
+        self._pending_drop = kept
+        self._pending_drop_pos = self._text.cursorForPosition(
+            event.position().toPoint()).position()
+        self._pending_check = None
+        if self.is_locked_by_other():
+            self._pending_drop = None
+            self._show_overlay(i18n.t("sticky.lock_overlay",
+                                      holder=self._lock_holder))
+            return
+        self._request_edit()
+        if not self._pending_lock and not self._edit_mode:
+            # 끊겨 있어 편집을 시작하지 못했다(안내는 _request_edit 이 띄웠다).
+            self._pending_drop = None
+
+    def _apply_pending_drop(self) -> None:
+        source, self._pending_drop = self._pending_drop, None
+        if source is None:
+            return
+        cursor = self._text.textCursor()
+        cursor.setPosition(max(0, min(self._pending_drop_pos,
+                                      self._text.document().characterCount() - 1)))
+        self._text.setTextCursor(cursor)
+        self._text.insertFromMimeData(source)
+
+    def _save_after_image(self) -> None:
+        """이미지를 넣은 직후에 한 번 보낸다(크기 제한을 따지지 않는다)."""
+        if not self._edit_mode:
+            return
+        if self._pending_commit is not None:
+            # 앞서 보낸 것이 아직 돌아오지 않았다. 판 번호가 어긋나지 않게 기다린다.
+            self._image_save_timer.start()
+            return
+        self._autosave_while_editing()
+
     def show_lock_denied(self, holder: str) -> None:
         self._pending_lock = False
         self._pending_check = None
+        self._pending_drop = None
         self._abandon_grant = False
         self._text.setReadOnly(True)
         self._lock_label.setText(i18n.t("sticky.lock_editing_by", holder=holder))
@@ -1080,51 +1151,99 @@ class StickyNoteWidget(QWidget):
 
     def _show_more_menu(self) -> None:
         is_private = bool(self.private_owner)
-        menu = QMenu(self)
-        # 전역 QSS 가 팝업 단위에서 Win11 다크 팔레트를 항상 이기지는
-        # 못해 light 스타일을 명시한다.
-        menu.setStyleSheet(
-            "QMenu { background-color: #FFFFFF; "
-            "border: 1px solid #EAEAEA; border-radius: 8px; "
-            "padding: 4px; color: #1F1F1F; }"
-            "QMenu::item { background-color: transparent; "
-            "padding: 6px 22px 6px 14px; border-radius: 6px; "
-            "color: #1F1F1F; min-width: 160px; }"
-            "QMenu::item:selected { background-color: #F0F0F0; "
-            "color: #1F1F1F; }"
-            "QMenu::separator { height: 1px; background: #EAEAEA; "
-            "margin: 4px 6px; }"
-        )
-        act_hide = menu.addAction(i18n.t("sticky.more_hide"))
-        act_hide.triggered.connect(lambda: self.hideRequested.emit(self.note_id))
-        act_hist = menu.addAction(i18n.t("sticky.tip_history"))
-        act_hist.triggered.connect(
+        menu = edit_menu.new_menu(self)
+        ink = "#3A3A3A"
+
+        def add(icon: str | None, text: str, handler) -> None:
+            add_centered_menu_action(
+                menu, svg_icon(icon, color=ink) if icon else None, text, handler)
+
+        add("eye_off", i18n.t("sticky.more_hide"),
+            lambda: self.hideRequested.emit(self.note_id))
+        add("clock", i18n.t("sticky.tip_history"),
             lambda: self.historyRequested.emit(self.note_id))
         menu.addSeparator()
-        act_fold = menu.addAction(i18n.t("sticky.more_fold"))
-        act_fold.triggered.connect(lambda: self.fold(style=nf.FOLD_SLIP))
-        act_icon = menu.addAction(i18n.t("sticky.more_fold_icon"))
-        act_icon.triggered.connect(lambda: self.fold(style=nf.FOLD_ICON))
+        add("fold", i18n.t("sticky.more_fold"),
+            lambda: self.fold(style=nf.FOLD_SLIP))
+        add("note", i18n.t("sticky.more_fold_icon"),
+            lambda: self.fold(style=nf.FOLD_ICON))
         if self._dock:
-            act_undock = menu.addAction(i18n.t("sticky.more_undock"))
-            act_undock.triggered.connect(self.undock)
+            add("unfold", i18n.t("sticky.more_undock"), self.undock)
         else:
-            act_left = menu.addAction(i18n.t("sticky.more_dock_left"))
-            act_left.triggered.connect(lambda: self.dock(nf.DOCK_LEFT))
-            act_right = menu.addAction(i18n.t("sticky.more_dock_right"))
-            act_right.triggered.connect(lambda: self.dock(nf.DOCK_RIGHT))
+            add("dock_left", i18n.t("sticky.more_dock_left"),
+                lambda: self.dock(nf.DOCK_LEFT))
+            add("dock_right", i18n.t("sticky.more_dock_right"),
+                lambda: self.dock(nf.DOCK_RIGHT))
         menu.addSeparator()
-        act_priv = menu.addAction(
-            i18n.t("sticky.more_private_off") if is_private
-            else i18n.t("sticky.more_private_on"))
-        act_priv.triggered.connect(
-            lambda: self.privateToggleRequested.emit(
-                self.note_id, not is_private))
+        add("lock", i18n.t("sticky.more_private_off") if is_private
+            else i18n.t("sticky.more_private_on"),
+            lambda: self.privateToggleRequested.emit(self.note_id, not is_private))
         menu.addSeparator()
-        act_del = menu.addAction(i18n.t("sticky.more_delete"))
-        act_del.triggered.connect(
+        add("trash", i18n.t("sticky.more_delete"),
             lambda: self.deleteRequested.emit(self.note_id))
-        menu.exec(self._more_btn.mapToGlobal(QPoint(0, self._more_btn.height())))
+        edit_menu.run_menu(menu, self._more_btn.mapToGlobal(
+            QPoint(0, self._more_btn.height())))
+
+    def _show_text_menu(self, pos: QPoint, global_pos: QPoint) -> None:
+        """본문을 우클릭했을 때의 메뉴.
+
+        그림 위면 그림에 할 수 있는 일을 먼저 둔다. 편집 중이면 실행 취소부터
+        모두 선택까지, 보기 상태면 편집과 전체 복사를 둔다."""
+        menu = edit_menu.new_menu(self)
+        ink = "#3A3A3A"
+        hit = self._text.content_image_at(pos)
+        if hit is not None:
+            url, ordinal = hit
+            add_centered_menu_action(
+                menu, svg_icon("image", color=ink), i18n.t("sticky.menu_image_view"),
+                lambda: self._open_image_viewer(url, ordinal))
+            add_centered_menu_action(
+                menu, svg_icon("copy", color=ink), i18n.t("sticky.menu_image_copy"),
+                lambda: QApplication.clipboard().setImage(data_url_image(url)))
+            add_centered_menu_action(
+                menu, svg_icon("download", color=ink),
+                i18n.t("sticky.menu_image_save"), lambda: self._save_image(url))
+            menu.addSeparator()
+        if self._edit_mode:
+            edit_menu.add_edit_actions(menu, self._text)
+        else:
+            can_edit = not self._offline and not self.is_locked_by_other()
+            add_centered_menu_action(
+                menu, svg_icon("edit", color=ink if can_edit else "#B0B0B0"),
+                i18n.t("sticky.menu_edit"), self._request_edit, enabled=can_edit)
+            plain = html_to_plain(self._content or "").strip()
+            add_centered_menu_action(
+                menu, svg_icon("copy", color=ink if plain else "#B0B0B0"),
+                i18n.t("sticky.menu_copy_all"),
+                lambda: QApplication.clipboard().setText(plain),
+                enabled=bool(plain))
+        edit_menu.run_menu(menu, global_pos)
+        menu.deleteLater()
+
+    def _save_image(self, url: str) -> None:
+        """본문의 이미지를 파일로 저장한다."""
+        parsed = parse_data_url(url)
+        if parsed is None:
+            self._show_overlay(i18n.t("sticky.image_save_failed"))
+            return
+        raw, subtype = parsed
+        ext = sniff_extension(raw, subtype)
+        # 저장 창이 뜨면 메모가 비활성화된다. 그때 편집이 끝나 버리지 않게 막는다.
+        self._opening_dialog = True
+        try:
+            path, _ = QFileDialog.getSaveFileName(
+                self, i18n.t("sticky.menu_image_save"),
+                i18n.t("sticky.image_save_name") + "." + ext,
+                f"*.{ext}")
+        finally:
+            QTimer.singleShot(0, self._end_opening_dialog)
+        if not path:
+            return
+        try:
+            with open(path, "wb") as f:
+                f.write(raw)
+        except OSError:
+            self._show_overlay(i18n.t("sticky.image_save_failed"))
 
     def _set_color(self, color: str) -> None:
         self._open_pix = None
@@ -1554,22 +1673,25 @@ class StickyNoteWidget(QWidget):
         open_link(self, href)
 
     def _show_link_menu(self, href: str, global_pos: QPoint) -> None:
-        menu = QMenu(self)
-        menu.setStyleSheet(LIGHT_MENU_QSS)
-        act_open = menu.addAction(link_icon(fl.kind_of(href)),
-                                  i18n.t("link.menu_open"))
-        act_open.triggered.connect(lambda: self._open_link(href))
+        menu = edit_menu.new_menu(self)
+        ink = "#3A3A3A"
+        add_centered_menu_action(
+            menu, link_icon(fl.kind_of(href)), i18n.t("link.menu_open"),
+            lambda: self._open_link(href))
         if fl.is_file_href(href) and not fl.is_folder_href(href):
-            act_reveal = menu.addAction(i18n.t("link.menu_reveal"))
-            act_reveal.triggered.connect(lambda: reveal_in_folder(self, href))
-        act_copy = menu.addAction(i18n.t("link.menu_copy"))
-        act_copy.triggered.connect(
+            add_centered_menu_action(
+                menu, svg_icon("folder", color=ink), i18n.t("link.menu_reveal"),
+                lambda: reveal_in_folder(self, href))
+        add_centered_menu_action(
+            menu, svg_icon("copy", color=ink), i18n.t("link.menu_copy"),
             lambda: QApplication.clipboard().setText(fl.describe_target(href)))
         if self._edit_mode:
             menu.addSeparator()
-            act_edit = menu.addAction(i18n.t("link.menu_edit"))
-            act_edit.triggered.connect(self._insert_link)
-        menu.exec(global_pos)
+            add_centered_menu_action(
+                menu, svg_icon("edit", color=ink), i18n.t("link.menu_edit"),
+                self._insert_link)
+        edit_menu.run_menu(menu, global_pos)
+        menu.deleteLater()
 
     def _attach_image(self) -> None:
         if not self._edit_mode:
@@ -1609,9 +1731,17 @@ class StickyNoteWidget(QWidget):
                 self._open_image_viewer(url, ordinal)
                 event.accept()
                 return True
+        if (obj is self._text.viewport() and event.type() == QEvent.Drop
+                and not self._edit_mode):
+            self._queue_drop(event)
+            event.acceptProposedAction()
+            return True
         if obj is self._text.viewport():
             handled = self._link_event(event)
             if handled:
+                return True
+            if event.type() == QEvent.ContextMenu:
+                self._show_text_menu(event.pos(), event.globalPos())
                 return True
         if obj is self._text.viewport() and event.type() == QEvent.MouseButtonPress:
             if not self._edit_mode:
@@ -2156,7 +2286,8 @@ class StickyNoteWidget(QWidget):
             color=self.color, title=self._title(),
             anchor=self._dock or nf.DOCK_LEFT,
             dock=self._dock if at_edge else nf.DOCK_NONE,
-            private=bool(self.private_owner), font=self.font(), style=style)
+            private=bool(self.private_owner), font=self.font(), style=style,
+            thumb=self._fold_thumb())
         self._fold_t = 0.0
         self.update()
         self._run_fold(0.0, 1.0, nf.FOLD_MS, self._finish_fold)
@@ -2246,7 +2377,8 @@ class StickyNoteWidget(QWidget):
         return nf.FoldFrames(
             pix, face, color=self.color, title=self._title(), anchor=anchor,
             dock=face_dock, private=bool(self.private_owner), font=self.font(),
-            style=nf.FOLD_SLIP if face_dock else self._style_now())
+            style=nf.FOLD_SLIP if face_dock else self._style_now(),
+            thumb=self._fold_thumb())
 
     def _finish_unfold(self) -> None:
         self._fold_frames = None
@@ -2499,6 +2631,13 @@ class StickyNoteWidget(QWidget):
             self._title_text = note_title_and_lines(self._content)[0]
         return self._title_text
 
+    def _fold_thumb(self) -> QPixmap | None:
+        """접힌 아이콘 안에 넣을 첫 이미지의 작은 그림. 이미지가 없으면 None."""
+        if self._thumb_src is not self._content:
+            self._thumb_src = self._content
+            self._thumb_pix = nf.note_thumbnail(self._content or "")
+        return self._thumb_pix
+
     def _current_open_size(self) -> QSize:
         if (self._folded or self._fold_busy()) and self._open_size.isValid() \
                 and not self._open_size.isEmpty():
@@ -2648,7 +2787,8 @@ class StickyNoteWidget(QWidget):
             if not dock and self._style_pref() == nf.FOLD_ICON:
                 nf.paint_icon(painter, QRectF(self.rect()), self.color,
                               self._title(), private=bool(self.private_owner),
-                              hover=self._slip_hover, font=self.font())
+                              hover=self._slip_hover, font=self.font(),
+                              thumb=self._fold_thumb())
             else:
                 nf.paint_slip(painter, QRectF(self.rect()), self.color,
                               self._title(), dock=dock,

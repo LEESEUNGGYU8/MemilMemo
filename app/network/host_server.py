@@ -578,6 +578,13 @@ class HostServer(QObject):
         # 메모가 폴더에서 분리되기 전에 목록을 캡처해야 새 가시성으로 다시 브로드캐스트할 수 있다.
         contained = self.repo.list_notes_in_folder(folder_id)
         prev_owner = existing.private_owner
+        if prev_owner:
+            # 나만 보던 폴더를 지운다고 그 안의 메모가 모두에게 공개되면 안 된다.
+            # 폴더에 기대어 비공개였던 메모에 주인을 직접 적어 둔다.
+            for note in contained:
+                if not note.private_owner:
+                    self.repo.set_note_private_owner(
+                        note.id, prev_owner, session.nickname)
         deleted_folder = self.repo.soft_delete_folder(folder_id)
         if deleted_folder is None:
             return

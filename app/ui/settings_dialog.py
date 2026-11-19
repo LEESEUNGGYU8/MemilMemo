@@ -117,6 +117,7 @@ class SettingsDialog(QDialog):
 
     backupNowRequested = Signal()
     restoreRequested = Signal()
+    copiesRequested = Signal()
 
     def __init__(self, settings: AppSettings, role: str = "guest",
                  parent: QWidget | None = None):
@@ -400,11 +401,24 @@ class SettingsDialog(QDialog):
 
         self._backup_enabled = QCheckBox(i18n.t("settings.check_backup_enabled"))
         self._backup_enabled.setChecked(self._settings.backup_enabled)
+        # 켜고 끄는 칸은 한 줄, 단추들은 그 아래 줄에 오른쪽으로 모은다(단추가
+        # 셋이라 한 줄에 같이 두면 글자가 잘린다).
+        check_row = QHBoxLayout()
+        check_row.setContentsMargins(8, 0, 0, 0)   # 왼쪽 8 = 폼의 왼쪽 inset 과 동일
+        check_row.addWidget(self._backup_enabled)
+        check_row.addStretch(1)
+        outer.addLayout(check_row)
         bottom = QHBoxLayout()
-        bottom.setContentsMargins(8, 0, 0, 0)   # 왼쪽 8 = 폼의 왼쪽 inset 과 동일
+        bottom.setContentsMargins(8, 0, 0, 0)
         bottom.setSpacing(10)
-        bottom.addWidget(self._backup_enabled)
         bottom.addStretch(1)
+        # 참여한 PC 가 받아 둔 메모 사본. 공유 PC 가 고장 났을 때 여기서 꺼낸다.
+        copies_btn = QPushButton(i18n.t("settings.btn_copies"))
+        copies_btn.setProperty("secondary", True)
+        refresh_style(copies_btn)
+        copies_btn.setCursor(Qt.PointingHandCursor)
+        copies_btn.clicked.connect(self.copiesRequested.emit)
+        bottom.addWidget(copies_btn)
         if self._role == "host":
             restore_btn = QPushButton(i18n.t("settings.btn_restore"))
             restore_btn.setProperty("secondary", True)

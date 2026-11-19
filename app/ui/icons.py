@@ -16,6 +16,73 @@ _SVG = {
         '<path d="M5 12h14" stroke="{color}" stroke-width="2" '
         'stroke-linecap="round" fill="none"/></svg>'
     ),
+    "note": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<path d="M6.5 4h7.5l4.5 4.5V18a2 2 0 0 1-2 2h-10a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z'
+        'M14 4v4.5h4.5" stroke="{color}" stroke-width="2" fill="none" '
+        'stroke-linejoin="round"/></svg>'
+    ),
+    "undo": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<path d="M8.5 5.5L4 10l4.5 4.5M4 10h10a5.5 5.5 0 0 1 0 11h-3" stroke="{color}" '
+        'stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    ),
+    "redo": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<path d="M15.5 5.5L20 10l-4.5 4.5M20 10H10a5.5 5.5 0 0 0 0 11h3" stroke="{color}" '
+        'stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    ),
+    "cut": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<circle cx="6.5" cy="18" r="2.5" stroke="{color}" stroke-width="2" fill="none"/>'
+        '<circle cx="17.5" cy="18" r="2.5" stroke="{color}" stroke-width="2" fill="none"/>'
+        '<path d="M8.2 16.2L18 4M15.8 16.2L6 4" stroke="{color}" stroke-width="2" '
+        'fill="none" stroke-linecap="round"/></svg>'
+    ),
+    "copy": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<rect x="8.5" y="8.5" width="11" height="12" rx="2" stroke="{color}" '
+        'stroke-width="2" fill="none"/>'
+        '<path d="M15.5 8.5V6a2 2 0 0 0-2-2H6.5a2 2 0 0 0-2 2v8.5a2 2 0 0 0 2 2h2" '
+        'stroke="{color}" stroke-width="2" fill="none" stroke-linecap="round"/></svg>'
+    ),
+    "paste": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<rect x="5.5" y="5.5" width="13" height="15" rx="2" stroke="{color}" '
+        'stroke-width="2" fill="none"/>'
+        '<path d="M9 5.5V4.8a1.3 1.3 0 0 1 1.3-1.3h3.4A1.3 1.3 0 0 1 15 4.8v.7M9.5 11h5M9.5 15h5" '
+        'stroke="{color}" stroke-width="2" fill="none" stroke-linecap="round"/></svg>'
+    ),
+    "select_all": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<rect x="4.5" y="4.5" width="15" height="15" rx="2.5" stroke="{color}" '
+        'stroke-width="2" fill="none" stroke-dasharray="3 3"/>'
+        '<path d="M8.5 12.2l2.4 2.4 4.6-5" stroke="{color}" stroke-width="2" '
+        'fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    ),
+    "edit": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<path d="M5 19l1-4L16.5 4.5a1.8 1.8 0 0 1 2.6 0l.4.4a1.8 1.8 0 0 1 0 2.6L9 18l-4 1z" '
+        'stroke="{color}" stroke-width="2" fill="none" stroke-linejoin="round"/></svg>'
+    ),
+    "download": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<path d="M12 4.5v10M7.5 10.5L12 15l4.5-4.5M5 19.5h14" stroke="{color}" '
+        'stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    ),
+    "trash": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<path d="M5 7h14M9.5 7V5.2a1.2 1.2 0 0 1 1.2-1.2h2.6a1.2 1.2 0 0 1 1.2 1.2V7'
+        'M7 7l.8 11.3a1.8 1.8 0 0 0 1.8 1.7h4.8a1.8 1.8 0 0 0 1.8-1.7L17 7" stroke="{color}" '
+        'stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    ),
+    "warning": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<path d="M12 4.5l8.5 15h-17z" stroke="{color}" stroke-width="2" fill="none" '
+        'stroke-linejoin="round"/>'
+        '<path d="M12 10v4.5M12 17.2v.1" stroke="{color}" stroke-width="2" '
+        'fill="none" stroke-linecap="round"/></svg>'
+    ),
     "clock": (
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
         '<circle cx="12" cy="12" r="9" stroke="{color}" stroke-width="2" fill="none"/>'

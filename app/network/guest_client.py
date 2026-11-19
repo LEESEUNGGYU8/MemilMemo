@@ -127,8 +127,9 @@ class GuestClient(ClientBase):
                         private=private))
 
     def create_folder(self, name: str, color: str,
-                      private: bool = False) -> None:
-        self._send(make(MSG_CREATE_FOLDER, id=new_id(), name=name,
+                      private: bool = False,
+                      folder_id: str | None = None) -> None:
+        self._send(make(MSG_CREATE_FOLDER, id=folder_id or new_id(), name=name,
                         color=color, private=private))
 
     def update_folder(self, folder_id: str, *,

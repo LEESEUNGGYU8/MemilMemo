@@ -629,6 +629,11 @@ def apply_theme(app: QApplication, font_family: str) -> None:
     if getattr(app, "_kb_focus_marker", None) is None:
         app._kb_focus_marker = KeyboardFocusMarker(app)
         app.installEventFilter(app._kb_focus_marker)
+    if getattr(app, "_edit_menu_filter", None) is None:
+        # 입력칸의 우클릭 메뉴를 앱의 메뉴로 바꾼다(Qt 기본은 영어다).
+        from .edit_menu import EditMenuFilter
+        app._edit_menu_filter = EditMenuFilter(app)
+        app.installEventFilter(app._edit_menu_filter)
     default = QFont(font_family or "Segoe UI", 10)
     app.setFont(smooth_font(default))
 

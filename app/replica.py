@@ -19,12 +19,14 @@ import os
 import re
 import sqlite3
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QObject
 
+from .models import Folder, Note
 from .network.client_base import ClientBase
 
 _SCHEMA = """
@@ -51,6 +53,163 @@ _STAMP = "%Y%m%d_%H%M%S"
 
 def _stamp(note: dict[str, Any]) -> tuple[int, int]:
     return int(note.get("version") or 0), int(note.get("updated_at") or 0)
+
+
+def archive_paths(replica_path: Path) -> list[Path]:
+    """다른 메모 묶음을 받느라 옮겨 둔 옛 사본들(새것부터)."""
+    replica_path = Path(replica_path)
+    pattern = re.compile(
+        re.escape(replica_path.stem) + r"\.archive-(\d{8}_\d{6})(?:-(\d+))?"
+        + re.escape(replica_path.suffix) + "$")
+    found = []
+    try:
+        entries = list(replica_path.parent.iterdir())
+    except OSError:
+        return []
+    for p in entries:
+        m = pattern.match(p.name)
+        if m and p.is_file():
+            # 같은 초에 옮긴 것은 뒤에 붙은 번호가 클수록 새것이다.
+            found.append(((m.group(1), int(m.group(2) or 1)), p))
+    return [p for _key, p in sorted(found, key=lambda x: x[0], reverse=True)]
+
+
+@dataclass
+class CopyInfo:
+    """이 PC 에 있는 사본 한 벌."""
+    path: Path
+    current: bool        # 지금 받고 있는 사본인가(아니면 옮겨 둔 옛 사본)
+    synced_at: int       # 마지막으로 받은 시각(ms)
+    host: str
+    nickname: str
+    host_id: str
+    note_count: int
+
+
+def read_copy(path: Path | str) -> tuple[list[dict[str, Any]], list[dict[str, Any]],
+                                         dict[str, str]]:
+    """사본 파일을 읽기만 한다: (메모들, 폴더들, 딸린 정보)."""
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(str(path))
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("PRAGMA query_only = ON")
+
+        def rows(table: str) -> list[dict[str, Any]]:
+            out = []
+            for (raw,) in conn.execute(f"SELECT data FROM {table}"):
+                try:
+                    item = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(item, dict) and item.get("id"):
+                    out.append(item)
+            return out
+
+        meta = {str(k): str(v) for k, v in conn.execute("SELECT key, value FROM meta")}
+        return rows("notes"), rows("folders"), meta
+    finally:
+        conn.close()
+
+
+def list_copies(replica_path: Path | str) -> list[CopyInfo]:
+    """이 PC 에 있는 사본들. 지금 사본이 먼저, 옮겨 둔 것은 새것부터.
+
+    메모가 하나도 없거나 읽지 못하는 파일은 넣지 않는다."""
+    replica_path = Path(replica_path)
+    out: list[CopyInfo] = []
+    for path, current in [(replica_path, True)] + [
+            (p, False) for p in archive_paths(replica_path)]:
+        try:
+            notes, _folders, meta = read_copy(path)
+        except (OSError, sqlite3.Error):
+            continue
+        if not notes:
+            continue
+        try:
+            synced = int(meta.get("synced_at") or 0)
+        except ValueError:
+            synced = 0
+        out.append(CopyInfo(path=path, current=current, synced_at=synced,
+                            host=meta.get("host", ""),
+                            nickname=meta.get("nickname", ""),
+                            host_id=meta.get("host_id", ""),
+                            note_count=len(notes)))
+    return out
+
+
+def missing_notes(copy_notes: list[dict[str, Any]],
+                  host_notes: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """사본에는 있는데 지금 공유 PC 에는 없는 내용.
+
+    공유 PC 에 그 메모가 아예 없거나, 있더라도 사본 쪽이 더 나중에 고친 다른
+    내용이면 넣는다. 가져올 때는 새 메모로 만들기 때문에 있는 메모를 덮어쓰지
+    않는다."""
+    out = []
+    for note in copy_notes:
+        there = host_notes.get(note.get("id"))
+        if there is None:
+            out.append(note)
+        elif ((note.get("content") or "") != (there.get("content") or "")
+              and int(note.get("updated_at") or 0) > int(there.get("updated_at") or 0)):
+            out.append(note)
+    return out
+
+
+def build_host_database(copy_path: Path | str, db_path: Path | str,
+                        nickname: str) -> Path | None:
+    """사본으로 공유 PC 의 메모 파일을 새로 만든다(이 PC 가 공유를 이어받는다).
+
+    이 PC 에 메모 파일이 이미 있으면 지우지 않고 옆으로 옮겨 둔다. 옮겨 둔 파일의
+    경로를 돌려준다. 사본을 받을 때와 닉네임이 달라졌으면 '나만 보기' 메모의
+    주인을 지금 닉네임으로 바꿔, 주인이 자기 메모를 못 보게 되는 일을 막는다.
+    수정 이력은 사본에 없으므로 따라오지 않는다."""
+    from .backup import set_aside
+    from .database import SqliteRepository
+
+    copy_path, db_path = Path(copy_path), Path(db_path)
+    notes, folders, meta = read_copy(copy_path)
+    if not notes:
+        raise ValueError("empty copy")
+    was = meta.get("nickname", "")
+
+    def owner(value):
+        return nickname if (value and was and value == was) else (value or None)
+
+    fresh = db_path.with_name(db_path.name + ".new")
+    if fresh.exists():
+        fresh.unlink()
+    repo = SqliteRepository(fresh)
+    try:
+        folder_ids = set()
+        for raw in folders:
+            try:
+                folder = Folder.from_dict(raw)
+            except TypeError:
+                continue
+            folder.deleted = 0
+            folder.private_owner = owner(folder.private_owner)
+            repo.insert_folder(folder)
+            folder_ids.add(folder.id)
+        for raw in notes:
+            try:
+                note = Note.from_dict(raw)
+            except TypeError:
+                continue
+            note.deleted = 0
+            note.content = note.content or ""
+            note.private_owner = owner(note.private_owner)
+            if note.folder_id not in folder_ids:
+                note.folder_id = None
+            note.created_by = note.created_by or nickname
+            note.updated_by = note.updated_by or note.created_by
+            repo.insert_note(note)
+    finally:
+        repo.close()
+    kept = set_aside(db_path, "before-takeover")
+    os.replace(fresh, db_path)
+    return kept
 
 
 class ReplicaStore:
@@ -115,16 +274,7 @@ class ReplicaStore:
 
     def archives(self) -> list[Path]:
         """다른 메모 묶음을 받느라 옮겨 둔 옛 사본들(새것부터)."""
-        pattern = re.compile(
-            re.escape(self.path.stem) + r"\.archive-(\d{8}_\d{6})(?:-(\d+))?"
-            + re.escape(self.path.suffix) + "$")
-        found = []
-        for p in self.path.parent.iterdir():
-            m = pattern.match(p.name)
-            if m and p.is_file():
-                # 같은 초에 옮긴 것은 뒤에 붙은 번호가 클수록 새것이다.
-                found.append(((m.group(1), int(m.group(2) or 1)), p))
-        return [p for _key, p in sorted(found, key=lambda x: x[0], reverse=True)]
+        return archive_paths(self.path)
 
     def _archive(self) -> None:
         self._close_quietly()

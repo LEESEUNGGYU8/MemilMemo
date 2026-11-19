@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import math
 import platform
+import re
+from collections import OrderedDict
 
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt
 from PySide6.QtGui import (
@@ -28,6 +30,7 @@ from PySide6.QtGui import (
 )
 
 from .icons import svg_icon
+from .rich_text import data_url_image, is_marker_url
 from .theme import text_color_for_bg
 
 # 떠 있는 쪽지와 가장자리 탭의 크기(논리 픽셀).
@@ -285,9 +288,57 @@ def _shade(color: QColor, *, lighter: bool, amount: int) -> QColor:
     return out
 
 
+_IMG_SRC = re.compile(r'<img[^>]*src=["\']([^"\']+)["\']', re.IGNORECASE)
+# 종이 그림 안에 넣는 첫 이미지의 축소판(논리 픽셀). 두 배로 만들어 둔다.
+_THUMB_W, _THUMB_H, _THUMB_SCALE = 36, 32, 2
+_THUMBS: "OrderedDict[tuple, QPixmap]" = OrderedDict()
+_THUMBS_MAX = 48
+
+
+def first_image_url(html: str) -> str:
+    """본문의 첫 이미지(글머리와 체크 상자 그림은 뺀다)."""
+    if not html or "<img" not in html.lower():
+        return ""
+    for m in _IMG_SRC.finditer(html):
+        if not is_marker_url(m.group(1)):
+            return m.group(1)
+    return ""
+
+
+def note_thumbnail(html: str) -> QPixmap | None:
+    """본문의 첫 이미지를 아이콘 속 칸에 꽉 차게(가운데를 잘라) 줄인 그림.
+
+    이미지가 없으면 None. 같은 이미지를 거듭 풀지 않도록 최근 것을 기억한다."""
+    url = first_image_url(html)
+    if not url:
+        return None
+    key = (len(url), url[:96], url[-96:])
+    hit = _THUMBS.get(key)
+    if hit is not None:
+        _THUMBS.move_to_end(key)
+        return hit
+    img = data_url_image(url)
+    if img.isNull():
+        return None
+    tw, th = _THUMB_W * _THUMB_SCALE, _THUMB_H * _THUMB_SCALE
+    scaled = img.scaled(tw, th, Qt.KeepAspectRatioByExpanding,
+                        Qt.SmoothTransformation)
+    pix = QPixmap.fromImage(scaled.copy(max(0, (scaled.width() - tw) // 2),
+                                        max(0, (scaled.height() - th) // 2),
+                                        tw, th))
+    pix.setDevicePixelRatio(_THUMB_SCALE)
+    _THUMBS[key] = pix
+    while len(_THUMBS) > _THUMBS_MAX:
+        _THUMBS.popitem(last=False)
+    return pix
+
+
 def paint_note_glyph(p: QPainter, rect: QRectF, color: str, *,
-                     private: bool = False) -> None:
-    """메모 색의 작은 종이. 위쪽 띠와 글줄 몇 가닥으로 메모임을 알린다."""
+                     private: bool = False,
+                     thumb: QPixmap | None = None) -> None:
+    """메모 색의 작은 종이. 위쪽 띠와 글줄 몇 가닥으로 메모임을 알린다.
+
+    ``thumb`` 을 주면 글줄 대신 그 그림을 종이 안에 작게 넣는다(이미지가 든 메모)."""
     p.save()
     p.setRenderHint(QPainter.Antialiasing)
     base = QColor(color)
@@ -302,14 +353,33 @@ def paint_note_glyph(p: QPainter, rect: QRectF, color: str, *,
     band = QRectF(body.left(), body.top(), body.width(), body.height() * 0.2)
     p.fillRect(band, _shade(base, lighter=True, amount=20))
     ink = QColor(255, 255, 255, 150) if dark else QColor(0, 0, 0, 92)
-    pen = QPen(ink, max(1.2, body.height() * 0.045))
-    pen.setCapStyle(Qt.RoundCap)
-    p.setPen(pen)
-    left = body.left() + body.width() * 0.2
-    for frac, width in ((0.42, 0.6), (0.58, 0.6), (0.74, 0.38)):
-        y = body.top() + body.height() * frac
-        p.drawLine(QPointF(left, y),
-                   QPointF(left + body.width() * width, y))
+    if thumb is not None and not thumb.isNull():
+        # 종이 안쪽에 사진을 붙인 모양. 종이가 줄어드는 접기 그림에서도 비율을 지킨다.
+        inset = body.width() * 0.11
+        top = band.bottom() + body.height() * 0.07
+        box = QRectF(body.left() + inset, top, body.width() - 2 * inset,
+                     body.bottom() - inset - top)
+        if box.width() > 6 and box.height() > 6:
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            clip = QPainterPath()
+            clip.addRoundedRect(box, 2.0, 2.0)
+            p.save()
+            p.setClipPath(clip, Qt.IntersectClip)
+            p.drawPixmap(box, thumb, QRectF(thumb.rect()))
+            p.restore()
+            p.setPen(QPen(QColor(255, 255, 255, 120) if dark
+                          else QColor(0, 0, 0, 70), 1.0))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(box, 2.0, 2.0)
+    else:
+        pen = QPen(ink, max(1.2, body.height() * 0.045))
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        left = body.left() + body.width() * 0.2
+        for frac, width in ((0.42, 0.6), (0.58, 0.6), (0.74, 0.38)):
+            y = body.top() + body.height() * frac
+            p.drawLine(QPointF(left, y),
+                       QPointF(left + body.width() * width, y))
     p.restore()
     ear = min(body.width() * 0.28, body.height() * 0.28)
     tri = QPolygonF([
@@ -327,10 +397,16 @@ def paint_note_glyph(p: QPainter, rect: QRectF, color: str, *,
     p.drawLine(tri[2], tri[1])
     p.drawPath(path)
     if private and body.width() >= 30:
-        icon = svg_icon("lock", color="#FFFFFF" if dark else "#1F2937")
         side = 13.0
-        p.drawPixmap(QPointF(body.left() + 4.0, body.bottom() - side - 4.0),
-                     icon.pixmap(int(side), int(side)))
+        spot = QPointF(body.left() + 4.0, body.bottom() - side - 4.0)
+        if thumb is not None and not thumb.isNull():
+            # 사진 위에서도 보이도록 종이 색 바탕을 깐다.
+            p.setPen(Qt.NoPen)
+            p.setBrush(base)
+            p.drawRoundedRect(QRectF(spot.x() - 2.0, spot.y() - 2.0,
+                                     side + 4.0, side + 4.0), 4.0, 4.0)
+        icon = svg_icon("lock", color="#FFFFFF" if dark else "#1F2937")
+        p.drawPixmap(spot, icon.pixmap(int(side), int(side)))
     p.restore()
 
 
@@ -453,12 +529,14 @@ def _paint_icon_backplate(p: QPainter, cell: QRectF, hover: bool) -> None:
 
 def paint_icon(p: QPainter, cell: QRectF, color: str, title: str, *,
                private: bool = False, hover: bool = False,
-               font: QFont | None = None) -> None:
+               font: QFont | None = None,
+               thumb: QPixmap | None = None) -> None:
     """접힌 메모를 바탕화면 아이콘 모양으로 그린다."""
     p.save()
     p.setRenderHint(QPainter.Antialiasing)
     _paint_icon_backplate(p, cell, hover)
-    paint_note_glyph(p, icon_glyph_rect(cell), color, private=private)
+    paint_note_glyph(p, icon_glyph_rect(cell), color, private=private,
+                     thumb=thumb)
     paint_icon_label(p, cell, title, font)
     p.restore()
 
@@ -545,7 +623,9 @@ class FoldFrames:
     def __init__(self, open_pix: QPixmap, slip_size: QSize, *,
                  color: str, title: str, anchor: str = DOCK_LEFT,
                  dock: str = DOCK_NONE, private: bool = False,
-                 font: QFont | None = None, style: str = FOLD_SLIP):
+                 font: QFont | None = None, style: str = FOLD_SLIP,
+                 thumb: QPixmap | None = None):
+        self.thumb = thumb
         self.dpr = open_pix.devicePixelRatio() or 1.0
         self.full = open_pix
         self.W = int(round(open_pix.width() / self.dpr))
@@ -602,7 +682,8 @@ class FoldFrames:
     def _paint_face(self, p: QPainter, paper: QRectF) -> None:
         """다 접힌 모습. ``paper`` 는 줄어드는 중인 종이의 자리다."""
         if self.style == FOLD_ICON:
-            paint_note_glyph(p, paper, self.color, private=self.private)
+            paint_note_glyph(p, paper, self.color, private=self.private,
+                             thumb=self.thumb)
             paint_icon_label(p, self.slip_rect(), self.title, self.font)
         else:
             paint_slip(p, paper, self.color, self.title, dock=self.dock,
@@ -648,7 +729,8 @@ class FoldFrames:
             # 끝 프레임은 접힌 창이 그리는 모습과 한 화소도 다르지 않게 한다.
             if self.style == FOLD_ICON:
                 paint_icon(p, self.slip_rect(), self.color, self.title,
-                           private=self.private, font=self.font)
+                           private=self.private, font=self.font,
+                           thumb=self.thumb)
             else:
                 paint_slip(p, self.slip_rect(), self.color, self.title,
                            dock=self.dock, private=self.private,

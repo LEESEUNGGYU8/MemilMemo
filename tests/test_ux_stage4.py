@@ -230,8 +230,8 @@ def test_close_to_tray_tells_once(window, monkeypatch):
     if window._tray is None:
         pytest.skip("트레이가 없는 환경")
     shown: list[str] = []
-    monkeypatch.setattr(window._tray, "showMessage",
-                        lambda title, text, *a: shown.append(text))
+    monkeypatch.setattr(window._toasts, "show_text",
+                        lambda text, **k: shown.append(text) or True)
     monkeypatch.setattr(window._tray, "isVisible", lambda: True)
     monkeypatch.setattr(window._settings, "save", lambda *a, **k: None)
     window._settings.close_main_to_tray = True

@@ -207,3 +207,30 @@ def test_client_reports_shared_notes():
 
     assert shared == [{"user": "민수", "note_id": "a"}]
     assert [n["id"] for n in created] == ["a", "b"]
+
+
+def test_deleting_a_private_folder_keeps_its_notes_private(host):
+    server, client, seen, repo = host
+    guest_seen = _with_guest(server)
+    client.create_folder("내 폴더", "#BAE1FF", private=True)
+    folder_id = seen.of("folder_created")[-1]["folder"]["id"]
+    client.create_note("#FFE066", 280, 260, folder_id=folder_id)
+    client.create_note("#FFE066", 280, 260, folder_id=folder_id, private_owner=HOST)
+
+    client.delete_folder(folder_id)
+
+    # 폴더가 없어져도 그 안의 메모는 다른 사람에게 가지 않는다.
+    assert guest_seen.of("note_created") == []
+    notes = repo.list_notes()
+    assert len(notes) == 2 and {n.private_owner for n in notes} == {HOST}
+    assert {n.folder_id for n in notes} == {None}
+
+
+def test_deleting_a_public_folder_leaves_its_notes_public(host):
+    server, client, seen, repo = host
+    _with_guest(server)
+    client.create_folder("회의", "#BAE1FF")
+    folder_id = seen.of("folder_created")[-1]["folder"]["id"]
+    client.create_note("#FFE066", 280, 260, folder_id=folder_id)
+    client.delete_folder(folder_id)
+    assert [n.private_owner for n in repo.list_notes()] == [None]
