@@ -65,7 +65,7 @@ from PySide6.QtGui import (  # noqa: E402
     QColor, QFont, QFontDatabase, QImage, QPainter, QPainterPath, QPen,
 )
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication, QTabWidget, QWidget  # noqa: E402
+from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
 import main as app_main  # noqa: E402
 from app import config  # noqa: E402
@@ -567,11 +567,10 @@ def shoot_raw(window) -> None:
     window._sessions_dialog.close()
 
     dlg = SettingsDialog(window._settings, role="host", parent=window)
-    tabs = dlg.findChild(QTabWidget)
     dlg.show()
-    for i, key in enumerate(("general", "memo", "startup", "network",
+    for i, key in enumerate(("general", "memo", "fold", "notify", "network",
                              "backup", "about")):
-        tabs.setCurrentIndex(i)
+        dlg.show_page(i)
         shot(dlg, f"raw-settings-{key}")
     dlg.close()
 
@@ -631,8 +630,8 @@ def run() -> None:
 
 
 def _hook_qapp() -> None:
-    import PySide6.QtWidgets as qw
-    real = qw.QApplication
+    # main.py 는 QApplication 이 아니라 그것을 물려받은 _App 을 만든다.
+    real = app_main._App
 
     class _HookedApp(real):
         def __init__(self, *a, **k):
@@ -640,12 +639,12 @@ def _hook_qapp() -> None:
             seed()
             QTimer.singleShot(1500, run)
 
-    app_main.QApplication = _HookedApp
+    app_main._App = _HookedApp
 
 
 def main() -> int:
     app_main.register_jumplist = lambda **kw: None
-    app_main._schedule_update_check = lambda app, window: None
+    app_main._schedule_update_check = lambda *args: None
     # 실행 중인 실제 앱과 같은 파이프 이름으로 듣지 않는다. 같은 이름이면
     # 작업 표시줄의 '새 메모'가 이 촬영용 인스턴스로 올 수 있다.
     from app import ipc

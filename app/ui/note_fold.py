@@ -38,13 +38,29 @@ SLIP_SIZE = QSize(184, 40)
 TAB_SIZE = QSize(46, 40)
 TAB_MAX_WIDTH = 240
 TAB_GAP = 6
-# 쪽지를 끌다가 화면 좌우 끝에서 이 거리 안에 놓으면 가장자리에 붙는다.
-SNAP_DISTANCE = 28
+# 위아래 벽의 탭은 벽을 따라 길고 납작하다. 마우스를 올리면 조금 더 나온다.
+HTAB_SIZE = QSize(132, 32)
+HTAB_GROW = 8
+# 접힌 메모를 끌 때 그 끝이 화면 벽에서 이 거리 안에 들면 붙는다. 아이콘 격자의
+# 첫 칸(벽에서 10)보다 작아야 벽 옆 칸에도 아이콘을 둘 수 있다.
+SNAP_DISTANCE = 6
+# 펼친 메모는 화면 끝 가까이에 두는 일이 흔하다. 커서를 벽까지 밀어야 붙는다.
+EDGE_PUSH = 4
+# 모니터끼리 맞닿은 끝에는 커서가 멈추지 않고 지나간다. 그 끝에 붙이려면 커서를
+# 끝에서 이 거리 안에 두고 놓는다.
+SEAM_DISTANCE = 14
 
 DOCK_NONE = ""
 DOCK_LEFT = "left"
 DOCK_RIGHT = "right"
-DOCK_SIDES = (DOCK_LEFT, DOCK_RIGHT)
+DOCK_TOP = "top"
+DOCK_BOTTOM = "bottom"
+DOCK_SIDES = (DOCK_LEFT, DOCK_RIGHT, DOCK_TOP, DOCK_BOTTOM)
+_SIDE_WALLS = (DOCK_LEFT, DOCK_RIGHT)
+# 모서리는 좌우 탭에 내주고, 위아래 탭은 그 안쪽에만 놓는다(서로 겹치지 않게).
+_CORNER_KEEP = TAB_SIZE.width() + 6
+# 화면 끝 너머 이만큼 떨어진 점에 다른 화면이 있으면 그 끝은 벽이 아니다.
+_WALL_PROBE = 2
 
 # 접힌 메모의 모양: 쪽지(제목이 적힌 납작한 종이) 또는 바탕화면 아이콘(그림 아래
 # 이름). 가장자리에 붙인 메모는 모양과 무관하게 탭이다.
@@ -119,6 +135,22 @@ def slip_path(rect: QRectF, dock: str) -> QPainterPath:
         path.quadTo(x0, y1, x0 + r, y1)
         path.lineTo(x1, y1)
         path.closeSubpath()
+    elif dock == DOCK_TOP:
+        path.moveTo(x0, y0)
+        path.lineTo(x1, y0)
+        path.lineTo(x1, y1 - r)
+        path.quadTo(x1, y1, x1 - r, y1)
+        path.lineTo(x0 + r, y1)
+        path.quadTo(x0, y1, x0, y1 - r)
+        path.closeSubpath()
+    elif dock == DOCK_BOTTOM:
+        path.moveTo(x0, y1)
+        path.lineTo(x0, y0 + r)
+        path.quadTo(x0, y0, x0 + r, y0)
+        path.lineTo(x1 - r, y0)
+        path.quadTo(x1, y0, x1, y0 + r)
+        path.lineTo(x1, y1)
+        path.closeSubpath()
     else:
         ear = _ear_size(rect)
         path.moveTo(x0 + r, y0)
@@ -161,9 +193,14 @@ def paint_slip(p: QPainter, rect: QRectF, color: str, title: str, *,
     if dock in DOCK_SIDES:
         # 화면 끝에 물린 쪽: 살짝 어두운 띠로 '끼워 둔' 느낌을 준다.
         strip = QRectF(body)
-        strip.setWidth(4.0)
-        if dock == DOCK_RIGHT:
-            strip.moveRight(body.right())
+        if dock in _SIDE_WALLS:
+            strip.setWidth(4.0)
+            if dock == DOCK_RIGHT:
+                strip.moveRight(body.right())
+        else:
+            strip.setHeight(4.0)
+            if dock == DOCK_BOTTOM:
+                strip.moveBottom(body.bottom())
         p.save()
         p.setClipPath(path)
         p.fillRect(strip, QColor(255, 255, 255, 50) if dark
@@ -201,18 +238,22 @@ def paint_slip(p: QPainter, rect: QRectF, color: str, title: str, *,
     pad_r = 10.0 + (4.0 if dock == DOCK_RIGHT else 0.0)
     if dock == DOCK_NONE:
         pad_r += _ear_size(body) * 0.6
-    text_rect = QRectF(body.left() + pad_l, body.top(),
-                       body.width() - pad_l - pad_r, body.height())
+    # 위아래 탭은 벽에 물린 띠를 뺀 자리의 가운데에 제목을 둔다.
+    pad_t = 4.0 if dock == DOCK_TOP else 0.0
+    pad_b = 4.0 if dock == DOCK_BOTTOM else 0.0
+    text_rect = QRectF(body.left() + pad_l, body.top() + pad_t,
+                       body.width() - pad_l - pad_r,
+                       body.height() - pad_t - pad_b)
     if private and text_rect.width() > 60:
         icon = svg_icon("lock", color=fg).pixmap(13, 13)
         p.drawPixmap(QPointF(text_rect.left(),
-                             body.center().y() - 6.5), icon)
+                             text_rect.center().y() - 6.5), icon)
         text_rect.setLeft(text_rect.left() + 18)
     p.setPen(QColor(fg))
     # 탭은 마우스를 올리면 폭이 늘어난다. 그 사이에 줄임표가 생겼다 사라지면
     # 글자가 튀어 보이므로, 가장 넓어졌을 때만 줄임표를 쓰고 그 전에는 들어가는
     # 글자만 보인다.
-    clip_only = (dock in DOCK_SIDES and rect.width() < TAB_MAX_WIDTH - 0.5) \
+    clip_only = (dock in _SIDE_WALLS and rect.width() < TAB_MAX_WIDTH - 0.5) \
         or text_rect.width() < fm.horizontalAdvance("가…")
     if clip_only:
         p.save()
@@ -515,16 +556,35 @@ def paint_icon_label(p: QPainter, cell: QRectF, text: str,
     p.restore()
 
 
-def _paint_icon_backplate(p: QPainter, cell: QRectF, hover: bool) -> None:
+def _paint_icon_hit_area(p: QPainter, cell: QRectF) -> None:
     # 반투명 창은 완전히 투명한 화소에서 마우스가 뒤 창으로 빠진다. 칸 전체를
     # 눈에 안 보이는 옅은 색으로 깔아 아이콘 둘레에서도 잡히게 한다.
     p.setPen(Qt.NoPen)
     p.setBrush(QColor(255, 255, 255, 1))
     p.drawRoundedRect(cell, 7, 7)
-    if hover:
-        p.setBrush(QColor(255, 255, 255, 52))
-        p.setPen(QPen(QColor(255, 255, 255, 96), 1.0))
-        p.drawRoundedRect(cell.adjusted(0.5, 0.5, -0.5, -0.5), 7, 7)
+
+
+def _paint_glyph(p: QPainter, rect: QRectF, hover: bool, draw) -> None:
+    """``draw(painter)`` 로 그림을 그린다. 마우스가 올라와 있으면 그림 모양대로만
+    밝힌다(둘레에 판을 깔지 않는다)."""
+    if not hover:
+        draw(p)
+        return
+    area = rect.adjusted(-2.0, -2.0, 2.0, 2.0)
+    device = p.device()
+    dpr = device.devicePixelRatioF() if device is not None else 1.0
+    layer = QPixmap(int(math.ceil(area.width() * dpr)),
+                    int(math.ceil(area.height() * dpr)))
+    layer.setDevicePixelRatio(dpr)
+    layer.fill(Qt.transparent)
+    q = QPainter(layer)
+    q.setRenderHint(QPainter.Antialiasing)
+    q.translate(-area.left(), -area.top())
+    draw(q)
+    q.setCompositionMode(QPainter.CompositionMode_SourceAtop)
+    q.fillRect(area, QColor(255, 255, 255, 62))
+    q.end()
+    p.drawPixmap(area.topLeft(), layer)
 
 
 def paint_icon(p: QPainter, cell: QRectF, color: str, title: str, *,
@@ -534,9 +594,10 @@ def paint_icon(p: QPainter, cell: QRectF, color: str, title: str, *,
     """접힌 메모를 바탕화면 아이콘 모양으로 그린다."""
     p.save()
     p.setRenderHint(QPainter.Antialiasing)
-    _paint_icon_backplate(p, cell, hover)
-    paint_note_glyph(p, icon_glyph_rect(cell), color, private=private,
-                     thumb=thumb)
+    _paint_icon_hit_area(p, cell)
+    glyph = icon_glyph_rect(cell)
+    _paint_glyph(p, glyph, hover, lambda q: paint_note_glyph(
+        q, glyph, color, private=private, thumb=thumb))
     paint_icon_label(p, cell, title, font)
     p.restore()
 
@@ -548,11 +609,12 @@ def paint_folder_icon(p: QPainter, cell: QRectF, color: str, name: str, *,
     폴더에 든 메모 수다."""
     p.save()
     p.setRenderHint(QPainter.Antialiasing)
-    _paint_icon_backplate(p, cell, hover)
+    _paint_icon_hit_area(p, cell)
     glyph = icon_glyph_rect(cell)
     glyph = QRectF(glyph.left() - 3.0, glyph.top() + 2.0,
                    glyph.width() + 6.0, glyph.height() - 6.0)
-    paint_folder_glyph(p, glyph, color, opened=opened)
+    _paint_glyph(p, glyph, hover, lambda q: paint_folder_glyph(
+        q, glyph, color, opened=opened))
     if count > 0:
         f = QFont(font) if font is not None else QFont(p.font())
         f.setPixelSize(10)
@@ -843,47 +905,75 @@ class FoldFrames:
 
 # ── 자리 계산 ───────────────────────────────────────────────────────────
 
-def dock_side_near(rect: QRect, screen: QRect,
-                   distance: int = SNAP_DISTANCE) -> str:
-    """쪽지 ``rect`` 가 화면 좌우 끝에 붙을 만큼 가까우면 그 쪽을 돌려준다."""
-    if rect.left() - screen.left() <= distance:
-        return DOCK_LEFT
-    if screen.right() - rect.right() <= distance:
-        return DOCK_RIGHT
-    return DOCK_NONE
+# 탭의 자리는 벽을 따라 잰 값 하나로 적는다. 좌우 벽이면 위에서부터(y), 위아래
+# 벽이면 왼쪽에서부터(x)다. 아래 함수들의 ``y``·``height`` 도 그 뜻으로 쓴다.
+
+def tab_size(side: str) -> QSize:
+    """다 접혀 벽에 붙은 탭의 크기."""
+    return QSize(TAB_SIZE) if side in _SIDE_WALLS else QSize(HTAB_SIZE)
 
 
-def clamp_dock_y(y: int, height: int, screen: QRect) -> int:
-    top = screen.top() + 8
-    bottom = screen.bottom() - height - 8
-    return max(top, min(int(y), max(top, bottom)))
+def tab_length(side: str) -> int:
+    """탭이 벽을 따라 차지하는 길이."""
+    return TAB_SIZE.height() if side in _SIDE_WALLS else HTAB_SIZE.width()
+
+
+def tab_rect(side: str, pos: int, screen: QRect, *, expanded: bool = False,
+             wide: int = 0) -> QRect:
+    """``screen`` 의 ``side`` 벽, 벽을 따라 ``pos`` 자리에 붙은 탭.
+
+    마우스를 올리면(``expanded``) 좌우 탭은 제목이 보이도록 ``wide`` 까지 길어지고,
+    위아래 탭은 조금 더 나온다."""
+    if side in _SIDE_WALLS:
+        w = max(TAB_SIZE.width(), int(wide)) if expanded else TAB_SIZE.width()
+        x = screen.left() if side == DOCK_LEFT else screen.right() - w + 1
+        return QRect(x, int(pos), w, TAB_SIZE.height())
+    h = HTAB_SIZE.height() + (HTAB_GROW if expanded else 0)
+    y = screen.top() if side == DOCK_TOP else screen.bottom() - h + 1
+    return QRect(int(pos), y, HTAB_SIZE.width(), h)
+
+
+def _dock_range(side: str, length: int, screen: QRect) -> tuple[int, int]:
+    if side in _SIDE_WALLS:
+        lo = screen.top() + 8
+        hi = screen.bottom() - length - 8
+    else:
+        lo = screen.left() + _CORNER_KEEP
+        hi = screen.right() - length - _CORNER_KEEP
+    return lo, max(lo, hi)
+
+
+def clamp_dock_y(y: int, height: int, screen: QRect,
+                 side: str = DOCK_LEFT) -> int:
+    lo, hi = _dock_range(side, height, screen)
+    return max(lo, min(int(y), hi))
 
 
 def free_dock_slot(y: int, height: int, screen: QRect,
-                   occupied: list[tuple[int, int]]) -> int:
-    """같은 가장자리의 다른 탭과 겹치지 않는, ``y`` 에 가장 가까운 자리.
+                   occupied: list[tuple[int, int]],
+                   side: str = DOCK_LEFT) -> int:
+    """같은 벽의 다른 탭과 겹치지 않는, ``y`` 에 가장 가까운 자리.
 
-    ``occupied`` 는 이미 놓인 탭들의 ``(위, 아래)`` 다. 아래로 밀어 보고 화면을
-    벗어나면 위로 올려 찾는다."""
-    y = clamp_dock_y(y, height, screen)
+    ``occupied`` 는 이미 놓인 탭들의 ``(시작, 끝)`` 이다. 뒤로 밀어 보고 화면을
+    벗어나면 앞으로 당겨 찾는다."""
+    lo, hi = _dock_range(side, height, screen)
+    y = max(lo, min(int(y), hi))
     spans = sorted(occupied)
 
-    def clash(top: int) -> tuple[int, int] | None:
+    def clash(start: int) -> tuple[int, int] | None:
         for a, b in spans:
-            if top < b + TAB_GAP and a < top + height + TAB_GAP:
+            if start < b + TAB_GAP and a < start + height + TAB_GAP:
                 return a, b
         return None
 
     down = y
-    limit_bottom = screen.bottom() - height - 8
-    while down <= limit_bottom:
+    while down <= hi:
         hit = clash(down)
         if hit is None:
             return down
         down = hit[1] + TAB_GAP
     up = y
-    limit_top = screen.top() + 8
-    while up >= limit_top:
+    while up >= lo:
         hit = clash(up)
         if hit is None:
             return up
@@ -891,11 +981,117 @@ def free_dock_slot(y: int, height: int, screen: QRect,
     return y
 
 
-def open_rect_for_dock(side: str, size: QSize, dock_y: int,
-                       screen: QRect) -> QRect:
-    """가장자리 탭에서 펼친 메모가 놓일 자리. 탭 높이에 맞추되 화면 안에 둔다."""
-    w, h = size.width(), size.height()
-    top = screen.top() + 8
-    y = max(top, min(int(dock_y), max(top, screen.bottom() - h - 8)))
-    x = screen.left() if side == DOCK_LEFT else screen.right() - w + 1
-    return QRect(x, y, w, h)
+# ── 화면의 바깥벽 ───────────────────────────────────────────────────────
+# ``screens`` 는 화면마다 ``(전체 영역, 작업 표시줄을 뺀 영역)`` 을 적은 목록이다.
+# 창에 기대지 않는 계산이라 모니터가 여럿인 배치도 숫자만으로 확인할 수 있다.
+
+def screen_index_at(point: QPoint,
+                    screens: list[tuple[QRect, QRect]]) -> int:
+    """``point`` 가 놓인 화면의 번호. 어느 화면에도 없으면 가장 가까운 화면."""
+    best, best_d = -1, -1
+    for i, (geo, _avail) in enumerate(screens):
+        if geo.contains(point):
+            return i
+        dx = max(geo.left() - point.x(), 0, point.x() - geo.right())
+        dy = max(geo.top() - point.y(), 0, point.y() - geo.bottom())
+        d = dx * dx + dy * dy
+        if best < 0 or d < best_d:
+            best, best_d = i, d
+    return best
+
+
+def is_outer_wall(side: str, index: int, screens: list[tuple[QRect, QRect]],
+                  along: int) -> bool:
+    """``index`` 화면의 ``side`` 끝이 바깥벽인가. 그 너머에 다른 화면이 이어져
+    있으면 바깥벽이 아니라 모니터 사이의 경계다. 크기가 다른 모니터는 끝의
+    일부만 맞닿으므로, 벽을 따라 잰 자리 ``along`` 에서 본다."""
+    geo = screens[index][0]
+    if side in _SIDE_WALLS:
+        along = max(geo.top(), min(int(along), geo.bottom()))
+        x = (geo.left() - _WALL_PROBE if side == DOCK_LEFT
+             else geo.right() + _WALL_PROBE)
+        probe = QPoint(x, along)
+    else:
+        along = max(geo.left(), min(int(along), geo.right()))
+        y = (geo.top() - _WALL_PROBE if side == DOCK_TOP
+             else geo.bottom() + _WALL_PROBE)
+        probe = QPoint(along, y)
+    return not any(other.contains(probe)
+                   for i, (other, _avail) in enumerate(screens) if i != index)
+
+
+def wall_for_drag(rect: QRect, cursor: QPoint,
+                  screens: list[tuple[QRect, QRect]],
+                  distance: int = SNAP_DISTANCE,
+                  seam_distance: int = SEAM_DISTANCE) -> tuple[str, int]:
+    """끌고 있는 ``rect`` 가 닿은 벽을 ``(쪽, 화면 번호)`` 로 돌려준다.
+    닿지 않았으면 쪽이 빈 문자열이다.
+
+    화면은 커서가 있는 곳으로 고른다. 벽은 작업 표시줄을 뺀 영역의 끝이다.
+
+    바깥벽은 ``rect`` 의 끝이 ``distance`` 안에 들면 닿은 것이다. 모니터끼리
+    맞닿은 경계에도 붙일 수 있지만, 그곳은 메모를 옆 화면으로 넘길 때 지나는
+    길이기도 하다. 끌려가는 쪽지가 경계에서 길게 걸리지 않도록, 경계는 커서가
+    ``seam_distance`` 안에 있을 때만 닿은 것으로 본다. 붙는 곳은 커서가 있는
+    쪽 화면의 끝이다.
+
+    모서리처럼 두 벽에 함께 닿으면 더 가까운 쪽을 고른다."""
+    if not screens:
+        return DOCK_NONE, -1
+    index = screen_index_at(cursor, screens)
+    avail = screens[index][1]
+    # (쪽, 메모 끝과 벽의 거리, 커서와 벽의 거리, 벽을 따라 잰 커서 자리)
+    gaps = (
+        (DOCK_LEFT, rect.left() - avail.left(),
+         cursor.x() - avail.left(), cursor.y()),
+        (DOCK_RIGHT, avail.right() - rect.right(),
+         avail.right() - cursor.x(), cursor.y()),
+        (DOCK_TOP, rect.top() - avail.top(),
+         cursor.y() - avail.top(), cursor.x()),
+        (DOCK_BOTTOM, avail.bottom() - rect.bottom(),
+         avail.bottom() - cursor.y(), cursor.x()),
+    )
+    found = DOCK_NONE
+    depth = 0
+    for side, rect_gap, cursor_gap, along in gaps:
+        if is_outer_wall(side, index, screens, along):
+            gap, limit = rect_gap, distance
+        else:
+            gap, limit = cursor_gap, seam_distance
+        if gap > limit:
+            continue
+        if not found or gap < depth:
+            found, depth = side, gap
+    return found, index
+
+
+def snap_to_wall(rect: QRect, side: str, screen: QRect) -> QRect:
+    """끌고 있는 쪽지를 벽에 댄 자리. 벽을 따라서는 화면 안에 둔다."""
+    r = QRect(rect)
+    if side == DOCK_LEFT:
+        r.moveLeft(screen.left())
+    elif side == DOCK_RIGHT:
+        r.moveRight(screen.right())
+    elif side == DOCK_TOP:
+        r.moveTop(screen.top())
+    elif side == DOCK_BOTTOM:
+        r.moveBottom(screen.bottom())
+    if side in _SIDE_WALLS:
+        r.moveTop(max(screen.top(), min(r.top(), screen.bottom() - r.height() + 1)))
+    elif side:
+        r.moveLeft(max(screen.left(), min(r.left(), screen.right() - r.width() + 1)))
+    return r
+
+
+def keep_on_screen(rect: QRect, screen: QRect) -> QRect:
+    """``rect`` 가 화면 밖으로 나가 있으면 안으로 들인다."""
+    r = QRect(rect)
+    if r.right() > screen.right():
+        r.moveRight(screen.right())
+    if r.bottom() > screen.bottom():
+        r.moveBottom(screen.bottom())
+    if r.left() < screen.left():
+        r.moveLeft(screen.left())
+    if r.top() < screen.top():
+        r.moveTop(screen.top())
+    return r

@@ -44,13 +44,13 @@ from PySide6.QtWidgets import (
     QWidgetAction,
 )
 
-from .. import config, i18n
+from .. import config, html_guard, i18n
 from .. import file_links as fl
 from ..image_export import (
     open_data_url_externally, parse_data_url, sniff_extension,
 )
 from ..settings import IMAGE_VIEWER_SYSTEM
-from . import edit_menu
+from . import dwm, edit_menu
 from . import note_fold as nf
 from .icons import color_swatch_icon, svg_icon
 from .image_viewer import ImageViewerWindow
@@ -88,7 +88,7 @@ from .rich_text import (
     marker_url_for_code,
     strip_link_icons,
 )
-from .theme import LIGHT_MENU_QSS, RoundedScrollBar, color_name
+from .theme import RoundedScrollBar, color_name
 
 
 # 바탕 화면과 앱 창 사이 레이어는 WindowStaysOnTopHint 로 만들 수 없어
@@ -110,8 +110,9 @@ def _pin_window_to_bottom(hwnd: int) -> None:
 
 
 def _set_window_topmost(hwnd: int, on: bool) -> None:
-    """가장자리에 붙인 메모는 다른 창을 쓰는 중에도 꺼내 볼 수 있어야 하므로
-    항상 위에 둔다. 떼면 일반 창으로 되돌린다."""
+    """가장자리에 붙인 탭은 다른 창을 쓰는 중에도 꺼내 볼 수 있어야 하므로
+    항상 위에 둔다. 펼치거나 떼면 일반 창으로 되돌린다(그때 보통 창들 가운데
+    맨 앞에 서고, 다른 창을 누르면 뒤로 간다)."""
     if platform.system() != "Windows" or hwnd == 0:
         return
     HWND_TOPMOST = -1
@@ -130,22 +131,38 @@ def _set_window_topmost(hwnd: int, on: bool) -> None:
         pass
 
 
-def _hide_dwm_border(hwnd: int) -> None:
-    """Windows 11 이 프레임 없는 창에 덧그리는 DWM 시스템 테두리를 꺼,
-    paintEvent 의 둥근 사각형만 경계로 남긴다."""
-    if platform.system() != "Windows" or hwnd == 0:
-        return
-    DWMWA_BORDER_COLOR = 34
-    DWMWA_COLOR_NONE = 0xFFFFFFFE
-    try:
-        dwm = ctypes.WinDLL("dwmapi")
-        color = ctypes.c_uint32(DWMWA_COLOR_NONE)
-        dwm.DwmSetWindowAttribute(
-            hwnd, DWMWA_BORDER_COLOR,
-            ctypes.byref(color), ctypes.sizeof(color),
-        )
-    except Exception:
-        pass
+class _DockGhost(QWidget):
+    """펼친 메모를 화면 벽으로 끌었을 때, 놓으면 생길 탭을 미리 보인다."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent, Qt.Tool | Qt.FramelessWindowHint
+                         | Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus
+                         | Qt.WindowTransparentForInput)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self._face: tuple | None = None
+
+    def preview(self, rect: QRect, color: str, title: str, side: str,
+                private: bool, font: QFont) -> None:
+        self._face = (color, title, side, private, QFont(font))
+        self.setGeometry(rect)
+        if not self.isVisible():
+            self.show()
+        self.update()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        dwm.set_bare(int(self.winId()))
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        if self._face is None:
+            return
+        color, title, side, private, font = self._face
+        painter = QPainter(self)
+        painter.setOpacity(0.78)
+        nf.paint_slip(painter, QRectF(self.rect()), color, title, dock=side,
+                      private=private, font=font)
+        painter.end()
 
 
 def _make_format_button(icon: QIcon, tip: str, checkable: bool = False) -> QToolButton:
@@ -302,8 +319,8 @@ class StickyNoteWidget(QWidget):
     privateToggleRequested = Signal(str, bool)  # note_id, new_private
     positionChanged = Signal(str, int, int)
     sizeChanged = Signal(str, int, int)  # note_id, w, h
-    # note_id, folded, dock, dock_y, fold_style
-    foldChanged = Signal(str, bool, str, int, str)
+    # note_id, 접힘 상태(folded, dock, dock_y, fold_style, fold_x, fold_y, fold_at)
+    foldChanged = Signal(str, object)
 
     _DEFAULT_FONT_SIZE = 11
     _AUTOSAVE_INTERVAL_MS = 30_000
@@ -384,6 +401,7 @@ class StickyNoteWidget(QWidget):
         handle_row.addWidget(self._private_icon, 0, Qt.AlignVCenter)
 
         self._lock_label = QLabel("", self._handle)
+        self._lock_label.setTextFormat(Qt.PlainText)   # 편집 중인 사람의 닉네임
         self._lock_label.setStyleSheet(
             "color: #3A3A3A; font-size: 11px; background: transparent;"
         )
@@ -536,6 +554,7 @@ class StickyNoteWidget(QWidget):
         # 다른 사람이 편집 중인 메모를 고치려다 거절됐을 때 잠깐 뜨는 알림.
         # 예전에는 남이 편집하는 내내 본문을 덮어 읽지도 못하게 했다.
         self._overlay = QLabel("", self)
+        self._overlay.setTextFormat(Qt.PlainText)
         self._overlay.setAlignment(Qt.AlignCenter)
         self._overlay.setWordWrap(True)
         self._overlay.setStyleSheet(
@@ -563,10 +582,15 @@ class StickyNoteWidget(QWidget):
         # 접기 · 가장자리 붙이기. 접힌 동안에는 이 창 자체가 쪽지(붙였으면 탭)가
         # 된다. 창을 따로 두지 않아 잠금·저장·닫기 흐름이 그대로다.
         self._folded = False
+        # 붙여 둔 벽과, 벽을 따라 잰 탭의 자리(좌우 벽은 y, 위아래 벽은 x).
         self._dock = nf.DOCK_NONE
         self._dock_y = 0
         self._open_pos = QPoint()            # 펼쳤을 때의 왼쪽 위(저장되는 위치)
         self._open_size = QSize()            # 접힌 동안 기억해 두는 펼친 크기
+        # 접힌 메모(쪽지·아이콘·탭)를 끌어다 둔 자리. 펼친 자리와 따로 기억한다.
+        # 정해 둔 적이 없으면 펼친 메모의 왼쪽 위에서 그대로 접힌다.
+        self._fold_pos = QPoint()
+        self._fold_at = False
         self._open_pix: QPixmap | None = None  # 접을 때 찍어 둔 펼친 모습
         self._fold_frames: nf.FoldFrames | None = None
         self._fold_t = 0.0
@@ -574,10 +598,16 @@ class StickyNoteWidget(QWidget):
         self._fold_done = None
         self._fold_target = QRect()
         self._geo_anim: QVariantAnimation | None = None
+        self._geo_done = None
+        self._pre_unfold = False             # 펼칠 자리로 옮겨 가는 중
         self._slip_press: QPoint | None = None
         self._slip_grab = QPoint()
         self._slip_dragging = False
         self._drag_dock = nf.DOCK_NONE       # 끄는 동안 미리 보이는 붙을 쪽
+        self._drag_avail = QRect()           # 그 벽이 있는 화면
+        self._drag_cursor = QPoint()
+        self._drag_from = QPoint()           # 펼친 메모를 끌기 시작한 자리
+        self._ghost: _DockGhost | None = None
         self._slip_hover = False
         self._topmost = False
         self._dock_resolver = None
@@ -608,6 +638,8 @@ class StickyNoteWidget(QWidget):
         # 편집 중이 아닐 때 끌어다 놓은 것. 잠금을 받은 뒤에 넣는다.
         self._pending_drop: QMimeData | None = None
         self._pending_drop_pos = -1
+        # 편집을 시작하면 본문 끝에 링크로 넣을 파일·폴더 경로.
+        self._pending_links: list[str] = []
         # 접힌 아이콘에 넣는 첫 이미지의 작은 그림(내용이 바뀌면 다시 만든다).
         self._thumb_src: str | None = None
         self._thumb_pix: QPixmap | None = None
@@ -621,7 +653,8 @@ class StickyNoteWidget(QWidget):
         if not content:
             self._text.clear()
         elif "<" in content and ">" in content:
-            self._text.setHtml(content)
+            # 본문이 가리키는 바깥 자원(네트워크 경로의 그림 등)은 걷어 내고 그린다.
+            self._text.setHtml(html_guard.clean(content))
         else:
             self._text.setPlainText(content)
         self._convert_loaded_markers()
@@ -784,13 +817,12 @@ class StickyNoteWidget(QWidget):
                 self._open_pix = None
             else:
                 self.resize(w, h)
-                if self._dock:
-                    self.setGeometry(nf.open_rect_for_dock(
-                        self._dock, self.size(), self._dock_y, self._avail()))
         if self._folded:
             # 제목이나 색이 바뀌었을 수 있다. 탭은 폭도 제목을 따른다.
-            if self._dock and self._slip_hover and not self._slip_dragging:
+            if (self._dock and self._slip_hover and not self._slip_dragging
+                    and not self._fold_busy()):
                 self._slide_to(self._tab_rect(True), nf.TAB_HOVER_MS)
+            self._refresh_face_tip()
             self.update()
 
     def set_lock_holder(self, holder: str | None) -> None:
@@ -811,6 +843,7 @@ class StickyNoteWidget(QWidget):
             # 종료와 같은 경로). 접힌 메모가 보이지 않는 채로 잠금을 쥐면 안 된다.
             self._abandon_grant = False
             self._pending_drop = None
+            self._pending_links = []
             self.releaseLock.emit(self.note_id)
             return
         self._edit_mode = True
@@ -825,6 +858,7 @@ class StickyNoteWidget(QWidget):
         # 행을 남기지 않도록 비교 기준 스냅샷을 떠 둔다.
         self._edit_baseline = self._edit_snapshot()
         self._apply_pending_drop()
+        self._apply_pending_links()
         if pending_check is not None:
             # 체크박스 한 번 누르기: 그 상자만 바꾸고 곧바로 저장하고 잠금을 푼다.
             block = self._text.document().findBlockByNumber(pending_check)
@@ -876,6 +910,46 @@ class StickyNoteWidget(QWidget):
         self._text.setTextCursor(cursor)
         self._text.insertFromMimeData(source)
 
+    def add_file_links(self, paths: list[str]) -> None:
+        """파일·폴더를 가리키는 링크를 본문 끝에 한 줄에 하나씩 넣는다.
+
+        잠금 없이는 호스트로 보낼 수 없으므로, 편집 중이 아니면 편집을 먼저
+        시작하고 잠금을 받은 뒤에 넣는다."""
+        self._pending_links += [p for p in paths if p]
+        if not self._pending_links:
+            return
+        if self._edit_mode:
+            self._apply_pending_links()
+            return
+        if self.is_locked_by_other() or self._folded or self._fold_busy():
+            self._pending_links = []
+            return
+        if not self._pending_lock:
+            self._request_edit()
+        if not self._pending_lock and not self._edit_mode:
+            # 끊겨 있어 편집을 시작하지 못했다(안내는 _request_edit 이 띄웠다).
+            self._pending_links = []
+
+    def _apply_pending_links(self) -> None:
+        paths, self._pending_links = self._pending_links, []
+        if not paths:
+            return
+        cursor = self._text.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self._text.setTextCursor(cursor)
+        for path in paths:
+            cursor = self._text.textCursor()
+            if cursor.block().length() > 1:
+                cursor.insertBlock()
+                self._text.setTextCursor(cursor)
+            self._text.insert_file_links([path])
+        if not self.isActiveWindow():
+            # Windows 가 앞에 세우기를 막아 뒤에 남은 메모다. 보이지 않는 창이
+            # 잠금을 쥐고 있지 않게, 넣은 것만 보내고 편집을 끝낸다.
+            self._commit_and_release()
+        elif self._pending_commit is None:
+            self._autosave_while_editing()
+
     def _save_after_image(self) -> None:
         """이미지를 넣은 직후에 한 번 보낸다(크기 제한을 따지지 않는다)."""
         if not self._edit_mode:
@@ -890,6 +964,7 @@ class StickyNoteWidget(QWidget):
         self._pending_lock = False
         self._pending_check = None
         self._pending_drop = None
+        self._pending_links = []
         self._abandon_grant = False
         self._text.setReadOnly(True)
         self._lock_label.setText(i18n.t("sticky.lock_editing_by", holder=holder))
@@ -1163,17 +1238,14 @@ class StickyNoteWidget(QWidget):
         add("clock", i18n.t("sticky.tip_history"),
             lambda: self.historyRequested.emit(self.note_id))
         menu.addSeparator()
-        add("fold", i18n.t("sticky.more_fold"),
-            lambda: self.fold(style=nf.FOLD_SLIP))
-        add("note", i18n.t("sticky.more_fold_icon"),
-            lambda: self.fold(style=nf.FOLD_ICON))
         if self._dock:
-            add("unfold", i18n.t("sticky.more_undock"), self.undock)
+            # 벽에 붙여 둔 메모는 접으면 늘 그 자리의 탭으로 돌아간다.
+            add("fold", i18n.t("sticky.tip_fold"), self.fold)
         else:
-            add("dock_left", i18n.t("sticky.more_dock_left"),
-                lambda: self.dock(nf.DOCK_LEFT))
-            add("dock_right", i18n.t("sticky.more_dock_right"),
-                lambda: self.dock(nf.DOCK_RIGHT))
+            add("fold", i18n.t("sticky.more_fold"),
+                lambda: self.fold(style=nf.FOLD_SLIP))
+            add("note", i18n.t("sticky.more_fold_icon"),
+                lambda: self.fold(style=nf.FOLD_ICON))
         menu.addSeparator()
         add("lock", i18n.t("sticky.more_private_off") if is_private
             else i18n.t("sticky.more_private_on"),
@@ -1901,6 +1973,7 @@ class StickyNoteWidget(QWidget):
                 and self._on_handle_bar(event.position().toPoint())):
             self._drag_offset = (event.globalPosition().toPoint()
                                   - self.frameGeometry().topLeft())
+            self._drag_from = self.pos()
             event.accept()
             return
         super().mousePressEvent(event)
@@ -1920,7 +1993,9 @@ class StickyNoteWidget(QWidget):
             event.accept()
             return
         if self._drag_offset is not None and (event.buttons() & Qt.LeftButton):
-            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            gp = event.globalPosition().toPoint()
+            self.move(gp - self._drag_offset)
+            self._preview_wall(gp)
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -1941,8 +2016,15 @@ class StickyNoteWidget(QWidget):
             return
         if self._drag_offset is not None:
             self._drag_offset = None
-            if self._dock:
-                self._settle_docked_open()
+            side = self._drag_dock
+            avail, cursor = QRect(self._drag_avail), QPoint(self._drag_cursor)
+            self._clear_wall_preview()
+            if side and not self._fold_busy():
+                # 벽까지 끌어다 놓았다. 그 벽의 탭으로 접는다. 펼친 자리는 끌기
+                # 전 그대로 둬서, 다시 펴면 원래 있던 곳으로 돌아온다.
+                self._open_pos = QPoint(self._drag_from)
+                self._dock_to(side, self._tab_along(side, cursor), avail)
+                self._fold_now()
             else:
                 self._open_pos = self.pos()
                 self.positionChanged.emit(self.note_id, self.x(), self.y())
@@ -1962,6 +2044,7 @@ class StickyNoteWidget(QWidget):
                 and event.button() == Qt.LeftButton
                 and self._on_handle_bar(event.position().toPoint())):
             self._drag_offset = None
+            self._clear_wall_preview()
             self.fold()
             event.accept()
             return
@@ -2008,35 +2091,29 @@ class StickyNoteWidget(QWidget):
         if not self._folded or self._fold_busy():
             super().contextMenuEvent(event)
             return
-        menu = QMenu(self)
-        menu.setStyleSheet(LIGHT_MENU_QSS)
-        menu.addAction(i18n.t("sticky.slip_unfold")).triggered.connect(
+        menu = edit_menu.new_menu(self)
+        ink = "#3A3A3A"
+        add_centered_menu_action(
+            menu, svg_icon("unfold", color=ink), i18n.t("sticky.slip_unfold"),
             self.unfold)
-        menu.addSeparator()
         if not self._dock:
-            # 접힌 모양 고르기: 쪽지 또는 바탕화면 아이콘.
+            # 접힌 모양 고르기: 쪽지 또는 바탕화면 아이콘. 벽에 붙인 메모는 늘 탭이다.
             if self._icon_mode():
-                menu.addAction(i18n.t("sticky.slip_style_slip")
-                               ).triggered.connect(
+                add_centered_menu_action(
+                    menu, svg_icon("fold", color=ink),
+                    i18n.t("sticky.slip_style_slip"),
                     lambda: self.set_fold_style(nf.FOLD_SLIP))
             else:
-                menu.addAction(i18n.t("sticky.slip_style_icon")
-                               ).triggered.connect(
+                add_centered_menu_action(
+                    menu, svg_icon("note", color=ink),
+                    i18n.t("sticky.slip_style_icon"),
                     lambda: self.set_fold_style(nf.FOLD_ICON))
-            menu.addSeparator()
-        if self._dock:
-            menu.addAction(i18n.t("sticky.more_undock")).triggered.connect(
-                self.undock)
-        if self._dock != nf.DOCK_LEFT:
-            menu.addAction(i18n.t("sticky.more_dock_left")).triggered.connect(
-                lambda: self.dock(nf.DOCK_LEFT))
-        if self._dock != nf.DOCK_RIGHT:
-            menu.addAction(i18n.t("sticky.more_dock_right")).triggered.connect(
-                lambda: self.dock(nf.DOCK_RIGHT))
         menu.addSeparator()
-        menu.addAction(i18n.t("sticky.more_hide")).triggered.connect(
+        add_centered_menu_action(
+            menu, svg_icon("eye_off", color=ink), i18n.t("sticky.more_hide"),
             lambda: self.hideRequested.emit(self.note_id))
-        menu.exec(event.globalPos())
+        edit_menu.run_menu(menu, event.globalPos())
+        menu.deleteLater()
         event.accept()
 
     def _on_handle_bar(self, pos: QPoint) -> bool:
@@ -2051,15 +2128,16 @@ class StickyNoteWidget(QWidget):
         return self._dock
 
     def dock_span(self) -> tuple[int, int]:
-        """붙어 있는 탭이 차지하는 세로 구간 ``(위, 아래)``."""
-        return (self._dock_y, self._dock_y + nf.TAB_SIZE.height())
+        """붙어 있는 탭이 벽을 따라 차지하는 구간 ``(시작, 끝)``."""
+        return (self._dock_y, self._dock_y + nf.tab_length(self._dock))
 
     def dock_screen_rect(self) -> QRect:
         return self._dock_avail()
 
     def set_dock_resolver(self, resolver) -> None:
         """``resolver(note_id, side, y, height, screen_rect) -> y`` 는 같은
-        가장자리의 다른 탭과 겹치지 않는 자리를 돌려준다."""
+        벽의 다른 탭과 겹치지 않는 자리를 돌려준다. ``y`` 와 ``height`` 는 벽을
+        따라 잰 자리와 길이다."""
         self._dock_resolver = resolver
 
     def refresh_dock_layer(self) -> None:
@@ -2090,13 +2168,12 @@ class StickyNoteWidget(QWidget):
 
     def reveal(self) -> None:
         """목록·트레이에서 고른 메모를 펼쳐 앞으로 가져온다."""
-        if not self._dock and not self._fold_busy():
+        if not self._folded and not self._fold_busy():
             # 그 사이 모니터 구성이 바뀌어 화면 밖에 있으면 데려온다.
             pos = self._pull_on_screen(self.pos(), self.size())
             if pos != self.pos():
                 self.move(pos)
-                if not self._folded:
-                    self._open_pos = QPoint(pos)
+                self._open_pos = QPoint(pos)
                 self.positionChanged.emit(self.note_id, pos.x(), pos.y())
         if self._folded and not self._fold_busy():
             self.unfold()
@@ -2147,8 +2224,8 @@ class StickyNoteWidget(QWidget):
         self._fold_style = style
         if self._folded and not self._dock:
             self._stop_geo_anim()
-            self.setGeometry(self._folded_rect())
-            self.setToolTip(self._title() if self._icon_mode() else "")
+            self.setGeometry(QRect(self.pos(), self._face_size()))
+            self._refresh_face_tip()
             self.update()
         self._emit_fold_state()
 
@@ -2208,38 +2285,56 @@ class StickyNoteWidget(QWidget):
 
     def apply_local_state(self, x: int, y: int, w: int = 0, h: int = 0, *,
                           folded: bool = False, dock: str = "",
-                          dock_y: int = 0, fold_style: str = "") -> None:
+                          dock_y: int = 0, fold_style: str = "",
+                          fold_x: int = 0, fold_y: int = 0,
+                          fold_at: bool = False) -> None:
         """이 PC 에 저장해 둔 위치·크기·접힘 상태로 창을 놓는다(처음 한 번,
-        보이기 전에 부른다)."""
+        보이기 전에 부른다). ``x``·``y`` 는 펼친 자리, ``fold_x``·``fold_y`` 는
+        접힌 메모를 둔 자리다(``fold_at`` 이 참일 때만 뜻이 있다)."""
         if w and h:
             self.resize(int(w), int(h))
             self._local_size_set = True
         # 모니터를 떼거나 해상도를 바꾸면 저장해 둔 자리가 화면 밖이 된다.
         pos = self._pull_on_screen(QPoint(int(x), int(y)), self.size())
-        x, y = pos.x(), pos.y()
-        self.move(x, y)
-        self._open_pos = QPoint(int(x), int(y))
+        self.move(pos)
+        self._open_pos = QPoint(pos)
         self._open_size = QSize(self.size())
         self._fold_style = fold_style if fold_style in nf.FOLD_STYLES else ""
         self._dock = dock if dock in nf.DOCK_SIDES else nf.DOCK_NONE
+        self._fold_at = bool(fold_at)
+        self._fold_pos = QPoint(int(fold_x), int(fold_y))
         if self._dock:
-            avail = self._dock_avail()
-            self._dock_y = self._resolve_slot(self._dock, int(dock_y), avail)
-            self._open_pos = nf.open_rect_for_dock(
-                self._dock, self._open_size, self._dock_y, avail).topLeft()
+            if self._fold_at:
+                tab = nf.tab_size(self._dock)
+                avail = self._screen_rect_at(self._fold_pos + QPoint(
+                    tab.width() // 2, tab.height() // 2))
+                along = self._along(self._dock, self._fold_pos)
+            else:
+                # 접힌 자리를 따로 적지 않던 버전의 상태. 그때는 펼친 자리가
+                # 붙인 벽 바로 옆이었으므로 그 자리로 화면을 가린다.
+                avail = self._screen_rect_at(self._open_pos + QPoint(8, 8))
+                along = int(dock_y)
+            self._dock_y = self._resolve_slot(self._dock, along, avail)
+            self._fold_pos = nf.tab_rect(self._dock, self._dock_y,
+                                         avail).topLeft()
+            self._fold_at = True
+        elif self._fold_at:
+            self._fold_pos = self._pull_on_screen(self._fold_pos,
+                                                  self._face_size())
         if folded:
             self._folded = True
             self._set_body_visible(False)
             self.setMinimumSize(0, 0)
             self.setCursor(Qt.PointingHandCursor)
             self.setGeometry(self._folded_rect())
-            self.setToolTip(self._title() if self._icon_mode() else "")
-        elif self._dock:
-            self.move(self._open_pos)
+            self._refresh_face_tip()
 
     def fold(self, dock: str | None = None, style: str | None = None) -> None:
-        """메모를 접는다. ``dock`` 을 주면 그 가장자리에 붙이고, ``style`` 을
-        주면 이 메모의 접힌 모양(쪽지·아이콘)을 그것으로 정한다."""
+        """메모를 접는다. ``style`` 을 주면 이 메모의 접힌 모양(쪽지·아이콘)을
+        그것으로 정하고, ``dock`` 을 주면 지금 화면의 그 벽에 탭으로 붙인다.
+
+        접힌 메모를 둔 자리가 있으면 접힌 뒤 그리로 간다. 펼친 자리는 따로
+        기억해 두었다가 다시 펼 때 쓴다."""
         if self._fold_busy():
             return
         if style in nf.FOLD_STYLES:
@@ -2250,47 +2345,38 @@ class StickyNoteWidget(QWidget):
             elif style in nf.FOLD_STYLES:
                 self.set_fold_style(style)
             return
+        self._open_pos = self.pos()
+        if dock in nf.DOCK_SIDES:
+            self._dock_to(dock, self._along(dock, self.pos()), self._avail())
+        self._fold_now()
+
+    def _fold_now(self) -> None:
+        """펼친 메모를 그 자리에서 접는다(펼친 자리는 이미 정해져 있다)."""
         if self._edit_mode:
             self._commit_and_release()
         self._drag_offset = None
-        open_rect = self.geometry()
-        avail = self._avail()
-        self._open_size = QSize(open_rect.size())
-        if dock in nf.DOCK_SIDES and dock != self._dock:
-            self._dock = dock
-            self._dock_y = self._resolve_slot(dock, open_rect.y(), avail)
-        if self._dock:
-            edge = nf.open_rect_for_dock(
-                self._dock, self._open_size, self._dock_y, avail)
-            self._open_pos = edge.topLeft()
-            at_edge = edge.x() == open_rect.x()
-        else:
-            self._open_pos = open_rect.topLeft()
-            at_edge = False
+        self._clear_wall_preview()
+        self._open_size = QSize(self.size())
         self._fold_target = self._folded_rect()
 
         pix = self.grab()
         self._open_pix = pix
         self._set_body_visible(False)
-        # 붙이러 가는 메모(아직 가장자리가 아닌 자리)는 쪽지로 접힌 뒤 탭 자리로
-        # 미끄러져 간다. 아이콘 모양은 떠 있는 메모에만 쓴다.
-        style = nf.FOLD_SLIP if self._dock else self._style_now()
-        if at_edge:
-            face = nf.TAB_SIZE
-        elif style == nf.FOLD_ICON:
-            face = nf.ICON_SIZE
-        else:
-            face = nf.SLIP_SIZE
+        self._set_bare(True)
+        # 벽에 붙인 메모는 접힌 모양 설정과 무관하게 탭으로 접힌다.
         self._fold_frames = nf.FoldFrames(
-            pix, face,
+            pix, self._fold_target.size(),
             color=self.color, title=self._title(),
-            anchor=self._dock or nf.DOCK_LEFT,
-            dock=self._dock if at_edge else nf.DOCK_NONE,
-            private=bool(self.private_owner), font=self.font(), style=style,
-            thumb=self._fold_thumb())
+            anchor=self._fold_anchor(), dock=self._dock,
+            private=bool(self.private_owner), font=self.font(),
+            style=self._style_now(), thumb=self._fold_thumb())
         self._fold_t = 0.0
         self.update()
         self._run_fold(0.0, 1.0, nf.FOLD_MS, self._finish_fold)
+
+    def _fold_anchor(self) -> str:
+        """접는 그림에서 쪽지가 남는 쪽. 오른쪽 벽의 탭은 오른쪽으로 접는다."""
+        return nf.DOCK_RIGHT if self._dock == nf.DOCK_RIGHT else nf.DOCK_LEFT
 
     def _finish_fold(self) -> None:
         frames = self._fold_frames
@@ -2305,34 +2391,43 @@ class StickyNoteWidget(QWidget):
         self.setMinimumSize(0, 0)
         self.setCursor(Qt.PointingHandCursor)
         self.setGeometry(end)
-        # 아이콘은 이름이 두 줄에서 잘릴 수 있어 말풍선으로 전체를 보인다.
-        self.setToolTip(self._title() if self._icon_mode() else "")
+        self._refresh_face_tip()
         self._apply_z_order()
         self.update()
         self._slide_to(self._fold_target)
         self._emit_fold_state()
 
     def unfold(self) -> None:
-        """쪽지(탭)를 다시 메모로 편다."""
+        """쪽지(탭)를 다시 메모로 편다. 직전에 펼쳐 있던 자리에서 펴진다."""
         if not self._folded or self._fold_busy():
             return
         self._stop_geo_anim()
         self._slip_press = None
         self._slip_dragging = False
+        open_rect = self._open_rect()
+        self._open_pos = open_rect.topLeft()
+        # 펴는 그림은 쪽지가 메모의 위쪽 모서리에 놓인 데서 시작한다. 접힌
+        # 메모가 다른 곳에 있으면 먼저 그리로 옮긴다.
+        face = self.size()
+        if self._fold_anchor() == nf.DOCK_RIGHT:
+            start = QRect(open_rect.right() - face.width() + 1, open_rect.top(),
+                          face.width(), face.height())
+        else:
+            start = QRect(open_rect.topLeft(), face)
+        if start != self.geometry() and self._animations_on():
+            self._pre_unfold = True
+            self._slip_hover = False
+            self._slide_to(start, nf.SLIDE_MS, done=self._unfold_now)
+            return
+        self._unfold_now()
+
+    def _unfold_now(self) -> None:
+        self._pre_unfold = False
         cur = self.geometry()
         size = self._current_open_size()
-        if self._dock:
-            avail = self._dock_avail()
-            open_rect = nf.open_rect_for_dock(
-                self._dock, size, self._dock_y, avail)
-            anchor = self._dock
-            face_dock = self._dock
-        else:
-            open_rect = self._kept_on_screen(QRect(cur.topLeft(), size),
-                                             self._avail())
-            anchor = nf.DOCK_LEFT
-            face_dock = nf.DOCK_NONE
-        self._open_pos = open_rect.topLeft()
+        open_rect = QRect(self._open_pos, size)
+        anchor = self._fold_anchor()
+        face_dock = self._dock
 
         animate = self._animations_on()
         pix = self._open_pix if animate else None
@@ -2385,101 +2480,138 @@ class StickyNoteWidget(QWidget):
         self._fold_t = 0.0
         self._open_pix = None
         self._set_body_visible(True)
+        self._set_bare(False)
         self._refresh_lock_ui()
         self._apply_z_order()
         self.update()
         self._emit_fold_state()
 
+    def _open_rect(self) -> QRect:
+        """다시 펼 자리. 직전에 펼쳐 있던 자리 그대로다."""
+        rect = QRect(self._open_pos, self._current_open_size())
+        if self._fold_at and not self._dock and self._fold_pos == self._open_pos:
+            # 접힌 자리를 따로 적지 않던 버전은 쪽지를 둔 자리를 펼친 자리로
+            # 적었다. 화면 끝에 둔 쪽지를 그대로 펴면 메모가 화면 밖으로 나간다.
+            return nf.keep_on_screen(rect, self._screen_rect_at(rect.topLeft()))
+        return QRect(self._pull_on_screen(rect.topLeft(), rect.size()),
+                     rect.size())
+
     def dock(self, side: str) -> None:
-        """메모를 화면 가장자리에 붙인다. 펼쳐 있으면 접어서 붙인다."""
+        """메모를 지금 화면의 ``side`` 벽에 탭으로 붙인다. 펼쳐 있으면 접어서
+        붙인다. 사용자는 끌어다 붙이고, 이 함수는 그 밖의 경로가 쓴다."""
         if side not in nf.DOCK_SIDES or self._fold_busy():
             return
         if not self._folded:
             self.fold(dock=side)
             return
-        self._place_tab(side, self.y(), self._avail())
+        self._dock_to(side, self._along(side, self.pos()), self._avail())
+        self._refresh_face_tip()
+        self._slide_to(self._tab_rect(self._slip_hover))
+        self.update()
         self._emit_fold_state()
 
     def undock(self) -> None:
-        """가장자리에서 뗀다. 접혀 있으면 가장자리 옆에 쪽지로 남는다."""
+        """벽에서 뗀다. 접혀 있으면 벽 옆에 쪽지(아이콘)로 남는다."""
         if not self._dock or self._fold_busy():
             return
         side = self._dock
         avail = self._dock_avail()
+        tab = self._tab_rect(False)
         self._dock = nf.DOCK_NONE
+        face = self._face_size()
+        if side == nf.DOCK_LEFT:
+            pos = QPoint(avail.left() + 24, tab.top())
+        elif side == nf.DOCK_RIGHT:
+            pos = QPoint(avail.right() - face.width() - 23, tab.top())
+        elif side == nf.DOCK_TOP:
+            pos = QPoint(tab.left(), avail.top() + 24)
+        else:
+            pos = QPoint(tab.left(), avail.bottom() - face.height() - 23)
+        rect = nf.keep_on_screen(QRect(pos, face), avail)
+        self._fold_pos = rect.topLeft()
+        self._fold_at = True
         if self._folded:
-            face = self._face_size()
-            x = (avail.left() + 24 if side == nf.DOCK_LEFT
-                 else avail.right() - face.width() - 23)
-            rect = QRect(QPoint(x, self.y()), face)
-            self._open_pos = rect.topLeft()
-            self.setToolTip(self._title() if self._icon_mode() else "")
+            self._refresh_face_tip()
             self._slide_to(rect)
-        else:
-            self._open_pos = self.pos()
         self._apply_z_order()
         self.update()
         self._emit_fold_state()
 
-    def _place_tab(self, side: str, y: int, avail: QRect) -> None:
+    def _dock_to(self, side: str, along: int, avail: QRect) -> None:
+        """``avail`` 화면의 ``side`` 벽, 벽을 따라 ``along`` 근처에 탭 자리를 잡는다."""
         self._dock = side
-        self._dock_y = self._resolve_slot(side, y, avail)
-        self._open_pos = nf.open_rect_for_dock(
-            side, self._current_open_size(), self._dock_y, avail).topLeft()
+        self._dock_y = self._resolve_slot(side, int(along), avail)
+        self._fold_pos = nf.tab_rect(side, self._dock_y, avail).topLeft()
+        self._fold_at = True
         self._apply_z_order()
-        self._slide_to(self._tab_rect(self._slip_hover))
-        self.update()
 
-    def _settle_docked_open(self) -> None:
-        """붙인 채 펼친 메모를 끌어 옮겼다. 가장자리 근처에 놓으면 그 자리에
-        다시 붙고, 멀리 놓으면 떨어진다."""
-        avail = self._avail()
-        side = nf.dock_side_near(self.frameGeometry(), avail)
-        if side:
-            self._dock = side
-            self._dock_y = self._resolve_slot(side, self.y(), avail)
-            rect = nf.open_rect_for_dock(side, self.size(), self._dock_y, avail)
-            self._open_pos = rect.topLeft()
-            self._slide_to(rect)
-        else:
-            self._dock = nf.DOCK_NONE
-            self._open_pos = self.pos()
-        self._apply_z_order()
-        self._emit_fold_state()
+    @staticmethod
+    def _along(side: str, point: QPoint) -> int:
+        """벽을 따라 잰 자리. 좌우 벽은 위에서부터, 위아래 벽은 왼쪽에서부터다."""
+        if side in (nf.DOCK_LEFT, nf.DOCK_RIGHT):
+            return point.y()
+        return point.x()
+
+    def _tab_along(self, side: str, cursor: QPoint) -> int:
+        """커서가 탭의 가운데에 오는 자리."""
+        return self._along(side, cursor) - nf.tab_length(side) // 2
+
+    def _preview_wall(self, gp: QPoint) -> None:
+        """펼친 메모를 끄는 동안 커서가 화면 벽에 닿으면, 놓았을 때 생길 탭을
+        그 자리에 미리 보인다."""
+        screens = self._screens()
+        side, index = nf.wall_for_drag(QRect(gp, QSize(1, 1)), gp, screens,
+                                       nf.EDGE_PUSH)
+        if not side:
+            self._clear_wall_preview()
+            return
+        avail = QRect(screens[index][1])
+        self._drag_dock = side
+        self._drag_avail = avail
+        self._drag_cursor = QPoint(gp)
+        if not self.isVisible():
+            return
+        if self._ghost is None:
+            self._ghost = _DockGhost(self)
+        along = self._resolve_slot(side, self._tab_along(side, gp), avail)
+        self._ghost.preview(nf.tab_rect(side, along, avail), self.color,
+                            self._title(), side, bool(self.private_owner),
+                            self.font())
+
+    def _clear_wall_preview(self) -> None:
+        self._drag_dock = nf.DOCK_NONE
+        if self._ghost is not None:
+            self._ghost.hide()
 
     def _begin_slip_drag(self) -> None:
         self._slip_dragging = True
         cur = self.size()
         target = self._face_size()
         if cur != target:
-            # 탭을 집어 들면 쪽지 크기로 돌아온다. 잡은 자리가 쪽지 안에 오게 한다.
-            gx = self._slip_grab.x()
+            # 탭을 집어 들면 쪽지(아이콘) 크기로 돌아온다. 잡은 자리가 그 안에
+            # 오게 한다.
+            gx, gy = self._slip_grab.x(), self._slip_grab.y()
             if self._dock == nf.DOCK_RIGHT:
                 gx = target.width() - (cur.width() - gx)
+            if self._dock == nf.DOCK_BOTTOM:
+                gy = target.height() - (cur.height() - gy)
             gx = max(12, min(target.width() - 12, gx))
-            self._slip_grab = QPoint(gx, self._slip_grab.y())
+            gy = max(8, min(target.height() - 8, gy))
+            self._slip_grab = QPoint(gx, gy)
 
     def _drag_slip_to(self, gp: QPoint) -> None:
-        scr = QGuiApplication.screenAt(gp)
-        avail = scr.availableGeometry() if scr is not None else self._avail()
+        screens = self._screens()
         rect = QRect(gp - self._slip_grab, self._face_size())
-        if self._style_pref() == nf.FOLD_ICON:
-            # 아이콘은 화면 끝에 두는 일이 흔하다. 끌어서는 붙이지 않고
-            # (메뉴로만 붙인다) 놓은 자리의 격자에 맞춘다.
-            self._drag_dock = nf.DOCK_NONE
-            if self._dock:
-                self._dock = nf.DOCK_NONE
-                self._apply_z_order()
-            self.setGeometry(rect)
-            self.update()
-            return
-        side = nf.dock_side_near(rect, avail)
-        if side == nf.DOCK_LEFT:
-            rect.moveLeft(avail.left())
-        elif side == nf.DOCK_RIGHT:
-            rect.moveRight(avail.right())
+        side, index = nf.wall_for_drag(rect, gp, screens)
+        self._drag_cursor = QPoint(gp)
         if side:
-            rect.moveTop(nf.clamp_dock_y(rect.top(), rect.height(), avail))
+            # 화면 벽에 닿으면 접힌 모양과 무관하게 쪽지로 붙는다.
+            avail = QRect(screens[index][1])
+            self._drag_avail = avail
+            slip = QSize(nf.SLIP_SIZE)
+            grab = QPoint(min(self._slip_grab.x(), slip.width() - 12),
+                          min(self._slip_grab.y(), slip.height() - 8))
+            rect = nf.snap_to_wall(QRect(gp - grab, slip), side, avail)
         self._drag_dock = side
         self.setGeometry(rect)
         self.update()
@@ -2488,18 +2620,37 @@ class StickyNoteWidget(QWidget):
         side = self._drag_dock
         self._drag_dock = nf.DOCK_NONE
         if side:
-            self._place_tab(side, self.y(), self._avail())
+            if side in (nf.DOCK_LEFT, nf.DOCK_RIGHT):
+                along = self.y()
+            else:
+                along = self._tab_along(side, self._drag_cursor)
+            self._dock_to(side, along, QRect(self._drag_avail))
+            self._slide_to(self._tab_rect(self._slip_hover))
         else:
             self._dock = nf.DOCK_NONE
-            self._open_pos = self.pos()
+            pos = self.pos()
             if self._icon_mode():
                 # 바탕화면 아이콘처럼 격자에 맞추고, 다른 아이콘과 겹치면 비켜 놓는다.
-                self._open_pos = self._resolve_icon_pos(self.pos())
-                self._slide_to(QRect(self._open_pos, nf.ICON_SIZE))
-                self.setToolTip(self._title())
+                pos = self._resolve_icon_pos(pos)
+                self._slide_to(QRect(pos, nf.ICON_SIZE))
+            self._fold_pos = QPoint(pos)
+            self._fold_at = True
             self._apply_z_order()
-            self.update()
+        self._refresh_face_tip()
+        self.update()
         self._emit_fold_state()
+
+    def _refresh_face_tip(self) -> None:
+        """아이콘과 위아래 탭은 제목이 잘릴 수 있어 말풍선으로 전체를 보인다."""
+        cut = self._folded and (self._icon_mode() or self._dock in (
+            nf.DOCK_TOP, nf.DOCK_BOTTOM))
+        self.setToolTip(self._title() if cut else "")
+
+    def _set_bare(self, bare: bool) -> None:
+        """접힌 메모는 창보다 작게 그려진다. Windows 가 창에 두르는 그림자가
+        그 둘레에 판처럼 보이지 않게 끈다."""
+        if self.isVisible():
+            dwm.set_bare(int(self.winId()), bare)
 
     def _style_pref(self) -> str:
         """이 메모의 접힌 모양(붙였는지와 무관한 선호). 비어 있으면 설정을 따른다."""
@@ -2531,7 +2682,7 @@ class StickyNoteWidget(QWidget):
         return nf.snap_icon_pos(pos, avail, [])
 
     def _fold_busy(self) -> bool:
-        return self._fold_frames is not None
+        return self._fold_frames is not None or self._pre_unfold
 
     def _animations_on(self) -> bool:
         s = self._settings
@@ -2575,14 +2726,17 @@ class StickyNoteWidget(QWidget):
             anim.stop()
             self._on_fold_anim_finished()
         self._finish_geo_anim()
+        if self._pre_unfold:
+            self._unfold_now()
 
-    def _slide_to(self, rect: QRect, ms: int = nf.SLIDE_MS) -> None:
+    def _slide_to(self, rect: QRect, ms: int = nf.SLIDE_MS, done=None) -> None:
+        """창을 ``rect`` 로 부드럽게 옮긴다. ``done`` 은 다 옮긴 뒤에 부른다."""
         self._stop_geo_anim()
         rect = QRect(rect)
-        if rect == self.geometry():
-            return
-        if not self._animations_on():
+        if rect == self.geometry() or not self._animations_on():
             self.setGeometry(rect)
+            if done is not None:
+                done()
             return
         anim = QVariantAnimation(self)
         anim.setStartValue(self.geometry())
@@ -2592,6 +2746,7 @@ class StickyNoteWidget(QWidget):
         anim.valueChanged.connect(self._on_geo_tick)
         anim.finished.connect(self._on_geo_finished)
         self._geo_anim = anim
+        self._geo_done = done
         anim.start()
 
     def _on_geo_tick(self, value) -> None:
@@ -2602,9 +2757,13 @@ class StickyNoteWidget(QWidget):
         anim, self._geo_anim = self._geo_anim, None
         if anim is not None:
             anim.deleteLater()
+        done, self._geo_done = self._geo_done, None
+        if done is not None:
+            done()
 
     def _stop_geo_anim(self) -> None:
         anim, self._geo_anim = self._geo_anim, None
+        self._geo_done = None
         if anim is not None:
             anim.stop()
             anim.deleteLater()
@@ -2614,9 +2773,12 @@ class StickyNoteWidget(QWidget):
         if anim is None:
             return
         end = anim.endValue()
+        done = self._geo_done
         self._stop_geo_anim()
         if isinstance(end, QRect):
             self.setGeometry(end)
+        if done is not None:
+            done()
 
     def _set_body_visible(self, visible: bool) -> None:
         for wdg in (self._handle, self._text, self._grip):
@@ -2646,69 +2808,71 @@ class StickyNoteWidget(QWidget):
             return QSize(config.DEFAULT_NOTE_WIDTH, config.DEFAULT_NOTE_HEIGHT)
         return QSize(self.size())
 
+    @staticmethod
+    def _screens() -> list[tuple[QRect, QRect]]:
+        """연결된 화면마다 ``(전체 영역, 작업 표시줄을 뺀 영역)``."""
+        return [(s.geometry(), s.availableGeometry())
+                for s in QGuiApplication.screens()]
+
     def _screen_rect_at(self, point: QPoint) -> QRect:
-        scr = QGuiApplication.screenAt(point)
-        if scr is None:
-            scr = QGuiApplication.primaryScreen()
-        return scr.availableGeometry() if scr is not None else QRect(
-            0, 0, 1920, 1080)
+        """``point`` 가 놓인(없으면 가장 가까운) 화면에서 작업 표시줄을 뺀 영역."""
+        screens = self._screens()
+        if not screens:
+            return QRect(0, 0, 1920, 1080)
+        return QRect(screens[nf.screen_index_at(point, screens)][1])
 
     def _avail(self) -> QRect:
         """지금 창이 놓인 화면에서 작업 표시줄을 뺀 영역."""
         return self._screen_rect_at(self.geometry().center())
 
     def _dock_avail(self) -> QRect:
-        """붙어 있는 화면. 펼친 자리(저장되는 위치)로 화면을 가린다."""
-        return self._screen_rect_at(self._open_pos + QPoint(8, 8))
+        """탭이 붙어 있는 화면. 탭을 둔 자리로 가린다."""
+        tab = nf.tab_size(self._dock)
+        return self._screen_rect_at(self._fold_pos + QPoint(
+            tab.width() // 2, tab.height() // 2))
 
     def _resolve_slot(self, side: str, y: int, avail: QRect) -> int:
-        h = nf.TAB_SIZE.height()
-        y = nf.clamp_dock_y(int(y), h, avail)
+        length = nf.tab_length(side)
+        y = nf.clamp_dock_y(int(y), length, avail, side)
         if self._dock_resolver is not None:
             try:
-                y = int(self._dock_resolver(self.note_id, side, y, h, avail))
+                y = int(self._dock_resolver(self.note_id, side, y, length,
+                                            avail))
             except Exception:
                 pass
         return y
 
     def _tab_rect(self, expanded: bool) -> QRect:
-        avail = self._dock_avail()
-        w = nf.TAB_SIZE.width()
-        if expanded:
-            w = nf.tab_width_for(self._title(), self.font(),
-                                 bool(self.private_owner))
-        x = (avail.left() if self._dock == nf.DOCK_LEFT
-             else avail.right() - w + 1)
-        return QRect(x, self._dock_y, w, nf.TAB_SIZE.height())
+        wide = 0
+        if expanded and self._dock in (nf.DOCK_LEFT, nf.DOCK_RIGHT):
+            wide = nf.tab_width_for(self._title(), self.font(),
+                                    bool(self.private_owner))
+        return nf.tab_rect(self._dock, self._dock_y, self._dock_avail(),
+                           expanded=expanded, wide=wide)
 
     def _folded_rect(self) -> QRect:
+        """접힌 메모가 놓일 자리. 둔 자리가 없으면 펼친 메모의 왼쪽 위다."""
         if self._dock:
             return self._tab_rect(False)
-        return QRect(self._open_pos, self._face_size())
-
-    @staticmethod
-    def _kept_on_screen(rect: QRect, avail: QRect) -> QRect:
-        """쪽지를 화면 끝에 두고 펴도 메모가 화면 밖으로 나가지 않게 한다."""
-        r = QRect(rect)
-        if r.right() > avail.right():
-            r.moveRight(avail.right())
-        if r.bottom() > avail.bottom():
-            r.moveBottom(avail.bottom())
-        if r.left() < avail.left():
-            r.moveLeft(avail.left())
-        if r.top() < avail.top():
-            r.moveTop(avail.top())
-        return r
+        pos = self._fold_pos if self._fold_at else self._open_pos
+        return QRect(pos, self._face_size())
 
     def _dock_on_top(self) -> bool:
         s = self._settings
         return bool(getattr(s, "dock_on_top", True)) if s is not None else True
 
+    def _wants_top(self) -> bool:
+        """다른 창 위에 둘 것인가. 벽에 탭으로 접혀 있는 동안만이다.
+
+        붙였던 메모도 펼치면 보통 창이다. 펼친 메모까지 위에 두면 쓰고 있는
+        다른 창을 계속 가린다."""
+        return self._folded and bool(self._dock) and self._dock_on_top()
+
     def _apply_z_order(self, initial: bool = False) -> None:
         if not self.isVisible():
             return
         hwnd = int(self.winId())
-        want_top = bool(self._dock) and self._dock_on_top()
+        want_top = self._wants_top()
         if want_top:
             _set_window_topmost(hwnd, True)
             self._topmost = True
@@ -2719,9 +2883,17 @@ class StickyNoteWidget(QWidget):
         if initial:
             _pin_window_to_bottom(hwnd)
 
+    def fold_state(self) -> dict[str, Any]:
+        """이 PC 에 저장할 접힘 상태."""
+        return {
+            "folded": self._folded, "dock": self._dock,
+            "dock_y": int(self._dock_y), "fold_style": self._fold_style,
+            "fold_x": self._fold_pos.x(), "fold_y": self._fold_pos.y(),
+            "fold_at": self._fold_at,
+        }
+
     def _emit_fold_state(self) -> None:
-        self.foldChanged.emit(self.note_id, self._folded, self._dock,
-                              int(self._dock_y), self._fold_style)
+        self.foldChanged.emit(self.note_id, self.fold_state())
         self.positionChanged.emit(self.note_id, self._open_pos.x(),
                                   self._open_pos.y())
 
@@ -2742,19 +2914,25 @@ class StickyNoteWidget(QWidget):
         hwnd = int(self.winId())
         if not self._first_show_done:
             self._first_show_done = True
-            _hide_dwm_border(hwnd)
+            dwm.hide_border(hwnd)
+        dwm.set_bare(hwnd, self._folded or self._fold_busy())
         if self._folded and self._dock:
             # 숨겨 둔 사이에 다른 탭이 이 자리를 차지했을 수 있다.
-            y = self._resolve_slot(self._dock, self._dock_y, self._dock_avail())
+            avail = self._dock_avail()
+            y = self._resolve_slot(self._dock, self._dock_y, avail)
             if y != self._dock_y:
                 self._dock_y = y
-                self.setGeometry(self._tab_rect(False))
+                rect = nf.tab_rect(self._dock, y, avail)
+                self._fold_pos = rect.topLeft()
+                self.setGeometry(rect)
                 self._emit_fold_state()
-        # 가장자리에 붙인 메모는 다른 창 위에, 나머지는 바탕 화면 쪽(맨 아래)에 둔다.
+        # 가장자리에 붙은 탭은 다른 창 위에, 나머지는 바탕 화면 쪽(맨 아래)에 둔다.
         self._apply_z_order(initial=True)
 
     def hideEvent(self, event) -> None:
         self._finish_pending_fold()
+        self._drag_offset = None
+        self._clear_wall_preview()
         self._slip_press = None
         self._slip_dragging = False
         self._slip_hover = False

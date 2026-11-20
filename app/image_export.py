@@ -19,7 +19,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import config
+from . import config, packaging
 
 # 임시 파일 보관 시간. 외부 뷰어가 파일을 이미 읽어들인 뒤라면 지워도 무방하다.
 TEMP_IMAGE_MAX_AGE_S = 24 * 3600
@@ -76,6 +76,10 @@ def sniff_extension(raw: bytes, subtype_hint: str = "") -> str:
 
 
 def temp_image_dir() -> Path:
+    if packaging.is_packaged():
+        # 스토어판이 임시 폴더(AppData 아래)에 쓴 파일은 앱 전용 자리로 돌려져
+        # 그림을 열 다른 프로그램이 보지 못한다. 돌려지지 않는 데이터 폴더에 둔다.
+        return config.app_data_dir() / "cache" / "images"
     return Path(tempfile.gettempdir()) / config.APP_NAME / "images"
 
 

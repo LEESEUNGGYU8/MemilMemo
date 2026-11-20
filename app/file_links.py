@@ -60,9 +60,19 @@ for _kind, _exts in _EXT_GROUPS.items():
             continue
         EXT_KIND[_ext] = _kind
 
-# 여는 것이 곧 실행인 형식. 열기 전에 경로를 보여 주고 묻는다. 파이썬 스크립트는
-# 아이콘은 코드지만 연결 프로그램이 곧바로 실행하므로 함께 묻는다.
-EXEC_EXTS = frozenset(_EXT_GROUPS[KIND_APP].split()) | {"py", "pyw"}
+# 여는 것이 곧 실행이거나 PC 설정을 바꾸는 형식. 열기 전에 경로를 보여 주고
+# 묻는다. 아이콘은 코드나 문서로 보여도 연결 프로그램이 곧바로 실행하는 것
+# (파이썬·셸 스크립트 등)도 함께 묻는다.
+_RUNS_WHEN_OPENED = """
+    msp mst ps1xml ps2 ps2xml psc1 psc2 psd1 psm1 cdxml pssc vb ws wsc sct
+    jnlp scf inf ins isp application appinstaller appx appxbundle msix
+    msixbundle gadget chm hlp rdp settingcontent-ms library-ms
+    searchconnector-ms search-ms website theme themepack deskthemepack
+    diagcab diagcfg diagpkg wsb xbap xll ade adp mde accde accdr
+    py pyw pyz pyzw pyc pyo sh rb pl
+"""
+EXEC_EXTS = (frozenset(_EXT_GROUPS[KIND_APP].split())
+             | frozenset(_RUNS_WHEN_OPENED.split()))
 
 _WEB_SCHEMES = ("http", "https")
 _DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
@@ -149,11 +159,20 @@ def kind_of(href: str) -> str:
     return EXT_KIND.get(_ext_of(path), KIND_FILE)
 
 
+def runs_when_opened(path: str) -> bool:
+    """이 이름의 파일을 열면 곧바로 실행되거나 PC 설정이 바뀌는가."""
+    return _ext_of(path or "") in EXEC_EXTS
+
+
 def needs_confirm(href: str) -> bool:
-    """여는 것이 곧 실행인 대상인가(실행 파일·스크립트·바로 가기)."""
-    if not is_file_href(href) or is_folder_href(href):
+    """여는 것이 곧 실행인 대상일 수 있는가(실행 파일·스크립트·바로 가기).
+
+    이름만 본다. 링크 끝에 ``/`` 를 붙여 폴더라고 적어 두어도 믿지 않는다
+    (``\\\\서버\\공유\\a.bat/`` 처럼 적으면 폴더 아이콘으로 보이지만 열면
+    실행된다). 정말 폴더인지는 열 때 확인한다(``link_open``)."""
+    if not is_file_href(href):
         return False
-    return _ext_of(href_to_path(href) or "") in EXEC_EXTS
+    return runs_when_opened(href_to_path(href) or "")
 
 
 def display_name(href: str) -> str:

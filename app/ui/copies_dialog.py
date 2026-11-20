@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 
 from .. import i18n
 from ..datetime_fmt import fmt_relative
-from ..replica import CopyInfo, missing_notes, read_copy
+from ..replica import CopyInfo, missing_notes, read_source
 from .icons import color_swatch_icon
 from .note_card import note_title_and_lines
 from .rich_text import html_to_plain
@@ -52,15 +52,18 @@ class CopiesDialog(QDialog):
 
     def __init__(self, copies: list[CopyInfo], *,
                  host_notes: dict[str, dict[str, Any]] | None,
-                 can_takeover: bool, parent: QWidget | None = None):
+                 can_takeover: bool, nickname: str = "",
+                 parent: QWidget | None = None):
         """``host_notes`` 는 지금 연결된 공유 PC 의 메모(메모 id → 메모). 연결돼
-        있지 않으면 None 이고, 그때는 가져오기를 할 수 없다."""
+        있지 않으면 None 이고, 그때는 가져오기를 할 수 없다. ``nickname`` 은 이 PC 가
+        공유하던 메모 파일에서 내 것만 고르는 데 쓴다."""
         super().__init__(parent)
         self.setWindowTitle(i18n.t("copies.window_title"))
         self.resize(660, 470)
         self.setMinimumSize(520, 380)
         self._copies = copies
         self._host_notes = host_notes
+        self._nickname = nickname
         self._notes: list[dict[str, Any]] = []
         self._folders: list[dict[str, Any]] = []
         self._missing: list[dict[str, Any]] = []
@@ -75,7 +78,9 @@ class CopiesDialog(QDialog):
         self._pick.setAccessibleName(i18n.t("copies.window_title"))
         for info in copies:
             when = fmt_relative(info.synced_at)
-            if info.host:
+            if info.kind == "host":
+                label = i18n.t("copies.item_own", when=when, count=info.note_count)
+            elif info.host:
                 label = i18n.t("copies.item", when=when, host=info.host,
                                count=info.note_count)
             else:
@@ -134,6 +139,10 @@ class CopiesDialog(QDialog):
     def selected_path(self) -> str:
         return self._pick.currentData() or ""
 
+    def _selected(self) -> CopyInfo | None:
+        index = self._pick.currentIndex()
+        return self._copies[index] if 0 <= index < len(self._copies) else None
+
     def missing(self) -> list[dict[str, Any]]:
         return list(self._missing)
 
@@ -141,10 +150,10 @@ class CopiesDialog(QDialog):
         self._list.clear()
         self._preview.clear()
         self._notes, self._folders, self._missing = [], [], []
-        path = self.selected_path()
-        if path:
+        info = self._selected()
+        if info is not None:
             try:
-                self._notes, self._folders, _meta = read_copy(path)
+                self._notes, self._folders, _meta = read_source(info, self._nickname)
             except Exception:
                 self._notes, self._folders = [], []
         self._notes.sort(key=lambda n: n.get("updated_at", 0), reverse=True)
@@ -183,7 +192,10 @@ class CopiesDialog(QDialog):
         self._import_btn.setText(
             i18n.t("copies.btn_import", count=count) if count
             else i18n.t("copies.btn_import_none"))
-        self._takeover_btn.setEnabled(bool(self._notes))
+        # 이 PC 가 공유하던 메모 파일은 사본이 아니다. 그것으로 다시 공유하려면
+        # 접속 창에서 '이 PC에서 공유 시작'을 고르면 된다.
+        self._takeover_btn.setEnabled(
+            bool(self._notes) and info is not None and info.kind != "host")
 
     def _show_note(self, row: int) -> None:
         note = self._rows[row] if 0 <= row < len(self._rows) else None

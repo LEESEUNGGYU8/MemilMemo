@@ -234,3 +234,231 @@ def test_deleting_a_public_folder_leaves_its_notes_public(host):
     client.create_note("#FFE066", 280, 260, folder_id=folder_id)
     client.delete_folder(folder_id)
     assert [n.private_owner for n in repo.list_notes()] == [None]
+
+
+# ── 터무니없이 긴 프레임 ────────────────────────────────────────────────
+
+class FakeSocket:
+    """받은 바이트를 한 번 내주고, 끊겼는지와 보낸 것을 적어 둔다."""
+
+    def __init__(self, data: bytes = b""):
+        self.data = data
+        self.aborted = False
+        self.sent = bytearray()
+
+    def readAll(self):  # noqa: N802
+        data, self.data = self.data, b""
+        return data
+
+    def write(self, data: bytes) -> None:
+        self.sent.extend(data)
+
+    def abort(self) -> None:
+        self.aborted = True
+
+    def deleteLater(self) -> None:  # noqa: N802
+        pass
+
+
+def _connect(server, sock):
+    from app.network.host_server import _Session
+    from app.protocol import MAX_FRAME_BEFORE_HELLO
+
+    session = _Session(socket=sock,
+                       parser=FrameParser(MAX_FRAME_BEFORE_HELLO))
+    server._sessions[sock] = session
+    return session
+
+
+def test_host_drops_a_stranger_that_announces_a_huge_frame(host):
+    from app.protocol import LENGTH_HEADER, MAX_FRAME_BEFORE_HELLO
+
+    server, _client, _seen, _repo = host
+    # 인사도 하기 전에 4GB 를 보내겠다는 상대(또는 다른 프로그램의 접속).
+    sock = FakeSocket(LENGTH_HEADER.pack(0xFFFFFFFF) + b"GET / HTTP/1.1")
+    session = _connect(server, sock)
+    server._on_ready_read(sock)
+    assert sock.aborted and session.parser.overflowed
+    assert len(session.parser._buf) == 0            # 받아 모으지 않는다
+
+    # 인사 전에는 작은 프레임만 받는다.
+    sock = FakeSocket(LENGTH_HEADER.pack(MAX_FRAME_BEFORE_HELLO + 1))
+    _connect(server, sock)
+    server._on_ready_read(sock)
+    assert sock.aborted
+
+
+def test_host_takes_a_large_note_after_hello(host):
+    from app.protocol import (
+        LENGTH_HEADER, MAX_FRAME_BEFORE_HELLO, MAX_FRAME_FROM_GUEST, make,
+    )
+
+    server, client, _seen, repo = host
+    client.create_note("#FFE066", 300, 240)
+    note = repo.list_notes()[0]
+    # 그림이 든 메모는 인사 전의 상한보다 훨씬 크다. 인사 뒤에는 받아야 한다.
+    big = "<p>" + "가" * (MAX_FRAME_BEFORE_HELLO) + "</p>"
+    sock = FakeSocket(
+        make("hello", nickname="지우").encode()
+        + make("update_note", id=note.id, content=big, color="#FFE066",
+               width=300, height=240, expected_version=note.version).encode())
+    session = _connect(server, sock)
+    server._on_ready_read(sock)
+    assert not sock.aborted and session.hello_received
+    assert session.parser.max_frame == MAX_FRAME_FROM_GUEST
+    assert repo.get_note(note.id).content == big
+
+    # 인사 뒤에도 끝없이 받지는 않는다.
+    sock.data = LENGTH_HEADER.pack(MAX_FRAME_FROM_GUEST + 1)
+    server._on_ready_read(sock)
+    assert sock.aborted
+
+
+def test_hello_with_an_odd_nickname_does_not_break_the_host(host):
+    from app.protocol import make
+
+    server, _client, _seen, _repo = host
+    for odd in ({"a": 1}, ["x"], 5, None, ""):
+        sock = FakeSocket(make("hello", nickname=odd).encode())
+        session = _connect(server, sock)
+        server._on_ready_read(sock)
+        assert session.hello_received and session.nickname == "anon"
+        assert not sock.aborted
+
+
+# ── 나만 보기 메모를 지키는 규칙 ────────────────────────────────────────
+
+def _guest(server, nickname):
+    """인사를 마친 참여자. 그 뒤로 받은 것은 sock.sent 에 쌓인다."""
+    from app.protocol import make
+
+    sock = FakeSocket(make("hello", nickname=nickname).encode())
+    session = _connect(server, sock)
+    server._on_ready_read(sock)
+    sock.sent.clear()
+    return sock, session
+
+
+def _send(server, sock, kind, **data):
+    from app.protocol import make
+
+    sock.data = make(kind, **data).encode()
+    server._on_ready_read(sock)
+
+
+def _received(sock) -> list[tuple[str, dict]]:
+    return [(m.type, m.data) for m in FrameParser().feed(bytes(sock.sent))]
+
+
+def test_others_cannot_change_or_delete_a_private_note(host):
+    server, client, _seen, repo = host
+    client.create_note("#FFE066", 300, 240, private_owner=HOST)
+    note = repo.list_notes()[0]
+    assert note.private_owner == HOST
+    stranger, _session = _guest(server, "지우")
+
+    # 잠금은 원래도 거절됐다. 잠금 없이 곧바로 보낸 수정과 삭제도 거절해야 한다.
+    _send(server, stranger, "update_note", id=note.id, content="<p>바꿈</p>",
+          color="#FFE066", width=300, height=240, expected_version=note.version)
+    _send(server, stranger, "delete_note", id=note.id)
+    kept = repo.get_note(note.id)
+    assert kept.content == note.content and not kept.deleted
+    errors = [d["message"] for k, d in _received(stranger) if k == "error"]
+    assert errors == ["not allowed", "not allowed"]
+
+    # 주인은 그대로 고치고 지울 수 있다.
+    client.update_note(note.id, "<p>주인이 고침</p>", "#FFE066", 300, 240, note.version)
+    assert repo.get_note(note.id).content == "<p>주인이 고침</p>"
+    client.delete_note(note.id)
+    assert repo.get_note(note.id).deleted
+
+
+def test_private_notes_are_always_owned_by_their_creator(host):
+    server, client, _seen, repo = host
+    client.create_folder("내 폴더", "#BAE1FF", True)
+    mine = repo.list_folders()[0]
+    guest, _session = _guest(server, "지우")
+
+    # 남의 이름으로 나만 보기 메모를 만들지 못하고, 남의 나만 보는 폴더에도 넣지 못한다.
+    _send(server, guest, "create_note", color="#FFE066", width=300, height=240,
+          private_owner=HOST, folder_id=mine.id)
+    made = [n for n in repo.list_notes() if n.created_by == "지우"]
+    assert len(made) == 1
+    assert made[0].private_owner == "지우" and made[0].folder_id is None
+    # 없는 폴더를 적어 보내면 폴더 없이 만든다.
+    _send(server, guest, "create_note", color="#FFE066", width=300, height=240,
+          folder_id="no-such-folder")
+    assert all(n.folder_id is None for n in repo.list_notes() if n.created_by == "지우")
+
+
+def test_locks_on_private_notes_are_not_shown_to_others(host):
+    server, client, _seen, repo = host
+    client.create_note("#FFE066", 300, 240, private_owner=HOST)
+    client.create_note("#FFE066", 300, 240)
+    private = next(n for n in repo.list_notes() if n.private_owner)
+    public = next(n for n in repo.list_notes() if not n.private_owner)
+    client.acquire_lock(private.id)
+    client.acquire_lock(public.id)
+
+    from app.protocol import make
+    sock = FakeSocket(make("hello", nickname="지우").encode())
+    _connect(server, sock)
+    server._on_ready_read(sock)
+    welcome = next(d for k, d in _received(sock) if k == "welcome")
+    assert welcome["locks"] == {public.id: HOST}
+    assert private.id not in [n["id"] for n in welcome["notes"]]
+
+    # 잠금이 저절로 풀릴 때도 그 메모를 볼 수 없는 사람에게는 알리지 않는다.
+    sock.sent.clear()
+    server.locks.reap_idle = lambda: [private.id, public.id]
+    server._on_idle_reap()
+    released = [d["note_id"] for k, d in _received(sock) if k == "lock_released"]
+    assert released == [public.id]
+
+
+def test_hello_is_answered_once_per_connection(host):
+    from app.protocol import make
+
+    server, _client, _seen, _repo = host
+    sock = FakeSocket(make("hello", nickname="지우").encode() * 5)
+    session = _connect(server, sock)
+    server._on_ready_read(sock)
+    assert [k for k, _d in _received(sock)].count("welcome") == 1
+    # 접속한 뒤에 다른 이름으로 다시 인사해도 이름은 바뀌지 않는다.
+    sock.sent.clear()
+    _send(server, sock, "hello", nickname=HOST)
+    assert session.nickname == "지우" and _received(sock) == []
+
+
+def test_host_strips_outside_resources_before_storing(host):
+    server, client, _seen, repo = host
+    client.create_note("#FFE066", 300, 240)
+    note = repo.list_notes()[0]
+    guest, _session = _guest(server, "지우")
+    evil = ('<p>회의 자료</p><img src="\\\\attacker\\share\\a.png">'
+            '<link rel="stylesheet" type="text/css" href="file://attacker/s/a.css">')
+    _send(server, guest, "update_note", id=note.id, content=evil, color="#FFE066",
+          width=300, height=240, expected_version=note.version)
+    stored = repo.get_note(note.id).content
+    assert stored == "<p>회의 자료</p>"
+    # 아직 옛 버전인 PC 도 걸러진 본문을 받는다.
+    sent = [d["note"]["content"] for k, d in _received(guest) if k == "note_updated"]
+    assert sent == ["<p>회의 자료</p>"]
+
+
+def test_malformed_message_does_not_drop_the_ones_after_it(host):
+    from app.protocol import make
+
+    server, client, _seen, repo = host
+    client.create_note("#FFE066", 300, 240)
+    note = repo.list_notes()[0]
+    guest, _session = _guest(server, "지우")
+    guest.data = (make("update_note", id=note.id, content="x", color="#FFE066",
+                       width="넓게", height=240,
+                       expected_version=note.version).encode()
+                  + make("update_note", id=["목록"], content="x").encode()
+                  + make("update_note", id=note.id, content="<p>정상</p>",
+                         color="#FFE066", width=300, height=240,
+                         expected_version=note.version).encode())
+    server._on_ready_read(guest)
+    assert repo.get_note(note.id).content == "<p>정상</p>"

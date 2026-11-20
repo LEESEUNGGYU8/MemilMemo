@@ -21,11 +21,15 @@ from . import config
 NEW_NOTE_FLAG = "--new-note"
 # 우클릭한 자리 근처에 메모를 띄우라는 표시(바탕 화면 우클릭 메뉴만 붙인다).
 AT_CURSOR_FLAG = "--at-cursor"
+# 파일·폴더 우클릭 메뉴가 넘기는 표시. 뒤에 그 경로가 온다.
+LINK_NOTE_FLAG = "--link-note"
 
 # 떠 있는 인스턴스에 넘기는 명령.
 CMD_NEW_NOTE = "new-note"
 CMD_NEW_NOTE_HERE = "new-note-here"
 CMD_SHOW = "show"
+# 뒤에 빈칸 하나를 두고 경로가 온다(한 줄에 경로 하나).
+CMD_LINK_NOTE = "link-note"
 # 명령을 읽은 인스턴스가 보낸 쪽에 돌려주는 답.
 ACK = b"ok\n"
 
@@ -35,6 +39,67 @@ def new_note_command(argv: list[str]) -> str | None:
     if NEW_NOTE_FLAG not in argv:
         return None
     return CMD_NEW_NOTE_HERE if AT_CURSOR_FLAG in argv else CMD_NEW_NOTE
+
+
+def link_note_paths(argv: list[str]) -> list[str]:
+    """실행 인자가 '새 메모에 링크로 넣기' 요청이면 그 경로들을 돌려준다."""
+    if LINK_NOTE_FLAG not in argv:
+        return []
+    rest = argv[argv.index(LINK_NOTE_FLAG) + 1:]
+    return [a for a in rest if a.strip() and not a.startswith("--")]
+
+
+def link_note_command(paths: list[str]) -> str:
+    """경로마다 한 줄씩인 명령. 받는 쪽은 줄마다 따로 받는다."""
+    return "\n".join(f"{CMD_LINK_NOTE} {p}" for p in paths)
+
+
+def split_command(line: str) -> tuple[str, str]:
+    """명령 한 줄을 ``(명령, 딸린 값)`` 으로 나눈다. 경로는 대소문자를 그대로 둔다."""
+    head, _, arg = (line or "").strip().partition(" ")
+    return head.lower(), arg.strip()
+
+
+_boot_mutex = None
+
+
+def claim_boot() -> bool:
+    """이 사용자의 앱을 지금 켜는 프로세스가 되겠다고 나선다. 이미 다른
+    프로세스가 켜는 중이거나 떠 있으면 False.
+
+    파일을 여럿 골라 우클릭 메뉴를 누르면 Windows 가 파일마다 프로세스를 하나씩
+    띄운다. 앱이 꺼져 있을 때 그것들이 저마다 앱을 켜지 않도록, 하나만 켜고
+    나머지는 그쪽이 뜰 때까지 기다렸다가 넘긴다."""
+    global _boot_mutex
+    if sys.platform != "win32":
+        return True
+    if _boot_mutex is not None:
+        return True
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        handle = kernel32.CreateMutexW(None, False, ipc_name() + "-boot")
+        if not handle:
+            return True
+        ERROR_ALREADY_EXISTS = 183
+        if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+            return False
+        _boot_mutex = handle        # 프로세스가 끝날 때까지 쥐고 있는다
+        return True
+    except Exception:
+        return True
+
+
+def forward_when_ready(command: str, total_ms: int = 20000) -> bool:
+    """켜지는 중인 인스턴스가 명령을 받을 수 있게 될 때까지 기다렸다가 넘긴다."""
+    deadline = time.monotonic() + total_ms / 1000
+    while True:
+        if forward_command(command, timeout_ms=300):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
 
 
 def _allow_foreground_handoff() -> None:
@@ -106,6 +171,8 @@ class IpcReceiver(QObject):
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
         self._server = QLocalServer(self)
+        # 같은 Windows 사용자의 프로세스만 이 파이프에 붙을 수 있게 한다.
+        self._server.setSocketOptions(QLocalServer.UserAccessOption)
         self._server.newConnection.connect(self._on_new_connection)
         self._is_owner = False
 

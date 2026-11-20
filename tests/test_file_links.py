@@ -90,9 +90,16 @@ def test_executables_need_confirmation():
         assert fl.needs_confirm(fl.path_to_href("C:\\a\\" + name)), name
     for name in ("보고서.pdf", "표.xlsx", "사진.png", "메모.txt"):
         assert not fl.needs_confirm(fl.path_to_href("C:\\a\\" + name)), name
-    # 이름이 .exe 로 끝나는 폴더는 폴더다.
-    assert not fl.needs_confirm(fl.path_to_href("C:\\a\\tool.exe", is_dir=True))
+    # 링크에 폴더라고 적혀 있어도 이름으로 본다. 끝에 '/' 를 붙여 폴더인 척하는
+    # 실행 파일이 확인 없이 열리면 안 된다. 정말 폴더인지는 열 때 확인한다.
+    assert fl.needs_confirm(fl.path_to_href("C:\\a\\tool.exe", is_dir=True))
+    assert fl.needs_confirm("file://filesrv/public/a.bat/")
     assert not fl.needs_confirm("https://example.com/setup.exe")
+    for name in ("도움말.chm", "원격.rdp", "a.appinstaller", "s.settingcontent-ms",
+                 "t.theme", "d.diagcab", "p.pyz", "x.msix", "script.sh", "a.xll"):
+        assert fl.runs_when_opened("C:\\a\\" + name), name
+    for name in ("보고서.pdf", "표.xlsx", "도면.dwg", "압축.zip", "이름 없는 파일"):
+        assert not fl.runs_when_opened("C:\\a\\" + name), name
 
 
 def test_parse_target_accepts_paths_and_web_only():
@@ -370,8 +377,12 @@ def test_open_link_blocks_unknown_schemes_and_confirms_programs(qapp, monkeypatc
 
     exe = fl.path_to_href("C:\\Windows\\System32\\notepad.exe")
     link_open.open_link(None, exe)
+    for _ in range(40):
+        if asked:
+            break
+        QTest.qWait(25)
     assert asked == ["C:\\Windows\\System32\\notepad.exe"]
-    QTest.qWait(200)
+    QTest.qWait(100)
     assert started == []          # 묻는 창에서 취소했다.
 
     # 없는 경로는 열지 않고 알린다(확인은 작업 스레드에서 한다).
@@ -383,6 +394,57 @@ def test_open_link_blocks_unknown_schemes_and_confirms_programs(qapp, monkeypatc
         QTest.qWait(25)
     assert warned and "없는 파일.txt" in warned[0]
     assert started == []
+
+
+def _wait_until(cond, tries: int = 60) -> None:
+    for _ in range(tries):
+        if cond():
+            return
+        QTest.qWait(25)
+
+
+def test_program_named_as_a_folder_is_not_run_without_asking(qapp, monkeypatch, tmp_path):
+    started: list[str] = []
+    asked: list[str] = []
+    answer = {"run": False}
+    monkeypatch.setattr(link_open.os, "startfile",
+                        lambda path: started.append(path), raising=False)
+    monkeypatch.setattr(link_open, "confirm_run",
+                        lambda parent, path: asked.append(path) or answer["run"])
+    script = tmp_path / "회의자료.bat"
+    script.write_text("@echo off", encoding="utf-8")
+    # 끝에 '/' 를 붙이면 폴더 아이콘으로 보인다. 그래도 실제로는 파일이므로 묻는다.
+    disguised = fl.path_to_href(str(script)) + "/"
+    assert fl.is_folder_href(disguised) and fl.kind_of(disguised) == fl.KIND_FOLDER
+
+    link_open.open_link(None, disguised)
+    _wait_until(lambda: asked)
+    assert asked == [str(script)] and started == []
+
+    answer["run"] = True
+    link_open.open_link(None, disguised)
+    _wait_until(lambda: started)
+    assert started == [str(script)]
+
+    # 이름이 .exe 로 끝나도 정말 폴더면 묻지 않고 연다.
+    started.clear()
+    asked.clear()
+    folder = tmp_path / "tool.exe"
+    folder.mkdir()
+    link_open.open_link(None, fl.path_to_href(str(folder), is_dir=True))
+    _wait_until(lambda: started)
+    assert started == [str(folder)] and asked == []
+
+
+def test_reveal_uses_the_system_explorer(qapp, monkeypatch, tmp_path):
+    ran: list[list[str]] = []
+    monkeypatch.setattr(link_open.subprocess, "Popen", lambda args: ran.append(args))
+    target = tmp_path / "문서.txt"
+    target.write_text("x", encoding="utf-8")
+    link_open.reveal_in_folder(None, fl.path_to_href(str(target)))
+    _wait_until(lambda: ran)
+    assert ran and os.path.isabs(ran[0][0])
+    assert ran[0][0].lower().endswith("\\explorer.exe") and ran[0][2] == str(target)
 
 
 def test_open_link_starts_existing_file(qapp, monkeypatch, tmp_path):

@@ -27,6 +27,9 @@ class ClientBase(QObject):
     noteAnnounced = Signal(dict)
     # 누군가 나만 보던 메모를 공개로 바꿨다({"user": 바꾼 사람, "note_id": 메모}).
     noteShared = Signal(dict)
+    # 누군가 메모를 고치고 편집을 마쳤다(이력 항목). 편집 중에는 오지 않는다.
+    # 편집 중에 저장된 글은 noteUpdated 로 온다.
+    noteEdited = Signal(dict)
     historyList = Signal(str, list)          # note_id 또는 '', [entries]
     connectionChanged = Signal(bool)
     errorOccurred = Signal(str)
@@ -102,6 +105,10 @@ class ClientBase(QObject):
             # 새로 보이게 된 메모에는 오지 않는다). 옛 버전 호스트도 같다.
             if entry.get("action") == "create" and not data.get("quiet"):
                 self.noteAnnounced.emit(entry)
+            # 고친 기록은 편집이 끝나 잠금을 풀 때, 내용이 달라졌으면 한 번 온다.
+            # 글자를 칠 때마다 오지 않는다. 옛 버전 호스트도 같다.
+            elif entry.get("action") == "update":
+                self.noteEdited.emit(entry)
         elif msg_type == "history_list":
             self.historyList.emit(data.get("note_id", "") or "", data.get("entries", []))
         elif msg_type == "error":

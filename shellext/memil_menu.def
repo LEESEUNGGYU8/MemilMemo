@@ -1,0 +1,4 @@
+LIBRARY MemilMenu
+EXPORTS
+    DllGetClassObject   PRIVATE
+    DllCanUnloadNow     PRIVATE

@@ -1,82 +1,307 @@
 from __future__ import annotations
 
 import os
+import platform
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QRectF, QSize, Qt, QVariantAnimation, Signal
+from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
-    QDoubleSpinBox,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
-    QFormLayout,
-    QGridLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
     QSpinBox,
-    QTabWidget,
+    QStackedWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from .. import config, i18n, shell_menu
+from .. import config, i18n, packaging, shell_menu
 from ..settings import (
     IMAGE_VIEWER_BUILTIN,
     IMAGE_VIEWER_SYSTEM,
     AppSettings,
+    autostart_supported,
     get_windows_autostart,
     set_windows_autostart,
 )
+from . import note_fold
 from .icons import color_swatch_icon, svg_icon
-from .theme import color_name, refresh_style
+from .theme import COLOR_FOCUS, color_name, refresh_style
 
 
-_DIALOG_BUTTON_WIDTH = 130  # "지금 백업 실행" 이 들어가면서도 저장/취소와 시각적으로 일치
-_LABEL_ROW_HEIGHT = 34       # QLineEdit / QSpinBox 의 실효 높이와 동일
+_DIALOG_BUTTON_WIDTH = 112
+_NAV_WIDTH = 168
+_FIELD_WIDTH = 184           # 고르는 칸과 숫자 칸의 폭. 줄마다 오른쪽 끝이 맞는다.
+_ABOUT_ICON = 92
+
+# 이 창 안에서만 쓰는 모양. 앱 전체 스타일 위에 덧입힌다.
+_QSS = """
+QWidget#SettingsNav {
+    background: #FAFAFA;
+    border-right: 1px solid #EAEAEA;
+}
+QPushButton#NavItem {
+    background: transparent;
+    color: #4A4A4A;
+    border: none;
+    border-radius: 8px;
+    padding: 0 12px;
+    min-height: 36px;
+    font-size: 13px;
+    font-weight: 500;
+    text-align: left;
+}
+QPushButton#NavItem:hover {
+    background: #F0F0F0;
+    color: #1F1F1F;
+}
+QPushButton#NavItem:checked {
+    background: #E9E9E9;
+    color: #1F1F1F;
+    font-weight: 700;
+}
+QPushButton#NavItem[kbFocus="true"] {
+    border: 2px solid #2563EB;
+    padding: 0 10px;
+}
+QLabel#PageTitle {
+    font-size: 17px;
+    font-weight: 700;
+    color: #1F1F1F;
+}
+QLabel#PageNote, QLabel#RowHint {
+    font-size: 11px;
+    color: #707070;
+}
+QLabel#RowLabel {
+    font-size: 13px;
+    color: #1F1F1F;
+}
+QFrame#RowLine {
+    background: #EFEFEF;
+    border: none;
+}
+QFrame#FootLine {
+    background: #EAEAEA;
+    border: none;
+}
+QLabel#AboutName {
+    font-size: 20px;
+    font-weight: 800;
+    color: #1F1F1F;
+}
+QLabel#AboutVersion {
+    font-size: 12px;
+    color: #707070;
+}
+QLabel#AboutText {
+    font-size: 13px;
+    color: #1F1F1F;
+}
+"""
 
 
-def _align_form_labels(form: QFormLayout) -> None:
-    """라벨의 최소 높이를 필드와 맞춰 세로 가운데 정렬한다.
+class Switch(QCheckBox):
+    """켜고 끄는 스위치. 동작(글쇠, 상태, 신호)은 QCheckBox 그대로이고 모양만
+    다르다. 글자는 옆의 줄 이름이 맡으므로 스위치에는 글자가 없다."""
 
-    ``setLabelAlignment`` 는 수평 정렬만 다루므로, 키가 작은 라벨은 더 큰 필드
-    행의 상단에 붙어 버린다."""
-    for row in range(form.rowCount()):
-        item = form.itemAt(row, QFormLayout.LabelRole)
-        if item is None:
-            continue
-        widget = item.widget()
-        if widget is None:
-            continue
-        widget.setMinimumHeight(_LABEL_ROW_HEIGHT)
-        widget.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+    _W, _H, _PAD = 38, 22, 3
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self._knob = 0.0                      # 0 = 꺼짐 자리, 1 = 켜짐 자리
+        self._anim: QVariantAnimation | None = None
+        self.toggled.connect(self._on_toggled)
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        return QSize(self._W + 2 * self._PAD, self._H + 2 * self._PAD)
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return self.sizeHint()
+
+    def hitButton(self, pos) -> bool:  # noqa: N802
+        return self.rect().contains(pos)
+
+    def _on_toggled(self, on: bool) -> None:
+        if self._anim is not None:
+            self._anim.stop()
+            self._anim.deleteLater()
+            self._anim = None
+        target = 1.0 if on else 0.0
+        if not self.isVisible() or not note_fold.system_animations_enabled():
+            self._knob = target
+            self.update()
+            return
+        anim = QVariantAnimation(self)
+        anim.setDuration(120)
+        anim.setStartValue(float(self._knob))
+        anim.setEndValue(target)
+        anim.valueChanged.connect(self._on_step)
+        self._anim = anim
+        anim.start()
+
+    def _on_step(self, value) -> None:
+        self._knob = float(value)
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        track = QRectF((self.width() - self._W) / 2.0,
+                       (self.height() - self._H) / 2.0, self._W, self._H)
+        if not self.isEnabled():
+            fill = QColor("#D9DBDF")
+        elif self.isChecked():
+            fill = QColor("#1F1F1F")
+        else:
+            fill = QColor("#8C8C8C")          # 흰 바탕에서 3:1 을 넘는다
+        p.setPen(Qt.NoPen)
+        p.setBrush(fill)
+        p.drawRoundedRect(track, self._H / 2.0, self._H / 2.0)
+        d = self._H - 6.0
+        x = track.left() + 3.0 + self._knob * (self._W - self._H)
+        p.setBrush(QColor("#FFFFFF"))
+        p.drawEllipse(QRectF(x, track.top() + 3.0, d, d))
+        if self.property("kbFocus"):
+            # 글쇠로 옮겨 왔을 때만 두르는 초점 테두리(theme.KeyboardFocusMarker).
+            p.setPen(QPen(QColor(COLOR_FOCUS), 2.0))
+            p.setBrush(Qt.NoBrush)
+            ring = track.adjusted(-2.0, -2.0, 2.0, 2.0)
+            p.drawRoundedRect(ring, ring.height() / 2.0, ring.height() / 2.0)
+        p.end()
+
+
+class _Row(QWidget):
+    """설정 한 줄: 왼쪽에 이름(과 덧붙이는 말), 오른쪽에 고르는 칸.
+
+    스위치가 달린 줄은 줄 어디를 눌러도 스위치가 바뀐다."""
+
+    def __init__(self, label: str, control: QWidget | None, hint: str = "",
+                 *, below: bool = False, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._switch = control if isinstance(control, Switch) else None
+        if self._switch is not None:
+            self.setCursor(Qt.PointingHandCursor)
+
+        text = QVBoxLayout()
+        text.setContentsMargins(0, 0, 0, 0)
+        text.setSpacing(3)
+        # 부모를 주고 만든다. 부모 없는 위젯에 setVisible(True) 를 부르면 그
+        # 위젯이 잠깐 독립된 창으로 뜬다(설정 창을 열 때 번쩍이던 것).
+        self.label = QLabel(label, self)
+        self.label.setObjectName("RowLabel")
+        text.addWidget(self.label)
+        self.hint = QLabel(hint, self)
+        self.hint.setObjectName("RowHint")
+        self.hint.setWordWrap(True)
+        self.hint.setVisible(bool(hint))
+        text.addWidget(self.hint)
+
+        if below:
+            # 폴더 경로처럼 긴 칸은 이름 아래에 줄 전체로 놓는다.
+            outer = QVBoxLayout(self)
+            outer.setContentsMargins(0, 11, 0, 11)
+            outer.setSpacing(8)
+            outer.addWidget(self.label)
+            if control is not None:
+                outer.addWidget(control)
+            outer.addWidget(self.hint)
+        else:
+            outer = QHBoxLayout(self)
+            outer.setContentsMargins(0, 9, 0, 9)
+            outer.setSpacing(16)
+            outer.addLayout(text, 1)
+            if control is not None:
+                outer.addWidget(control, 0, Qt.AlignVCenter | Qt.AlignRight)
+            self.setMinimumHeight(50)
+        if control is not None and not control.accessibleName():
+            control.setAccessibleName(label)
+
+    def set_hint(self, text: str) -> None:
+        self.hint.setText(text)
+        self.hint.setVisible(bool(text))
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if (self._switch is not None and event.button() == Qt.LeftButton
+                and self._switch.isEnabled()
+                and self.rect().contains(event.position().toPoint())):
+            self._switch.click()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+class _Page(QWidget):
+    """설정 한 쪽: 제목 아래에 줄을 쌓는다. 줄 사이에는 가는 선이 놓인다."""
+
+    def __init__(self, title: str, note: str = "",
+                 parent: QWidget | None = None):
+        super().__init__(parent)
+        self._v = QVBoxLayout(self)
+        self._v.setContentsMargins(28, 22, 28, 12)
+        self._v.setSpacing(0)
+        heading = QLabel(title)
+        heading.setObjectName("PageTitle")
+        self._v.addWidget(heading)
+        if note:
+            sub = QLabel(note)
+            sub.setObjectName("PageNote")
+            sub.setWordWrap(True)
+            self._v.addSpacing(4)
+            self._v.addWidget(sub)
+        self._v.addSpacing(8)
+        self._rows = 0
+
+    def add_row(self, label: str, control: QWidget | None = None,
+                hint: str = "", *, below: bool = False) -> _Row:
+        if self._rows:
+            line = QFrame()
+            line.setObjectName("RowLine")
+            line.setFixedHeight(1)
+            self._v.addWidget(line)
+        row = _Row(label, control, hint, below=below)
+        self._v.addWidget(row)
+        self._rows += 1
+        return row
+
+    def add_layout(self, layout, top: int = 0) -> None:
+        if top:
+            self._v.addSpacing(top)
+        self._v.addLayout(layout)
+
+    def add_stretch(self) -> None:
+        self._v.addStretch(1)
+
+
+def _field(widget: QWidget) -> QWidget:
+    widget.setFixedWidth(_FIELD_WIDTH)
+    return widget
 
 
 class _ColorPicker(QWidget):
     colorChanged = Signal(str)
-
-    _COLUMNS = 4
 
     def __init__(self, current: str, parent: QWidget | None = None):
         super().__init__(parent)
         self._current = current
         self._buttons: dict[str, QToolButton] = {}
 
-        outer = QHBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
-        grid = QGridLayout()
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(6)
-        grid.setVerticalSpacing(6)
-
-        for index, hex_color in enumerate(config.COLORS):
-            r, c = divmod(index, self._COLUMNS)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        for hex_color in config.COLORS:
             btn = QToolButton()
             btn.setFixedSize(26, 26)
             btn.setIcon(color_swatch_icon(hex_color, 20))
@@ -93,10 +318,7 @@ class _ColorPicker(QWidget):
             )
             btn.clicked.connect(lambda _=False, c=hex_color: self._select(c))
             self._buttons[hex_color] = btn
-            grid.addWidget(btn, r, c)
-
-        outer.addLayout(grid)
-        outer.addStretch(1)
+            row.addWidget(btn)
         self._refresh()
 
     def _select(self, color: str) -> None:
@@ -123,17 +345,44 @@ class SettingsDialog(QDialog):
                  parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle(i18n.t("settings.window_title", app=i18n.t("app.name")))
-        self.setMinimumSize(540, 460)
+        self.setMinimumSize(700, 500)
+        self.setStyleSheet(_QSS)
         self._settings = settings
         self._role = role
 
-        tabs = QTabWidget()
-        tabs.addTab(self._build_general_tab(), i18n.t("settings.tab_general"))
-        tabs.addTab(self._build_memo_tab(), i18n.t("settings.tab_memo"))
-        tabs.addTab(self._build_startup_tab(), i18n.t("settings.tab_startup"))
-        tabs.addTab(self._build_network_tab(), i18n.t("settings.tab_network"))
-        tabs.addTab(self._build_backup_tab(), i18n.t("settings.tab_backup"))
-        tabs.addTab(self._build_about_tab(), i18n.t("settings.tab_about"))
+        nav = QWidget()
+        nav.setObjectName("SettingsNav")
+        nav.setAttribute(Qt.WA_StyledBackground, True)
+        nav.setFixedWidth(_NAV_WIDTH)
+        nav_v = QVBoxLayout(nav)
+        nav_v.setContentsMargins(10, 18, 10, 12)
+        nav_v.setSpacing(2)
+        self._nav = QButtonGroup(self)
+        self._nav.setExclusive(True)
+        self._pages = QStackedWidget()
+
+        for icon, title, build in (
+            ("settings", i18n.t("settings.tab_general"), self._build_general_page),
+            ("note", i18n.t("settings.tab_memo"), self._build_memo_page),
+            ("fold", i18n.t("settings.tab_fold"), self._build_fold_page),
+            ("bell", i18n.t("settings.tab_notify"), self._build_notify_page),
+            ("network", i18n.t("settings.tab_network"), self._build_network_page),
+            ("archive", i18n.t("settings.tab_backup"), self._build_backup_page),
+            ("info", i18n.t("settings.tab_about"), self._build_about_page),
+        ):
+            index = self._pages.addWidget(build(title))
+            item = QPushButton(title)
+            item.setObjectName("NavItem")
+            item.setIcon(svg_icon(icon, color="#4A4A4A"))
+            item.setIconSize(QSize(16, 16))
+            item.setCheckable(True)
+            item.setAutoDefault(False)
+            item.setCursor(Qt.PointingHandCursor)
+            self._nav.addButton(item, index)
+            nav_v.addWidget(item)
+        nav_v.addStretch(1)
+        self._nav.idClicked.connect(self._pages.setCurrentIndex)
+        self._nav.button(0).setChecked(True)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
@@ -141,7 +390,7 @@ class SettingsDialog(QDialog):
         cancel_btn = buttons.button(QDialogButtonBox.Cancel)
         ok_btn.setText(i18n.t("settings.btn_save"))
         cancel_btn.setText(i18n.t("settings.btn_cancel"))
-        # setFixedWidth 는 re-polish 뒤에 호출해야 한다. polish 가 크기 힌트를
+        # setMinimumWidth 는 re-polish 뒤에 호출해야 한다. polish 가 크기 힌트를
         # 재계산하며 그 전에 지정한 폭을 덮어쓰기 때문이다.
         cancel_btn.setProperty("secondary", True)
         refresh_style(cancel_btn)
@@ -150,20 +399,42 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(18, 18, 18, 14)
-        root.setSpacing(12)
-        root.addWidget(tabs, 1)
-        root.addWidget(buttons)
+        foot_line = QFrame()
+        foot_line.setObjectName("FootLine")
+        foot_line.setFixedHeight(1)
+        foot = QHBoxLayout()
+        foot.setContentsMargins(28, 12, 20, 14)
+        foot.addWidget(buttons)
 
-    def _build_general_tab(self) -> QWidget:
-        w = QWidget()
-        form = QFormLayout(w)
-        form.setContentsMargins(8, 12, 8, 8)
-        form.setVerticalSpacing(18)
-        form.setHorizontalSpacing(24)
-        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        form.setLabelAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        right = QVBoxLayout()
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(0)
+        right.addWidget(self._pages, 1)
+        right.addWidget(foot_line)
+        right.addLayout(foot)
+
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(nav)
+        root.addLayout(right, 1)
+
+    def show_page(self, index: int) -> None:
+        """``index`` 번째 구역을 보인다."""
+        button = self._nav.button(index)
+        if button is not None:
+            button.setChecked(True)
+            self._pages.setCurrentIndex(index)
+
+    def _switch(self, on: bool) -> Switch:
+        switch = Switch()
+        switch.setChecked(bool(on))
+        return switch
+
+    # ── 구역 ────────────────────────────────────────────────────────────
+
+    def _build_general_page(self, title: str) -> QWidget:
+        page = _Page(title)
 
         self._language = QComboBox()
         for code in i18n.SUPPORTED_LANGUAGES:
@@ -172,53 +443,49 @@ class SettingsDialog(QDialog):
         cur_lang = i18n.resolve_language(self._settings.language_code)
         idx = self._language.findData(cur_lang)
         self._language.setCurrentIndex(idx if idx >= 0 else 0)
-        form.addRow(i18n.t("settings.language"), self._language)
+        page.add_row(i18n.t("settings.language"), _field(self._language),
+                     i18n.t("settings.language.restart_hint"))
 
-        lang_hint = QLabel(i18n.t("settings.language.restart_hint"))
-        lang_hint.setProperty("role", "subtle")
-        lang_hint.setWordWrap(True)
-        form.addRow("", lang_hint)
+        is_windows = platform.system() == "Windows"
+        self._autostart = self._switch(
+            get_windows_autostart() if is_windows else self._settings.autostart)
+        can_autostart = is_windows and autostart_supported()
+        self._autostart.setEnabled(can_autostart)
+        store = packaging.is_packaged()
+        # 스토어판에서 사용자가 Windows 설정의 시작 앱에서 꺼 두었으면 앱이 바꿀
+        # 수 없다. 그때만 어디서 바꾸는지 적는다.
+        page.add_row(i18n.t("settings.check_autostart"), self._autostart,
+                     i18n.t("settings.note_autostart_windows")
+                     if store and not can_autostart else "")
+
+        self._tray_check = self._switch(self._settings.show_tray_icon)
+        page.add_row(i18n.t("settings.check_tray"), self._tray_check)
+
+        self._close_to_tray = self._switch(self._settings.close_main_to_tray)
+        page.add_row(i18n.t("settings.check_close_to_tray"), self._close_to_tray)
+
+        # 바탕 화면의 '새 메모'와 파일·폴더의 '새 메모에 링크로 넣기'. 상태는 설정
+        # 파일이 아니라 레지스트리에 있다(설치 프로그램의 선택 항목과 같은 자리).
+        self._desktop_menu_was = shell_menu.is_registered()
+        self._desktop_menu = self._switch(self._desktop_menu_was)
+        self._desktop_menu.setEnabled(shell_menu.is_supported())
+        # 스토어판의 메뉴는 Windows 11 의 첫 화면 메뉴에 나오므로 덧붙일 말이 없다.
+        page.add_row(i18n.t("settings.check_desktop_menu"), self._desktop_menu,
+                     "" if store else i18n.t("settings.note_desktop_menu"))
+        page.add_stretch()
+        return page
+
+    def _build_memo_page(self, title: str) -> QWidget:
+        page = _Page(title)
 
         self._font_size = QSpinBox()
         self._font_size.setRange(8, 48)
         self._font_size.setSuffix(" pt")
         self._font_size.setValue(self._settings.default_font_size)
-        form.addRow(i18n.t("settings.label_font_size"), self._font_size)
+        page.add_row(i18n.t("settings.label_font_size"), _field(self._font_size))
 
         self._color_picker = _ColorPicker(self._settings.default_note_color)
-        form.addRow(i18n.t("settings.label_note_color"), self._color_picker)
-
-        self._tray_check = QCheckBox(i18n.t("settings.check_tray"))
-        self._tray_check.setChecked(self._settings.show_tray_icon)
-        form.addRow("", self._tray_check)
-
-        self._close_to_tray = QCheckBox(i18n.t("settings.check_close_to_tray"))
-        self._close_to_tray.setChecked(self._settings.close_main_to_tray)
-        form.addRow("", self._close_to_tray)
-
-        # 바탕 화면 우클릭 메뉴의 '새 메모'. 상태는 설정 파일이 아니라
-        # 레지스트리에 있다(설치 프로그램의 선택 항목과 같은 자리).
-        self._desktop_menu = QCheckBox(i18n.t("settings.check_desktop_menu"))
-        self._desktop_menu_was = shell_menu.is_registered()
-        self._desktop_menu.setChecked(self._desktop_menu_was)
-        self._desktop_menu.setEnabled(shell_menu.is_supported())
-        form.addRow("", self._desktop_menu)
-
-        menu_note = QLabel(i18n.t("settings.note_desktop_menu"))
-        menu_note.setProperty("role", "subtle")
-        menu_note.setWordWrap(True)
-        form.addRow("", menu_note)
-        _align_form_labels(form)
-        return w
-
-    def _build_memo_tab(self) -> QWidget:
-        w = QWidget()
-        form = QFormLayout(w)
-        form.setContentsMargins(8, 12, 8, 8)
-        form.setVerticalSpacing(18)
-        form.setHorizontalSpacing(24)
-        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        form.setLabelAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        page.add_row(i18n.t("settings.label_note_color"), self._color_picker)
 
         # 새 메모를 누구에게 보일지. 만든 뒤에는 메모마다 바꿀 수 있다.
         self._new_note_scope = QComboBox()
@@ -228,19 +495,13 @@ class SettingsDialog(QDialog):
             i18n.t("settings.new_note_private"), userData=True)
         self._new_note_scope.setCurrentIndex(
             1 if self._settings.new_note_private else 0)
-        form.addRow(i18n.t("settings.label_new_note_scope"),
-                    self._new_note_scope)
+        page.add_row(i18n.t("settings.label_new_note_scope"),
+                     _field(self._new_note_scope))
 
-        self._notify_new_note = QCheckBox(
-            i18n.t("settings.check_notify_new_note"))
-        self._notify_new_note.setChecked(self._settings.notify_new_note)
-        form.addRow("", self._notify_new_note)
-
-        self._move_checked_to_bottom = QCheckBox(
-            i18n.t("settings.check_move_checked_to_bottom"))
-        self._move_checked_to_bottom.setChecked(
+        self._move_checked_to_bottom = self._switch(
             self._settings.move_checked_to_bottom)
-        form.addRow("", self._move_checked_to_bottom)
+        page.add_row(i18n.t("settings.check_move_checked_to_bottom"),
+                     self._move_checked_to_bottom)
 
         self._image_viewer = QComboBox()
         self._image_viewer.addItem(i18n.t("settings.image_viewer_builtin"),
@@ -249,7 +510,13 @@ class SettingsDialog(QDialog):
                                    userData=IMAGE_VIEWER_SYSTEM)
         idx = self._image_viewer.findData(self._settings.image_viewer)
         self._image_viewer.setCurrentIndex(idx if idx >= 0 else 0)
-        form.addRow(i18n.t("settings.label_image_viewer"), self._image_viewer)
+        page.add_row(i18n.t("settings.label_image_viewer"),
+                     _field(self._image_viewer))
+        page.add_stretch()
+        return page
+
+    def _build_fold_page(self, title: str) -> QWidget:
+        page = _Page(title)
 
         # 접힌 메모의 기본 모양. 메모마다 접힌 쪽지를 오른쪽 눌러 바꿀 수도 있다.
         self._fold_style = QComboBox()
@@ -259,57 +526,35 @@ class SettingsDialog(QDialog):
                                  userData="icon")
         idx = self._fold_style.findData(self._settings.fold_style)
         self._fold_style.setCurrentIndex(idx if idx >= 0 else 0)
-        form.addRow(i18n.t("settings.label_fold"), self._fold_style)
+        page.add_row(i18n.t("settings.label_fold"), _field(self._fold_style))
 
-        self._fold_animation = QCheckBox(
-            i18n.t("settings.check_fold_animation"))
-        self._fold_animation.setChecked(self._settings.fold_animation)
-        form.addRow("", self._fold_animation)
+        self._fold_animation = self._switch(self._settings.fold_animation)
+        page.add_row(i18n.t("settings.check_fold_animation"),
+                     self._fold_animation)
 
-        self._dock_on_top = QCheckBox(i18n.t("settings.check_dock_on_top"))
-        self._dock_on_top.setChecked(self._settings.dock_on_top)
-        form.addRow("", self._dock_on_top)
+        self._dock_on_top = self._switch(self._settings.dock_on_top)
+        page.add_row(i18n.t("settings.check_dock_on_top"), self._dock_on_top)
+        page.add_stretch()
+        return page
 
-        fold_note = QLabel(i18n.t("settings.note_fold"))
-        fold_note.setProperty("role", "subtle")
-        fold_note.setWordWrap(True)
-        form.addRow("", fold_note)
-        _align_form_labels(form)
-        return w
+    def _build_notify_page(self, title: str) -> QWidget:
+        page = _Page(title)
+        self._notify_new_note = self._switch(self._settings.notify_new_note)
+        page.add_row(i18n.t("settings.check_notify_new_note"),
+                     self._notify_new_note)
+        self._notify_note_edit = self._switch(self._settings.notify_note_edit)
+        page.add_row(i18n.t("settings.check_notify_note_edit"),
+                     self._notify_note_edit)
+        page.add_stretch()
+        return page
 
-    def _build_startup_tab(self) -> QWidget:
-        w = QWidget()
-        form = QFormLayout(w)
-        form.setContentsMargins(8, 12, 8, 8)
-        form.setVerticalSpacing(18)
-        form.setHorizontalSpacing(24)
-        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        form.setLabelAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-
-        import platform
-        is_windows = platform.system() == "Windows"
-
-        self._autostart = QCheckBox(i18n.t("settings.check_autostart"))
-        current = get_windows_autostart() if is_windows else self._settings.autostart
-        self._autostart.setChecked(current)
-        self._autostart.setEnabled(is_windows)
-        form.addRow("", self._autostart)
-        _align_form_labels(form)
-        return w
-
-    def _build_network_tab(self) -> QWidget:
-        w = QWidget()
-        form = QFormLayout(w)
-        form.setContentsMargins(8, 12, 8, 8)
-        form.setVerticalSpacing(18)
-        form.setHorizontalSpacing(24)
-        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        form.setLabelAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+    def _build_network_page(self, title: str) -> QWidget:
+        page = _Page(title, i18n.t("settings.note_network"))
 
         self._port = QSpinBox()
         self._port.setRange(1, 65535)
         self._port.setValue(self._settings.default_port)
-        form.addRow(i18n.t("settings.label_host_port"), self._port)
+        page.add_row(i18n.t("settings.label_host_port"), _field(self._port))
 
         self._heartbeat = QDoubleSpinBox()
         self._heartbeat.setDecimals(1)
@@ -317,33 +562,20 @@ class SettingsDialog(QDialog):
         self._heartbeat.setSingleStep(0.5)
         self._heartbeat.setSuffix(i18n.t("connect.unit_seconds"))
         self._heartbeat.setValue(self._settings.default_heartbeat_ms / 1000)
-        form.addRow(i18n.t("settings.label_heartbeat"), self._heartbeat)
+        page.add_row(i18n.t("settings.label_heartbeat"), _field(self._heartbeat))
+        page.add_stretch()
+        return page
 
-        note = QLabel(i18n.t("settings.note_network"))
-        note.setProperty("role", "subtle")
-        note.setWordWrap(True)
-        form.addRow("", note)
-        _align_form_labels(form)
-        return w
+    def _build_backup_page(self, title: str) -> QWidget:
+        is_host = self._role == "host"
+        page = _Page(title, "" if is_host else i18n.t("settings.note_backup_guest"))
 
-    def _build_backup_tab(self) -> QWidget:
-        w = QWidget()
-        # 좌우 여백을 0 으로 둬야 하단 액션 버튼이 대화상자의 저장/취소 버튼과
-        # 우측으로 정확히 정렬된다.
-        outer = QVBoxLayout(w)
-        outer.setContentsMargins(0, 12, 0, 8)
-        outer.setSpacing(12)
+        self._backup_enabled = self._switch(self._settings.backup_enabled)
+        page.add_row(i18n.t("settings.check_backup_enabled"), self._backup_enabled)
 
-        form_wrap = QWidget()
-        form = QFormLayout(form_wrap)
-        self._backup_form = form
-        form.setContentsMargins(8, 0, 8, 0)
-        form.setVerticalSpacing(18)
-        form.setHorizontalSpacing(24)
-        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        form.setLabelAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-
-        dir_row = QHBoxLayout()
+        dir_wrap = QWidget()
+        dir_row = QHBoxLayout(dir_wrap)
+        dir_row.setContentsMargins(0, 0, 0, 0)
         dir_row.setSpacing(6)
         self._backup_dir = QLineEdit(self._settings.backup_dir
                                       or str(config.default_backup_dir()))
@@ -351,24 +583,23 @@ class SettingsDialog(QDialog):
         browse.setIcon(svg_icon("folder"))
         browse.setIconSize(QSize(16, 16))
         browse.setCursor(Qt.PointingHandCursor)
-        browse.setAutoRaise(True)
+        browse.setProperty("iconOnly", True)
+        browse.setFixedSize(34, 34)
         browse.setToolTip(i18n.t("settings.btn_browse_folder"))
         browse.clicked.connect(self._pick_backup_dir)
         dir_row.addWidget(self._backup_dir, 1)
         dir_row.addWidget(browse)
-        dir_wrap = QWidget()
-        dir_wrap.setLayout(dir_row)
-        form.addRow(i18n.t("settings.label_backup_dir"), dir_wrap)
-
         # 백업이 메모와 같은 디스크에 있으면 디스크가 고장 날 때 함께 잃는다.
-        self._backup_dir_hint = QLabel(i18n.t("settings.note_backup_same_disk"))
-        self._backup_dir_hint.setProperty("role", "subtle")
-        self._backup_dir_hint.setWordWrap(True)
-        form.addRow("", self._backup_dir_hint)
+        dir_line = page.add_row(i18n.t("settings.label_backup_dir"), dir_wrap,
+                                i18n.t("settings.note_backup_same_disk"),
+                                below=True)
+        self._backup_dir_hint = dir_line.hint
         self._backup_dir.textChanged.connect(self._refresh_backup_dir_hint)
         self._refresh_backup_dir_hint()
 
-        interval_row = QHBoxLayout()
+        interval_wrap = QWidget()
+        interval_row = QHBoxLayout(interval_wrap)
+        interval_row.setContentsMargins(0, 0, 0, 0)
         interval_row.setSpacing(6)
         self._backup_interval = QSpinBox()
         self._backup_interval.setRange(1, 999)
@@ -382,94 +613,114 @@ class SettingsDialog(QDialog):
             self._backup_unit.addItem(label, userData=key)
         idx = self._backup_unit.findData(self._settings.backup_interval_unit)
         self._backup_unit.setCurrentIndex(idx if idx >= 0 else 1)
-        self._backup_unit.setFixedWidth(96)
-        interval_row.addWidget(self._backup_interval, 1)
+        # 두 칸의 폭을 합쳐 다른 줄의 칸과 같게 한다. 숫자 칸을 늘어나게 두면
+        # 제 최소 폭을 고집해, 단위 칸이 줄 밖으로 밀려 오른쪽이 잘린다.
+        self._backup_unit.ensurePolished()
+        unit_width = max(92, self._backup_unit.sizeHint().width())
+        self._backup_unit.setFixedWidth(unit_width)
+        self._backup_interval.setFixedWidth(
+            _FIELD_WIDTH - interval_row.spacing() - unit_width)
+        interval_row.addWidget(self._backup_interval)
         interval_row.addWidget(self._backup_unit)
-        interval_wrap = QWidget()
-        interval_wrap.setLayout(interval_row)
-        form.addRow(i18n.t("settings.label_backup_interval"), interval_wrap)
+        self._backup_interval.setAccessibleName(
+            i18n.t("settings.label_backup_interval"))
+        page.add_row(i18n.t("settings.label_backup_interval"),
+                     _field(interval_wrap))
 
         self._backup_keep = QSpinBox()
         self._backup_keep.setRange(1, 1000)
         self._backup_keep.setSuffix(i18n.t("settings.backup_keep_suffix"))
         self._backup_keep.setValue(self._settings.backup_keep_count)
-        form.addRow(i18n.t("settings.label_backup_keep"), self._backup_keep)
-        _align_form_labels(form)
-        outer.addWidget(form_wrap)
+        page.add_row(i18n.t("settings.label_backup_keep"),
+                     _field(self._backup_keep))
+        page.add_stretch()
 
-        outer.addStretch(1)
-
-        self._backup_enabled = QCheckBox(i18n.t("settings.check_backup_enabled"))
-        self._backup_enabled.setChecked(self._settings.backup_enabled)
-        # 켜고 끄는 칸은 한 줄, 단추들은 그 아래 줄에 오른쪽으로 모은다(단추가
-        # 셋이라 한 줄에 같이 두면 글자가 잘린다).
-        check_row = QHBoxLayout()
-        check_row.setContentsMargins(8, 0, 0, 0)   # 왼쪽 8 = 폼의 왼쪽 inset 과 동일
-        check_row.addWidget(self._backup_enabled)
-        check_row.addStretch(1)
-        outer.addLayout(check_row)
-        bottom = QHBoxLayout()
-        bottom.setContentsMargins(8, 0, 0, 0)
-        bottom.setSpacing(10)
-        bottom.addStretch(1)
+        actions = QHBoxLayout()
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(8)
         # 참여한 PC 가 받아 둔 메모 사본. 공유 PC 가 고장 났을 때 여기서 꺼낸다.
-        copies_btn = QPushButton(i18n.t("settings.btn_copies"))
-        copies_btn.setProperty("secondary", True)
-        refresh_style(copies_btn)
-        copies_btn.setCursor(Qt.PointingHandCursor)
-        copies_btn.clicked.connect(self.copiesRequested.emit)
-        bottom.addWidget(copies_btn)
-        if self._role == "host":
-            restore_btn = QPushButton(i18n.t("settings.btn_restore"))
-            restore_btn.setProperty("secondary", True)
-            refresh_style(restore_btn)
-            restore_btn.setMinimumWidth(_DIALOG_BUTTON_WIDTH)
-            restore_btn.setCursor(Qt.PointingHandCursor)
-            restore_btn.clicked.connect(self.restoreRequested.emit)
-            bottom.addWidget(restore_btn)
-            now_btn = QPushButton(i18n.t("settings.btn_backup_now"))
-            now_btn.setProperty("secondary", True)
-            refresh_style(now_btn)
-            # 고정 폭은 re-polish 뒤에 지정해야 스타일시트 최소 폭에 덮이지 않는다.
-            now_btn.setMinimumWidth(_DIALOG_BUTTON_WIDTH)
-            now_btn.setCursor(Qt.PointingHandCursor)
-            now_btn.clicked.connect(self.backupNowRequested.emit)
-            bottom.addWidget(now_btn)
-        outer.addLayout(bottom)
+        actions.addWidget(self._action_button(
+            i18n.t("settings.btn_copies"), self.copiesRequested.emit))
+        actions.addStretch(1)
+        if is_host:
+            actions.addWidget(self._action_button(
+                i18n.t("settings.btn_restore"), self.restoreRequested.emit))
+            actions.addWidget(self._action_button(
+                i18n.t("settings.btn_backup_now"), self.backupNowRequested.emit))
+        page.add_layout(actions, top=8)
+        return page
 
-        if self._role != "host":
-            note_wrap = QWidget()
-            note_v = QVBoxLayout(note_wrap)
-            note_v.setContentsMargins(8, 0, 8, 0)
-            note = QLabel(i18n.t("settings.note_backup_guest"))
-            note.setProperty("role", "subtle")
-            note.setWordWrap(True)
-            note_v.addWidget(note)
-            outer.addWidget(note_wrap)
-        return w
+    def _action_button(self, text: str, handler) -> QPushButton:
+        button = QPushButton(text)
+        button.setProperty("secondary", True)
+        refresh_style(button)
+        button.setAutoDefault(False)
+        button.setCursor(Qt.PointingHandCursor)
+        button.clicked.connect(handler)
+        return button
 
-    def _build_about_tab(self) -> QWidget:
-        w = QWidget()
-        v = QVBoxLayout(w)
-        v.setContentsMargins(8, 12, 8, 8)
-        v.setSpacing(6)
-        title = QLabel(i18n.t("app.name"))
-        title.setStyleSheet("font-size: 18px; font-weight: 800; color: #1F1F1F;")
-        v.addWidget(title)
+    def _build_about_page(self, title: str) -> QWidget:
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(28, 30, 28, 12)
+        v.setSpacing(0)
+
+        icon = QLabel()
+        icon.setAlignment(Qt.AlignHCenter)
+        icon.setFixedHeight(_ABOUT_ICON)
+        icon.setAccessibleName(i18n.t("app.name"))
+        source = QPixmap(str(config.ICON_PATH))
+        if not source.isNull():
+            dpr = self.devicePixelRatioF() or 1.0
+            side = int(round(_ABOUT_ICON * dpr))
+            scaled = source.scaled(side, side, Qt.KeepAspectRatio,
+                                   Qt.SmoothTransformation)
+            scaled.setDevicePixelRatio(dpr)
+            icon.setPixmap(scaled)
+        v.addWidget(icon)
+        v.addSpacing(12)
+
+        name = QLabel(i18n.t("app.name"))
+        name.setObjectName("AboutName")
+        name.setAlignment(Qt.AlignHCenter)
+        v.addWidget(name)
+        v.addSpacing(4)
         version = QLabel(
             i18n.t("settings.about_version", version=config.APP_VERSION))
-        version.setProperty("role", "subtle")
+        version.setObjectName("AboutVersion")
+        version.setAlignment(Qt.AlignHCenter)
         v.addWidget(version)
+        v.addSpacing(10)
         desc = QLabel(i18n.t("settings.about_description"))
+        desc.setObjectName("AboutText")
+        desc.setAlignment(Qt.AlignHCenter)
         desc.setWordWrap(True)
         v.addWidget(desc)
-        v.addSpacing(8)
+        v.addSpacing(20)
+
+        self._auto_update = self._switch(self._settings.auto_update)
+        if not packaging.is_packaged():
+            # 스토어판은 스토어가 올리므로 이 줄이 없다.
+            line = QFrame()
+            line.setObjectName("RowLine")
+            line.setFixedHeight(1)
+            v.addWidget(line)
+            v.addWidget(_Row(i18n.t("settings.check_auto_update"),
+                             self._auto_update,
+                             i18n.t("settings.note_auto_update")))
+            line = QFrame()
+            line.setObjectName("RowLine")
+            line.setFixedHeight(1)
+            v.addWidget(line)
+
+        v.addStretch(1)
         credit = QLabel(i18n.t("settings.about_credit"))
-        credit.setProperty("role", "subtle")
+        credit.setObjectName("RowHint")
         credit.setWordWrap(True)
         v.addWidget(credit)
-        v.addStretch(1)
-        return w
+        return page
+
+    # ── 동작 ────────────────────────────────────────────────────────────
 
     def _refresh_backup_dir_hint(self) -> None:
         """백업 폴더가 메모 파일과 같은 드라이브면 안내를 보인다(호스트만)."""
@@ -477,8 +728,7 @@ class SettingsDialog(QDialog):
             return os.path.splitdrive(os.path.abspath(p))[0].lower()
         folder = self._backup_dir.text().strip() or str(config.default_backup_dir())
         same = drive(folder) == drive(str(config.default_db_path()))
-        self._backup_form.setRowVisible(
-            self._backup_dir_hint, self._role == "host" and same)
+        self._backup_dir_hint.setVisible(self._role == "host" and same)
 
     def backup_folder(self) -> Path:
         """지금 입력칸에 적힌 백업 폴더(아직 저장하지 않은 값 포함)."""
@@ -503,10 +753,12 @@ class SettingsDialog(QDialog):
         want_menu = self._desktop_menu.isChecked()
         if self._desktop_menu.isEnabled() and want_menu != self._desktop_menu_was:
             shell_menu.set_registered(
-                want_menu, i18n.t("jumplist.new_note_title"))
+                want_menu, i18n.t("jumplist.new_note_title"),
+                i18n.t("shell.link_note_title"))
 
         s.new_note_private = bool(self._new_note_scope.currentData())
         s.notify_new_note = self._notify_new_note.isChecked()
+        s.notify_note_edit = self._notify_note_edit.isChecked()
         s.move_checked_to_bottom = self._move_checked_to_bottom.isChecked()
         s.image_viewer = self._image_viewer.currentData() or IMAGE_VIEWER_BUILTIN
         s.fold_style = self._fold_style.currentData() or "slip"
@@ -527,6 +779,11 @@ class SettingsDialog(QDialog):
         s.backup_interval_value = int(self._backup_interval.value())
         s.backup_interval_unit = self._backup_unit.currentData() or "hours"
         s.backup_keep_count = int(self._backup_keep.value())
+
+        if s.auto_update != self._auto_update.isChecked():
+            s.auto_update = self._auto_update.isChecked()
+            # 다시 켰으면 지난번에 끝내지 못한 버전도 새로 시도한다.
+            s.auto_update_tried = ""
 
         s.save()
         self.accept()

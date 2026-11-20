@@ -148,14 +148,40 @@ def test_only_changed_notes_are_rewritten(store, monkeypatch):
     assert sorted(written) == ["b", "d"]
 
 
-def test_archives_are_capped(store, monkeypatch):
+def test_old_archives_are_capped(store, monkeypatch):
     monkeypatch.setattr(replica_mod, "KEEP_ARCHIVES", 2)
+    # 옮겨 둔 지 오래된 것만 개수를 넘으면 지운다. 여기서는 모두 오래된 것으로 친다.
+    monkeypatch.setattr(replica_mod, "ARCHIVE_MIN_AGE_DAYS", -1)
     for i in range(5):
         store.apply_snapshot([note(f"n{i}")], [], host_id=f"H{i}")
     assert len(store.archives()) == 2
     # 가장 새로 옮긴 두 벌이 남는다.
     assert [stored(p) for p in store.archives()] == [{"n3"}, {"n2"}]
     assert ids(store) == {"n4"}
+
+
+def test_recent_archives_are_kept_even_past_the_cap(store, monkeypatch):
+    """공유 PC 인 척하는 상대가 서로 다른 메모 묶음을 잇달아 보내도, 진짜
+    사본이 개수에 밀려 지워지지 않는다."""
+    monkeypatch.setattr(replica_mod, "KEEP_ARCHIVES", 2)
+    store.apply_snapshot([note("진짜1"), note("진짜2")], [], host_id="REAL")
+    for i in range(8):
+        store.apply_snapshot([note(f"가짜{i}")], [], host_id=f"FAKE{i}")
+    kept = [stored(p) for p in store.archives()]
+    assert {"진짜1", "진짜2"} in kept
+    assert len(kept) == 8
+
+
+def test_archive_age_is_read_from_its_name(tmp_path):
+    from datetime import datetime
+
+    now = datetime(2026, 11, 20, 12, 0, 0)
+    old = tmp_path / "replica.archive-20260901_090000.sqlite3"
+    new = tmp_path / "replica.archive-20261119_090000-3.sqlite3"
+    odd = tmp_path / "replica.archive-어제.sqlite3"
+    assert replica_mod._older_than(old, now, 30) is True
+    assert replica_mod._older_than(new, now, 30) is False
+    assert replica_mod._older_than(odd, now, 30) is False     # 모르면 남긴다
 
 
 def test_damaged_copy_is_set_aside_not_deleted(tmp_path):

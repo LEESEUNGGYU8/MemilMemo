@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import i18n
+from . import dwm
 from .icons import svg_icon
 
 TOAST_WIDTH = 328
@@ -99,7 +100,10 @@ class Toast(QWidget):
             mark.setPixmap(icon.pixmap(22, 22))
         row.addWidget(mark, 0, Qt.AlignTop)
 
-        self._label = QLabel(text, card)
+        # 알림 글에는 남의 닉네임과 메모 제목이 들어간다. 글자 그대로 보인다.
+        self._label = QLabel(card)
+        self._label.setTextFormat(Qt.PlainText)
+        self._label.setText(text)
         self._label.setWordWrap(True)
         self._label.setStyleSheet(
             "color: #FFFFFF; font-size: 13px; font-weight: 600; "
@@ -160,6 +164,12 @@ class Toast(QWidget):
             fade.finished.connect(then)
         self._fade = fade
         fade.start()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        # 그림자 여백까지 창이라, Windows 가 두르는 그림자와 테두리가 알림을
+        # 감싼 판처럼 보인다.
+        dwm.set_bare(int(self.winId()))
 
     def enterEvent(self, event) -> None:  # noqa: N802
         # 읽는 동안에는 사라지지 않는다.

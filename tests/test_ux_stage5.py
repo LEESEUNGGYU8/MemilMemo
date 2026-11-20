@@ -85,8 +85,10 @@ def make_window(qapp, tmp_path, monkeypatch):
 
     def build(*, role="guest", replica=None, settings=None, nickname=ME):
         client = FakeClient(nickname)
-        win = MainWindow(client=client,
-                         local_state=LocalStateStore(tmp_path / f"ls{len(made)}.json"),
+        local = LocalStateStore(tmp_path / f"ls{len(made)}.json")
+        # 접속 정보는 창을 만들기 전에 적힌다. 사본은 그 주소에서 받은 것만 보여 준다.
+        local.state.last_host_ip = "10.0.0.5"
+        win = MainWindow(client=client, local_state=local,
                          role=role, settings=settings or AppSettings(),
                          replica=replica)
         shown: list[str] = []
@@ -391,15 +393,15 @@ def test_backup_tab_warns_about_the_same_disk_and_offers_restore(qapp, tmp_path)
     from PySide6.QtWidgets import QPushButton
 
     host = SettingsDialog(AppSettings(), role="host")
-    form, hint = host._backup_form, host._backup_dir_hint
+    hint = host._backup_dir_hint
     # 기본 백업 폴더는 메모 파일과 같은 디스크다.
-    assert form.isRowVisible(hint)
+    assert not hint.isHidden() and hint.text() == i18n.t("settings.note_backup_same_disk")
     other = "Z:\\" if not str(config.default_db_path()).upper().startswith("Z:") else "Y:\\"
     host._backup_dir.setText(other + "backups")
-    assert not form.isRowVisible(hint)
+    assert hint.isHidden()
     assert host.backup_folder() == __import__("pathlib").Path(other + "backups")
     host._backup_dir.setText("")
-    assert form.isRowVisible(hint) and host.backup_folder() == config.default_backup_dir()
+    assert not hint.isHidden() and host.backup_folder() == config.default_backup_dir()
 
     asked = []
     host.restoreRequested.connect(lambda: asked.append(True))
@@ -410,7 +412,7 @@ def test_backup_tab_warns_about_the_same_disk_and_offers_restore(qapp, tmp_path)
     assert asked == [True]
 
     guest = SettingsDialog(AppSettings(), role="guest")
-    assert not guest._backup_form.isRowVisible(guest._backup_dir_hint)
+    assert guest._backup_dir_hint.isHidden()
     assert not [b for b in guest.findChildren(QPushButton)
                 if b.text() == i18n.t("settings.btn_restore")]
     host.deleteLater()

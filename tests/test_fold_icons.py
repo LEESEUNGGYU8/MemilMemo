@@ -87,6 +87,18 @@ def test_icon_faces_paint_and_keep_cell_hittable(qapp):
     # 그림 둘레의 빈 곳도 완전히 투명하지 않아야 마우스가 뒤 창으로 빠지지 않는다.
     assert img.pixelColor(8, 30).alpha() >= 1
 
+    # 마우스를 올려도 둘레에 판을 깔지 않는다. 그림만 밝아진다.
+    plain = img.pixelColor(glyph)
+    img.fill(Qt.transparent)
+    p = QPainter(img)
+    nf.paint_icon(p, cell, "#FFE066", "주간 회의 메모", hover=True,
+                  font=qapp.font())
+    p.end()
+    assert img.pixelColor(8, 30).alpha() <= 2
+    assert img.pixelColor(2, 2).alpha() <= 2
+    lit = img.pixelColor(glyph)
+    assert lit.alpha() == 255 and lit.lightness() > plain.lightness()
+
     img.fill(Qt.transparent)
     p = QPainter(img)
     nf.paint_folder_icon(p, cell, "#BAE1FF", "업무", opened=True, count=128,
@@ -137,7 +149,8 @@ def test_icon_style_folds_to_icon_and_opens_on_double_click(qapp):
     assert w.geometry() == QRect(open_geo.topLeft(), nf.ICON_SIZE)
     assert w.toolTip() == "주간 회의 메모"
     # 설정의 기본 모양을 따랐을 뿐이라 메모에는 모양이 기록되지 않는다.
-    assert events[-1] == ("n1", True, "", 0, "")
+    assert events[-1][0] == "n1"
+    assert events[-1][1]["folded"] is True and events[-1][1]["fold_style"] == ""
 
     # 아이콘은 한 번 눌러서는 펴지지 않고 두 번 눌러야 펴진다.
     QTest.mouseClick(w, Qt.LeftButton, Qt.NoModifier, QPoint(40, 30))
@@ -155,9 +168,11 @@ def test_style_can_be_switched_per_note(qapp):
     events: list[tuple] = []
     w.foldChanged.connect(lambda *a: events.append(a))
     w.fold(style=nf.FOLD_ICON)
-    assert w.size() == nf.ICON_SIZE and events[-1][4] == nf.FOLD_ICON
+    assert w.size() == nf.ICON_SIZE
+    assert events[-1][1]["fold_style"] == nf.FOLD_ICON
     w.set_fold_style(nf.FOLD_SLIP)
-    assert w.size() == nf.SLIP_SIZE and events[-1][4] == nf.FOLD_SLIP
+    assert w.size() == nf.SLIP_SIZE
+    assert events[-1][1]["fold_style"] == nf.FOLD_SLIP
     assert w.is_folded()
     # 쪽지는 한 번 누르면 펴진다.
     QTest.mouseClick(w, Qt.LeftButton, Qt.NoModifier, QPoint(20, 20))
@@ -180,9 +195,10 @@ def test_dragged_icon_snaps_to_grid_without_docking(qapp):
     w._slip_press = w.mapToGlobal(QPoint(30, 30))
     w._slip_grab = QPoint(30, 30)
     w._begin_slip_drag()
-    # 화면 왼쪽 끝으로 끌어도 아이콘은 붙지 않는다(쪽지였다면 탭이 된다).
+    # 벽 바로 옆 칸까지 끌어도 벽에 닿지 않으면 아이콘으로 남는다.
     w._drag_slip_to(QPoint(avail.left() + 40, 360))
     assert w._drag_dock == nf.DOCK_NONE
+    assert w.size() == nf.ICON_SIZE
     w._slip_press = None
     w._slip_dragging = False
     w._end_slip_drag()
@@ -193,9 +209,65 @@ def test_dragged_icon_snaps_to_grid_without_docking(qapp):
         % nf.ICON_GRID.width() == 0
     assert (pos.y() - avail.top() - nf.ICON_GRID_ORIGIN.y()) \
         % nf.ICON_GRID.height() == 0
-    # 펴면 아이콘이 있던 자리에서 펴진다.
+    # 펴면 펼쳐 있던 자리로 돌아가고, 접으면 아이콘을 둔 자리로 온다.
     w.unfold()
-    assert w.pos() == pos
+    assert w.pos() == QPoint(300, 200)
+    w.fold()
+    assert w.pos() == pos and w.size() == nf.ICON_SIZE
+    w._teardown = True
+    w.close()
+
+
+def test_icon_pushed_into_a_wall_becomes_a_tab(qapp):
+    w = _sticky(qapp, _settings("icon"))
+    avail = QGuiApplication.primaryScreen().availableGeometry()
+    w.fold()
+    w._slip_press = w.mapToGlobal(QPoint(30, 30))
+    w._slip_grab = QPoint(30, 30)
+    w._begin_slip_drag()
+    # 아이콘 설정과 무관하게, 벽에 닿으면 쪽지 모양으로 붙는다.
+    w._drag_slip_to(QPoint(avail.left() + 20, 360))
+    assert w._drag_dock == nf.DOCK_LEFT
+    assert w.size() == nf.SLIP_SIZE and w.geometry().left() == avail.left()
+    w._slip_press = None
+    w._slip_dragging = False
+    w._end_slip_drag()
+    assert w.dock_side() == nf.DOCK_LEFT and w.size() == nf.TAB_SIZE
+    assert w.fold_style() == nf.FOLD_SLIP
+    # 벽에서 떼어 내면 다시 아이콘이다.
+    w._slip_press = w.mapToGlobal(QPoint(20, 20))
+    w._slip_grab = QPoint(20, 20)
+    w._begin_slip_drag()
+    w._drag_slip_to(QPoint(avail.left() + 300, 360))
+    assert w._drag_dock == nf.DOCK_NONE and w.size() == nf.ICON_SIZE
+    w._slip_press = None
+    w._slip_dragging = False
+    w._end_slip_drag()
+    assert w.dock_side() == nf.DOCK_NONE and w.fold_style() == nf.FOLD_ICON
+    w._teardown = True
+    w.close()
+
+
+def test_icon_at_the_screen_edge_does_not_drift(qapp):
+    # 화면 오른쪽 끝 칸에 둔 아이콘을 펴고 접어도 아이콘은 제자리다.
+    w = _sticky(qapp, _settings("icon"))
+    avail = QGuiApplication.primaryScreen().availableGeometry()
+    w.fold()
+    w._slip_press = w.mapToGlobal(QPoint(30, 30))
+    w._slip_grab = QPoint(30, 30)
+    w._begin_slip_drag()
+    w._drag_slip_to(QPoint(avail.right() - 70, 300))
+    assert w._drag_dock == nf.DOCK_NONE
+    w._slip_press = None
+    w._slip_dragging = False
+    w._end_slip_drag()
+    spot = w.pos()
+    assert spot.x() + 280 > avail.right()     # 여기서 그대로 펴면 화면을 넘는다
+    for _ in range(3):
+        w.unfold()
+        assert w.geometry() == QRect(300, 200, 280, 260)
+        w.fold()
+        assert w.pos() == spot
     w._teardown = True
     w.close()
 

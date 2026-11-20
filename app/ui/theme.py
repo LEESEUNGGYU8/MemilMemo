@@ -629,6 +629,11 @@ def apply_theme(app: QApplication, font_family: str) -> None:
     if getattr(app, "_kb_focus_marker", None) is None:
         app._kb_focus_marker = KeyboardFocusMarker(app)
         app.installEventFilter(app._kb_focus_marker)
+    if getattr(app, "_plain_label_guard", None) is None:
+        # 닉네임이나 메모 제목이 HTML 처럼 생겼어도 글자 그대로 그린다.
+        from .safe_text import PlainLabelGuard
+        app._plain_label_guard = PlainLabelGuard(app)
+        app.installEventFilter(app._plain_label_guard)
     if getattr(app, "_edit_menu_filter", None) is None:
         # 입력칸의 우클릭 메뉴를 앱의 메뉴로 바꾼다(Qt 기본은 영어다).
         from .edit_menu import EditMenuFilter

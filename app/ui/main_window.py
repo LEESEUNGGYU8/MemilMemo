@@ -28,13 +28,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import config, i18n
-from ..ipc import CMD_NEW_NOTE, CMD_NEW_NOTE_HERE, CMD_SHOW
+from .. import config, html_guard, i18n
+from ..ipc import (
+    CMD_LINK_NOTE, CMD_NEW_NOTE, CMD_NEW_NOTE_HERE, CMD_SHOW, split_command,
+)
 from ..datetime_fmt import fmt_relative
 from ..local_state import FolderIconState, LocalStateStore
 from ..network.client_base import ClientBase
 from ..models import new_id
-from ..replica import ReplicaStore, list_copies
+from ..replica import ReplicaStore, copy_to_show, list_copies, read_copy
 from ..settings import (
     VIEW_COMPACT,
     VIEW_DETAILED,
@@ -63,6 +65,15 @@ from .toast import ToastManager
 # 실제 폴더 id 와 같은 dict 키 자리에 분기 없이 섞여 저장되도록 문자열 sentinel 로 둔다.
 FOLDER_ALL = "__all__"
 FOLDER_NONE = "__none__"
+
+# 목록에 무엇을 보이는가. 메모 수 단추를 누를 때마다 이 차례로 넘어간다.
+LIST_ALL, LIST_SHOWN, LIST_HIDDEN = "all", "shown", "hidden"
+LIST_MODES = (LIST_ALL, LIST_SHOWN, LIST_HIDDEN)
+
+# 파일을 여럿 골라 우클릭 메뉴를 누르면 경로가 하나씩 따로 도착한다. 이만큼
+# 기다려 모으고, 메모를 만든 뒤에도 얼마 동안은 뒤늦게 온 경로를 같은 메모에 잇는다.
+LINK_NOTE_BATCH_MS = 300
+LINK_NOTE_JOIN_SECONDS = 4.0
 
 # 새 메모가 놓이는 자리: 화면의 쓸 수 있는 영역 왼쪽 위에서 이만큼 들어온 곳.
 NEW_NOTE_ORIGIN = QPoint(120, 120)
@@ -114,6 +125,8 @@ class _ConnectionBadge(QWidget):
         self._dot.setFixedSize(8, 8)
         self._state = QLabel()
         self._detail = QLabel()
+        self._state.setTextFormat(Qt.PlainText)
+        self._detail.setTextFormat(Qt.PlainText)
         self._detail.setStyleSheet(
             f"color: {theme.COLOR_TEXT_SUBTLE}; font-size: 11px;")
         row.addWidget(self._dot, 0, Qt.AlignVCenter)
@@ -149,6 +162,11 @@ class MainWindow(QMainWindow):
     _UNDO_MS = 10_000
     # 새 메모 알림을 모으는 시간. 잇달아 만든 메모는 한 번에 알린다.
     _ANNOUNCE_MS = 900
+    # 같은 사람이 같은 메모를 잇달아 고칠 때, 마지막으로 고친 뒤 이만큼 조용해야
+    # 다시 알린다(초). 할 일 상자를 하나씩 누르는 것도 저마다 편집 한 번이라,
+    # 없으면 누를 때마다 뜬다.
+    _EDIT_NOTICE_COOLDOWN = 30.0
+    _NOTICE_TITLE_MAX = 22
 
     def __init__(self, client: ClientBase, local_state: LocalStateStore,
                  role: str, settings: AppSettings | None = None,
@@ -186,6 +204,8 @@ class MainWindow(QMainWindow):
         self._force_quit = False
         self._tray: QSystemTrayIcon | None = None
         self._search_query: str = ""
+        # 목록에 무엇을 보이는가: 전체, 바탕화면에 표시한 메모, 숨긴 메모.
+        self._list_mode = LIST_ALL
         # 복원이 일반 lock → update → release 흐름을 타야 이력 항목이 남으므로,
         # 클릭 시 여기에 내용을 담아 두고 _on_lock_granted 에서 소비한다.
         self._pending_restore: dict[str, str] = {}
@@ -198,6 +218,17 @@ class MainWindow(QMainWindow):
         self._undo_snapshots: list[dict] = []
         # 되돌리기로 다시 만드는 중인 메모(만들어지는 차례대로).
         self._recreate_queue: list[dict] = []
+        # 파일 우클릭 메뉴로 만드는 중인 메모에 넣을 경로 묶음(만들어지는 차례대로).
+        self._link_note_queue: list[list[str]] = []
+        # 한꺼번에 고른 파일들의 경로를 모으는 중인 묶음과 그때의 마우스 자리.
+        self._link_batch: list[str] = []
+        self._link_batch_at: QPoint | None = None
+        self._link_batch_timer = QTimer(self)
+        self._link_batch_timer.setSingleShot(True)
+        self._link_batch_timer.setInterval(LINK_NOTE_BATCH_MS)
+        self._link_batch_timer.timeout.connect(self._flush_link_batch)
+        # 방금 만든 링크 메모와 만든 때. 뒤늦게 온 경로를 같은 메모에 잇는다.
+        self._link_note_recent: tuple[str, float] | None = None
         # 게스트가 한 번도 붙지 못한 채 실패한 횟수.
         self._connect_failures: int = 0
         self._selection_mode: bool = False
@@ -214,6 +245,11 @@ class MainWindow(QMainWindow):
         self._announce: dict[str, int] = {}
         # 알릴 공개 전환(바꾼 사람 → 개수).
         self._announce_shared: dict[str, int] = {}
+        # 고친 사람 → 고친 메모들(메모 id → 제목). 알린 때는 따로 적어 둔다.
+        self._announce_edited: dict[str, dict[str, str]] = {}
+        self._edit_notified: dict[tuple[str, str], float] = {}
+        # 지금 편집 중인 사람의 이번 편집을 이미 다뤘는가(메모 id → 그 사람).
+        self._edit_handled: dict[str, str] = {}
         # 화면 오른쪽 아래에 잠깐 뜨는 알림. 누르면 메인 창을 연다.
         self._toasts = ToastManager(self, app_icon)
         self._toasts.clicked.connect(self._show_main_window)
@@ -366,12 +402,21 @@ class MainWindow(QMainWindow):
             "letter-spacing: -0.2px;")
         hdr.addWidget(header_lbl, 0)
 
-        self._empty_hint = QLabel("")
-        self._empty_hint.setStyleSheet(
-            "color: #4B5563; font-size: 11px; font-weight: 700; "
-            "background: rgba(17, 24, 39, 0.07); "
-            "border-radius: 9px; padding: 2px 9px;")
-        hdr.addWidget(self._empty_hint, 0)
+        # 메모 수 단추. 누를 때마다 전체 → 표시 → 숨김 차례로 목록을 바꾼다.
+        # 숨긴 메모는 목록에서 첫 줄 제목으로만 찾아야 해서 놓치기 쉽다.
+        self._count_btn = QToolButton()
+        self._count_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self._count_btn.setCursor(Qt.PointingHandCursor)
+        self._count_btn.setFocusPolicy(Qt.NoFocus)
+        self._count_btn.setStyleSheet(
+            "QToolButton { background: rgba(17, 24, 39, 0.07); border: none; "
+            "  border-radius: 9px; padding: 3px 10px; color: #111827; "
+            "  font-size: 11px; font-weight: 700; }"
+            "QToolButton:hover { background: rgba(17, 24, 39, 0.12); }"
+            "QToolButton:pressed { background: rgba(17, 24, 39, 0.18); }"
+        )
+        self._count_btn.clicked.connect(self._cycle_list_mode)
+        hdr.addWidget(self._count_btn, 0)
         hdr.addStretch(1)
 
         self._view_btn = QToolButton()
@@ -452,6 +497,7 @@ class MainWindow(QMainWindow):
         banner_row.setContentsMargins(12, 6, 8, 6)
         banner_row.setSpacing(8)
         self._replica_text = QLabel("")
+        self._replica_text.setTextFormat(Qt.PlainText)   # 공유 PC 의 닉네임
         self._replica_text.setWordWrap(True)
         banner_row.addWidget(self._replica_text, 1)
         self._copies_btn = QPushButton(i18n.t("main.replica_banner_btn"))
@@ -667,6 +713,7 @@ class MainWindow(QMainWindow):
         c.historyAppended.connect(self._on_history_appended)
         c.noteAnnounced.connect(self._on_note_announced)
         c.noteShared.connect(self._on_note_shared)
+        c.noteEdited.connect(self._on_note_edited)
         c.historyList.connect(self._on_history_list)
         c.connectionChanged.connect(self._on_connection_changed)
         c.errorOccurred.connect(self._on_error)
@@ -713,14 +760,54 @@ class MainWindow(QMainWindow):
     def handle_ipc_command(self, command: str) -> None:
         """형제 프로세스가 전달한 명령 줄을 분배한다(예: 작업 표시줄
         점프리스트에서 '새 메모' 클릭)."""
-        cmd = (command or "").strip().lower()
+        cmd, arg = split_command(command)
         if cmd == CMD_NEW_NOTE:
             self.handle_new_note_request()
         elif cmd == CMD_NEW_NOTE_HERE:
             # 바탕 화면 우클릭 메뉴에서 왔다. 마우스가 있는 자리에 띄운다.
             self.handle_new_note_request(QCursor.pos())
+        elif cmd == CMD_LINK_NOTE:
+            if arg:
+                self._queue_link_path(arg)
         elif cmd == CMD_SHOW:
             self._show_main_window()
+
+    def _queue_link_path(self, path: str) -> None:
+        """파일·폴더 우클릭 메뉴에서 온 경로. 여럿을 골랐으면 경로마다 따로
+        도착하므로 잠깐 모아 메모 하나에 담는다."""
+        now = time.monotonic()
+        recent = self._link_note_recent
+        if recent is not None and now - recent[1] <= LINK_NOTE_JOIN_SECONDS:
+            # 방금 만든 링크 메모에 뒤늦게 도착한 경로다. 같은 메모에 잇는다.
+            w = self._stickies.get(recent[0])
+            if (w is not None and self._connected
+                    and not w.is_locked_by_other()):
+                self._link_note_recent = (recent[0], now)
+                w.add_file_links([path])
+                return
+        if not self._link_batch:
+            self._link_batch_at = QCursor.pos()
+        if path not in self._link_batch:
+            self._link_batch.append(path)
+        self._link_batch_timer.start()
+
+    def _flush_link_batch(self) -> None:
+        paths, self._link_batch = self._link_batch, []
+        if paths:
+            self.handle_link_note_request(paths, self._link_batch_at)
+
+    def handle_link_note_request(self, paths: list[str],
+                                 at: QPoint | None = None) -> None:
+        """파일·폴더를 가리키는 링크가 든 새 메모를 만든다."""
+        paths = [p for p in paths if p]
+        if not paths:
+            return
+        if not self._connected:
+            self._show_main_window()
+            return
+        self._link_note_queue.append(paths)
+        self._new_note_spots.append((time.monotonic(), at))
+        self._create_note(self._settings.default_note_color)
 
     def handle_new_note_request(self, at: QPoint | None = None) -> None:
         """앱 밖(작업 표시줄 목록, 바탕 화면 우클릭 메뉴)에서 온 '새 메모'.
@@ -788,7 +875,15 @@ class MainWindow(QMainWindow):
             self._history_viewer = HistoryViewer(self)
             self._history_viewer.restoreRequested.connect(
                 self._on_restore_requested)
+            self._history_viewer.reviveRequested.connect(
+                self._on_revive_requested)
         return self._history_viewer
+
+    def _sync_history_notes(self) -> None:
+        """이력 창이 떠 있으면 메모 목록을 지금 것으로 맞춘다(방금 지워진 메모가
+        삭제된 메모 쪽으로 넘어간다)."""
+        if self._history_viewer is not None and self._history_viewer.isVisible():
+            self._history_viewer.set_notes(list(self._notes.values()))
 
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self._settings, role=self._role, parent=self)
@@ -805,7 +900,7 @@ class MainWindow(QMainWindow):
         """이 PC 에 받아 둔 사본을 열어 본다. 빠진 메모를 가져오거나, 공유 PC 를
         다시 쓸 수 없을 때 이 PC 가 공유를 이어받는다."""
         parent = QApplication.activeModalWidget() or self
-        copies = list_copies(config.default_replica_path())
+        copies = self._copy_sources()
         if not copies:
             confirm.notify(parent, i18n.t("copies.window_title"),
                            i18n.t("copies.empty"))
@@ -813,10 +908,19 @@ class MainWindow(QMainWindow):
         dlg = CopiesDialog(
             copies,
             host_notes=dict(self._notes) if self._connected else None,
-            can_takeover=(self._role == "guest"), parent=parent)
+            can_takeover=(self._role == "guest"),
+            nickname=self._client.nickname(), parent=parent)
         dlg.importRequested.connect(self._import_from_copy)
         dlg.takeoverRequested.connect(self.takeoverRequested.emit)
         dlg.exec()
+
+    def _copy_sources(self) -> list:
+        """사본 창에 보여 줄 것들. 참여 중인 PC 에서는 이 PC 가 공유 PC 였을 때의
+        메모 파일도 넣는다(공유 PC 로 쓰는 동안에는 그 파일이 곧 지금 메모다)."""
+        return list_copies(
+            config.default_replica_path(),
+            host_db=config.default_db_path() if self._role == "guest" else None,
+            nickname=self._client.nickname())
 
     def _import_from_copy(self, notes: list, folders: list) -> None:
         """사본에만 있는 메모를 새 메모로 만든다. 있는 메모는 건드리지 않는다.
@@ -905,7 +1009,7 @@ class MainWindow(QMainWindow):
         for w in self._stickies.values():
             w.set_offline(not connected)
         self._refresh_status_text()
-        self._refresh_empty_hint()
+        self._refresh_count()
         self._refresh_sessions_dialog()
         self._refresh_replica_banner()
 
@@ -1003,6 +1107,7 @@ class MainWindow(QMainWindow):
         self._cards.clear()
         self._notes.clear()
         self._locks = locks
+        self._edit_handled.clear()
         sorted_notes = sorted(
             notes,
             key=lambda n: n.get("updated_at", 0),
@@ -1024,14 +1129,22 @@ class MainWindow(QMainWindow):
 
         호스트가 꺼져 있어도 메모를 볼 수 있다. 붙으면 호스트가 보낸 것으로
         바뀐다. 다른 닉네임으로 받은 사본은 보여 주지 않는다(그 사람의 '나만
-        보기' 메모가 들어 있다)."""
+        보기' 메모가 들어 있다). 공유 PC 를 바꾼 직후에는 지금 사본이 다른 공유
+        PC 의 것이므로, 붙으려는 주소에서 받아 둔 사본을 찾아 보여 준다."""
         if self._replica is None or self._role != "guest":
             return
+        ls = self._local.state
         try:
-            meta = self._replica.meta()
-            if meta.get("nickname") != self._client.nickname():
+            path = copy_to_show(self._replica.path,
+                                f"{ls.last_host_ip}:{ls.last_host_port}",
+                                self._client.nickname())
+            if path is None:
                 return
-            notes, folders = self._replica.load()
+            if path == self._replica.path:
+                meta = self._replica.meta()
+                notes, folders = self._replica.load()
+            else:
+                notes, folders, meta = read_copy(path)
         except Exception:
             return
         if not notes:
@@ -1107,17 +1220,26 @@ class MainWindow(QMainWindow):
                 self._take_new_note_spot())
             st.x, st.y = pos.x(), pos.y()
         self._local.save()
+        # 남이 만든 메모는 숨김으로 들어온다. '숨김 N' 의 수를 맞춘다.
+        self._apply_search_filter()
         if is_creator:
             # 아이콘으로 접어 둔 폴더에 새 메모를 만들면 보이지 않는다. 폴더를 연다.
             self._open_folder_of(note["id"], animate=False)
         self._ensure_sticky(note)
+        self._sync_history_notes()
         if restoring is not None:
             self._recovery_notes.add(note["id"])   # '보냈습니다' 안내는 띄우지 않는다
             self._refresh_folder_icons()
             self._invalidate_tray_menu()
+            if restoring.get("front"):
+                # 이력 창에서 되살린 메모는 어디에 생겼는지 보여야 한다.
+                w = self._stickies.get(note["id"])
+                if w is not None:
+                    w.bring_to_front()
             return
         if is_creator:
             recovered = bool(self._orphan_texts)
+            links = None
             if recovered:
                 # 끊긴 동안 쓴 글을 담으려고 만든 메모다. 그 글을 넣는다.
                 self._pending_resend[note["id"]] = self._orphan_texts.pop(0)
@@ -1125,15 +1247,22 @@ class MainWindow(QMainWindow):
                 self._client.acquire_lock(note["id"])
                 self._status.showMessage(
                     i18n.t("main.status_unsent_new_note"), 10000)
+            elif self._link_note_queue:
+                links = self._link_note_queue.pop(0)
             # 메모는 평소 바탕 화면 쪽에 깔린다. 방금 만든 메모는 다른 창을 쓰던
             # 중이어도 보여야 하고 바로 쓸 수 있어야 하므로 앞으로 올린다.
             w = self._stickies.get(note["id"])
             if w is not None:
-                w.bring_to_front(start_editing=not recovered)
+                w.bring_to_front(start_editing=not recovered and not links)
+                if links:
+                    # 파일 우클릭 메뉴로 만든 메모: 그 파일의 링크를 넣는다.
+                    self._link_note_recent = (note["id"], time.monotonic())
+                    w.add_file_links(links)
         self._refresh_folder_icons()
         self._invalidate_tray_menu()
 
     def _on_note_updated(self, note: dict) -> None:
+        self._notice_live_edit(self._notes.get(note["id"]), note)
         self._notes[note["id"]] = note
         c = self._cards.get(note["id"])
         if c is not None:
@@ -1165,6 +1294,7 @@ class MainWindow(QMainWindow):
             self._undo_timer.start()
             self._status.showMessage(self._delete_message, self._UNDO_MS)
         self._notes.pop(note_id, None)
+        self._edit_handled.pop(note_id, None)
         if note_id in self._selected_notes:
             self._selected_notes.discard(note_id)
             self._refresh_bulk_bar()
@@ -1184,6 +1314,7 @@ class MainWindow(QMainWindow):
         self._apply_search_filter()
         self._refresh_folder_icons()
         self._invalidate_tray_menu()
+        self._sync_history_notes()
 
     def _on_folder_created(self, folder: dict) -> None:
         if not folder.get("id"):
@@ -1463,14 +1594,39 @@ class MainWindow(QMainWindow):
         self._pending_restore[note_id] = content
         self._client.acquire_lock(note_id)
 
+    def _on_revive_requested(self, content: str, color: str) -> None:
+        """삭제된 메모를 그 시점의 본문으로 새 메모에 되살린다.
+
+        삭제된 메모가 나만 보던 것이었는지는 이력에 남지 않는다. 남에게 보이면
+        안 되는 글일 수 있으므로 나만 보는 메모로 만든다(공개는 사용자가 바꾼다)."""
+        if not self._require_online():
+            return
+        if color not in config.COLORS:
+            color = self._settings.default_note_color or config.DEFAULT_COLOR
+        width, height = config.DEFAULT_NOTE_WIDTH, config.DEFAULT_NOTE_HEIGHT
+        pos = self._new_note_position(width, height, None)
+        self._recreate_queue.append({
+            "content": html_guard.clean(content or ""), "color": color,
+            "width": width, "height": height, "folder_id": None,
+            "private": True, "pos": (pos.x(), pos.y()), "hidden": False,
+            "front": True,
+        })
+        self._client.create_note(
+            color, width, height, folder_id=None,
+            private_owner=self._client.nickname(), quiet=True)
+        self._status.showMessage(i18n.t("main.status_revived"), 6000)
+
     def _on_lock_held(self, note_id: str, holder: str) -> None:
         self._locks[note_id] = holder
+        if self._edit_handled.get(note_id) != holder:
+            self._edit_handled.pop(note_id, None)
         w = self._stickies.get(note_id)
         if w is not None:
             w.set_lock_holder(holder)
 
     def _on_lock_released(self, note_id: str) -> None:
         self._locks.pop(note_id, None)
+        self._edit_handled.pop(note_id, None)
         w = self._stickies.get(note_id)
         if w is not None:
             w.set_lock_holder(None)
@@ -1525,9 +1681,78 @@ class MainWindow(QMainWindow):
         self._announce_shared[who] = self._announce_shared.get(who, 0) + 1
         self._announce_timer.start()
 
+    def _on_note_edited(self, entry: dict) -> None:
+        """다른 사람이 메모를 고치고 편집을 마쳤다.
+
+        호스트는 편집이 끝나 잠금을 풀 때, 내용이나 색이 달라졌으면 이력 항목을
+        한 번 보낸다. 편집 중에 저장된 글로 이미 알렸으면 다시 알리지 않는다."""
+        self._announce_edit(
+            str(entry.get("user") or ""), str(entry.get("note_id") or ""),
+            str(entry.get("content_before") or ""),
+            str(entry.get("content_after") or ""))
+
+    def _notice_live_edit(self, old: dict | None, new: dict) -> None:
+        """다른 사람이 편집 중에 저장한 글을 받았다.
+
+        편집이 끝날 때 오는 이력 항목만 기다리면, 쓰던 사람이 메모에 커서를 둔
+        동안에는 글이 바뀌어도 알림이 없다. 폴더, 공개 범위, 크기만 바뀐 것은
+        내용이 같으므로 여기서 알리지 않는다."""
+        if old is None:
+            return
+        before = str(old.get("content") or "")
+        after = str(new.get("content") or "")
+        if before != after:
+            self._announce_edit(str(new.get("updated_by") or ""),
+                                str(new.get("id") or ""), before, after)
+
+    def _announce_edit(self, who: str, note_id: str, before: str,
+                       after: str) -> None:
+        """다른 사람의 수정을 알린다. 편집 한 번에 한 번이고, 글자마다 알리지 않는다.
+
+        빈 메모에 처음 글을 채운 것은 알리지 않는다. 새 메모는 만들 때 이미
+        알렸고, 지웠다 되돌린 메모와 사본에서 가져온 메모도 이 길로 채워진다."""
+        if (not who or not note_id or who == self._client.nickname()
+                or not self._settings.notify_note_edit):
+            return
+        now = time.monotonic()
+        key = (who, note_id)
+        last = self._edit_notified.get(key)
+        if len(self._edit_notified) > 200:
+            self._edit_notified = {
+                k: t for k, t in self._edit_notified.items()
+                if now - t < self._EDIT_NOTICE_COOLDOWN}
+        # 잇달아 고치는 동안에는 조용한 시간이 이어진다.
+        self._edit_notified[key] = now
+        if self._locks.get(note_id) == who:
+            # 그 사람이 지금 편집 중이다. 이번 편집은 한 번만 다룬다.
+            if self._edit_handled.get(note_id) == who:
+                return
+            self._edit_handled[note_id] = who
+        if not before.strip():
+            return
+        if last is not None and now - last < self._EDIT_NOTICE_COOLDOWN:
+            return
+        title = (html_to_plain(after).strip().splitlines() or [""])[0].strip()
+        if len(title) > self._NOTICE_TITLE_MAX:
+            title = title[:self._NOTICE_TITLE_MAX].rstrip() + "…"
+        self._announce_edited.setdefault(who, {})[note_id] = title
+        self._announce_timer.start()
+
     def _flush_announcements(self) -> None:
         created, self._announce = self._announce, {}
         shared, self._announce_shared = self._announce_shared, {}
+        edited, self._announce_edited = self._announce_edited, {}
+        for who, notes in edited.items():
+            titles = list(notes.values())
+            if len(titles) > 1:
+                text = i18n.t("main.notify_edited_notes", name=who,
+                              count=len(titles))
+            elif titles[0]:
+                text = i18n.t("main.notify_edited_titled", name=who,
+                              title=titles[0])
+            else:
+                text = i18n.t("main.notify_edited_note", name=who)
+            self._show_notification(text)
         for who, count in created.items():
             self._show_notification(
                 i18n.t("main.notify_new_note", name=who) if count == 1
@@ -2005,39 +2230,66 @@ class MainWindow(QMainWindow):
             self._empty_action.setText(new_note)
         self._empty_body.setVisible(bool(self._empty_body.text()))
 
-    def _refresh_empty_hint(self) -> None:
+    def _refresh_count(self) -> None:
+        """메모 수 단추의 글과, 목록이 비었을 때의 안내를 맞춘다."""
         total = len(self._notes)
         # isVisible() 은 창이 아직 뜨지 않았으면 늘 False 다. 숨겼는지를 본다.
         visible = sum(1 for c in self._cards.values() if not c.isHidden())
         self._refresh_empty_panel(total, visible)
-        self._empty_hint.setVisible(bool(total))
-        if not total:
-            return
-        # "7 / 7개" 같은 잡음을 피하려고 일부가 가려진 경우에만 분수로 표시한다.
-        if visible == total:
-            self._empty_hint.setText(i18n.t("main.hint_count_total", total=total))
-        else:
-            self._empty_hint.setText(
-                i18n.t("main.hint_count_partial", visible=visible, total=total))
+        self._count_btn.setVisible(bool(total))
+        # 수는 지금 목록에 보이는 메모 수다(폴더와 검색어에 맞는 것 가운데).
+        self._count_btn.setText({
+            LIST_ALL: i18n.t("main.count_all", count=visible),
+            LIST_SHOWN: i18n.t("main.count_shown", count=visible),
+            LIST_HIDDEN: i18n.t("main.count_hidden", count=visible),
+        }[self._list_mode])
+
+    def _hidden_note_ids(self) -> set[str]:
+        """지금 보는 폴더에서 바탕화면에 숨겨 둔 메모."""
+        notes = self._local.state.notes
+        return {nid for nid, note in self._notes.items()
+                if self._note_in_current_folder(note)
+                and nid in notes and notes[nid].hidden}
+
+    def _list_mode_counts(self, hidden_ids: set[str]) -> dict[str, int]:
+        """지금 보는 폴더의 메모 수: 전체, 바탕화면에 표시한 것, 숨긴 것."""
+        total = sum(1 for note in self._notes.values()
+                    if self._note_in_current_folder(note))
+        return {LIST_ALL: total, LIST_SHOWN: total - len(hidden_ids),
+                LIST_HIDDEN: len(hidden_ids)}
+
+    def _cycle_list_mode(self) -> None:
+        """전체 → 표시 → 숨김 차례로 넘긴다. 메모가 없는 쪽은 건너뛴다."""
+        counts = self._list_mode_counts(self._hidden_note_ids())
+        at = LIST_MODES.index(self._list_mode)
+        for step in range(1, len(LIST_MODES) + 1):
+            mode = LIST_MODES[(at + step) % len(LIST_MODES)]
+            if mode == LIST_ALL or counts[mode]:
+                break
+        self._list_mode = mode
+        self._apply_search_filter()
 
     def _apply_search_filter(self, text: str | None = None) -> None:
-        """폴더 선택과 검색어를 AND 로 결합해 카드 가시성을 정한다."""
+        """폴더 선택, 표시·숨김 고르기, 검색어를 AND 로 결합해 카드 가시성을 정한다."""
         if text is None:
             text = self._search_input.text()
         query = (text or "").strip().lower()
         self._search_query = query
+        hidden_ids = self._hidden_note_ids()
+        if not self._list_mode_counts(hidden_ids)[self._list_mode]:
+            # 고른 쪽에 메모가 없는 폴더다. 빈 목록으로 두지 않고 전체로 돌아간다.
+            self._list_mode = LIST_ALL
         for note_id, card in self._cards.items():
             note = self._notes.get(note_id, {})
-            in_folder = self._note_in_current_folder(note)
-            if not in_folder:
-                card.setVisible(False)
-                continue
-            if not query:
-                card.setVisible(True)
-                continue
-            plain = html_to_plain(note.get("content") or "").lower()
-            card.setVisible(query in plain)
-        self._refresh_empty_hint()
+            matches = self._note_in_current_folder(note) and (
+                not query
+                or query in html_to_plain(note.get("content") or "").lower())
+            if self._list_mode == LIST_SHOWN:
+                matches = matches and note_id not in hidden_ids
+            elif self._list_mode == LIST_HIDDEN:
+                matches = matches and note_id in hidden_ids
+            card.setVisible(matches)
+        self._refresh_count()
 
     def _ensure_sticky(self, note: dict) -> None:
         note_id = note["id"]
@@ -2073,8 +2325,9 @@ class MainWindow(QMainWindow):
             # 서버 기본 크기보다 우선한다.
             w.apply_local_state(st.x, st.y, st.w, st.h, folded=st.folded,
                                 dock=st.dock, dock_y=st.dock_y,
-                                fold_style=st.fold_style)
-        elif not w.is_folded() and not w.dock_side():
+                                fold_style=st.fold_style, fold_x=st.fold_x,
+                                fold_y=st.fold_y, fold_at=st.fold_at)
+        elif not w.is_folded():
             w.move(st.x, st.y)
             if st.w and st.h:
                 w.resize(st.w, st.h)
@@ -2100,11 +2353,8 @@ class MainWindow(QMainWindow):
         self._local.state.set_note_state(note_id, w=w, h=h)
         self._local.save()
 
-    def _on_fold_changed(self, note_id: str, folded: bool, dock: str,
-                         dock_y: int, fold_style: str = "") -> None:
-        self._local.state.set_note_state(
-            note_id, folded=folded, dock=dock, dock_y=dock_y,
-            fold_style=fold_style)
+    def _on_fold_changed(self, note_id: str, state: dict) -> None:
+        self._local.state.set_note_state(note_id, **state)
         self._local.save()
 
     def _resolve_icon_pos(self, owner_key: str, pos, screen_rect):
@@ -2264,13 +2514,14 @@ class MainWindow(QMainWindow):
 
     def _resolve_dock_slot(self, note_id: str, side: str, y: int,
                            height: int, screen_rect) -> int:
-        """같은 화면 같은 가장자리에 이미 붙어 있는 탭을 피해 자리를 잡는다."""
+        """같은 화면 같은 벽에 이미 붙어 있는 탭을 피해 자리를 잡는다. ``y`` 와
+        ``height`` 는 벽을 따라 잰 자리와 길이다."""
         spans = [
             w.dock_span() for nid, w in self._stickies.items()
             if nid != note_id and w.isVisible() and w.dock_side() == side
             and w.dock_screen_rect() == screen_rect
         ]
-        return free_dock_slot(y, height, screen_rect, spans)
+        return free_dock_slot(y, height, screen_rect, spans, side)
 
     def _set_note_visibility(self, note_id: str, visible: bool) -> None:
         self._local.state.set_note_state(note_id, hidden=not visible)
@@ -2289,14 +2540,14 @@ class MainWindow(QMainWindow):
         card = self._cards.get(note_id)
         if card is not None:
             card.set_visible(visible)
+        # '숨김 N' 의 수와, 숨긴 메모만 보는 중이면 목록도 다시 맞춘다.
+        self._apply_search_filter()
         self._refresh_folder_icons()
 
     def _open_history_for(self, note_id: str) -> None:
         self._ensure_history_viewer()
         self._history_viewer.set_notes(list(self._notes.values()))
-        idx = self._history_viewer._note_combo.findData(note_id)
-        if idx >= 0:
-            self._history_viewer._note_combo.setCurrentIndex(idx)
+        self._history_viewer.select_note(note_id)
         self._history_viewer.show()
         self._history_viewer.raise_()
         self._client.get_history(None)
@@ -2443,13 +2694,29 @@ class MainWindow(QMainWindow):
         confirm.notify(self, i18n.t("main.msg_reset_connection_title"),
                        i18n.t("main.msg_reset_connection_body"))
 
-    def _quit_app(self) -> None:
+    def notify(self, text: str) -> None:
+        """화면 오른쪽 아래에 잠깐 알린다(창 밖의 코드가 쓴다)."""
+        self._show_notification(text)
+
+    def is_editing(self) -> bool:
+        """지금 편집 중인 메모가 있는가."""
+        return any(w._edit_mode for w in self._stickies.values())
+
+    def prepare_quit(self) -> None:
+        """프로그램이 끝나기 전에 창들이 해 둘 일. 여러 번 불러도 된다.
+
+        Qt 는 종료 요청을 받으면 보이는 창을 하나씩 닫아 본다. 메모 창은 닫기를
+        '숨기기'로 받으므로, 이 채비 없이 종료가 시작되면 메모 하나가 숨김으로
+        바뀌고 종료는 취소된다."""
         self._force_quit = True
         self._flush_pending_edits()
         self._teardown_stickies()
         self._toasts.close_all()
         if self._tray is not None:
             self._tray.hide()
+
+    def _quit_app(self) -> None:
+        self.prepare_quit()
         self._client.stop()
         QApplication.quit()
 

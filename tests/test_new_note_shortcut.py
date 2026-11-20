@@ -36,6 +36,8 @@ class FakeClient(ClientBase):
         super().__init__(nickname)
         self.created: list[dict] = []
         self.lock_requests: list[str] = []
+        self.released: list[str] = []
+        self.updated: list[tuple[str, str]] = []
         self.deliver = True
 
     def create_note(self, color, width, height, folder_id=None,
@@ -52,6 +54,13 @@ class FakeClient(ClientBase):
 
     def acquire_lock(self, note_id: str) -> None:
         self.lock_requests.append(note_id)
+
+    def release_lock(self, note_id: str) -> None:
+        self.released.append(note_id)
+
+    def update_note(self, note_id, content, color, width, height,
+                    expected_version) -> None:
+        self.updated.append((note_id, content))
 
 
 @pytest.fixture(scope="module")
@@ -309,8 +318,13 @@ def test_key(monkeypatch):
 
     root = rf"Software\SyncNotesTests\pytest-{os.getpid()}"
     monkeypatch.setattr(shell_menu, "KEY_PATH", root + r"\NewNote")
+    # 파일과 폴더 항목도 시험용 자리로 돌린다(실제 우클릭 메뉴를 건드리지 않는다).
+    links = (root + r"\LinkFile", root + r"\LinkFolder")
+    monkeypatch.setattr(shell_menu, "LINK_KEY_PATHS", links)
     yield root + r"\NewNote"
-    for path in (root + r"\NewNote\command", root + r"\NewNote", root,
+    for path in (root + r"\NewNote\command", root + r"\NewNote",
+                 links[0] + r"\command", links[0],
+                 links[1] + r"\command", links[1], root,
                  r"Software\SyncNotesTests"):
         try:
             winreg.DeleteKey(winreg.HKEY_CURRENT_USER, path)
@@ -376,10 +390,12 @@ def test_settings_dialog_toggles_the_menu(qapp, test_key, monkeypatch):
 
     # 저장은 자동 실행 값도 쓴다. 실제 값은 건드리지 않게 막는다.
     monkeypatch.setattr(settings_dialog, "set_windows_autostart", lambda v: True)
-    calls: list[tuple[bool, str]] = []
+    calls: list[tuple] = []
     real = shell_menu.set_registered
-    monkeypatch.setattr(shell_menu, "set_registered",
-                        lambda on, label: calls.append((on, label)) or real(on, label))
+    monkeypatch.setattr(
+        shell_menu, "set_registered",
+        lambda on, label, link="": calls.append((on, label, link))
+        or real(on, label, link))
 
     dlg = SettingsDialog(AppSettings(), role="host")
     assert not dlg._desktop_menu.isChecked()
@@ -389,11 +405,171 @@ def test_settings_dialog_toggles_the_menu(qapp, test_key, monkeypatch):
     dlg = SettingsDialog(AppSettings(), role="host")
     dlg._desktop_menu.setChecked(True)
     dlg._on_accept()
-    assert calls == [(True, "새 메모")]
+    assert calls == [(True, "새 메모", "새 메모에 링크로 넣기")]
     assert shell_menu.is_registered()
+    # 켜면 파일과 폴더의 항목도 함께 들어간다.
+    for path in shell_menu.LINK_KEY_PATHS:
+        assert shell_menu._read_entry(path)[0] == "새 메모에 링크로 넣기"
 
     dlg = SettingsDialog(AppSettings(), role="host")
     assert dlg._desktop_menu.isChecked()        # 상태는 레지스트리에서 읽는다
     dlg._desktop_menu.setChecked(False)
     dlg._on_accept()
     assert not shell_menu.is_registered()
+    for path in shell_menu.LINK_KEY_PATHS:
+        assert shell_menu._read_entry(path) == ("", "", "")
+
+
+# ── 파일·폴더 우클릭 메뉴: 새 메모에 링크로 넣기 ─────────────────────────
+
+def test_link_note_paths_from_argv():
+    assert ipc.link_note_paths(["app.exe"]) == []
+    assert ipc.link_note_paths(["app.exe", "--new-note"]) == []
+    path = r"C:\Work\견적 회신.xlsx"
+    assert ipc.link_note_paths(["app.exe", "--link-note", path]) == [path]
+    assert ipc.link_note_paths(["app.exe", "--link-note"]) == []
+    command = ipc.link_note_command([path, r"D:\Docs"])
+    assert command.splitlines() == [f"link-note {path}", r"link-note D:\Docs"]
+    # 경로의 대소문자와 빈칸은 그대로 온다. 명령 이름만 소문자로 본다.
+    assert ipc.split_command(f"LINK-NOTE {path}") == ("link-note", path)
+    assert ipc.split_command("new-note-here") == ("new-note-here", "")
+    assert ipc.split_command("") == ("", "")
+
+
+def test_register_adds_file_and_folder_entries(test_key):
+    assert shell_menu.register("새 메모", "새 메모에 링크로 넣기")
+    for path in shell_menu.LINK_KEY_PATHS:
+        label, icon, command = shell_menu._read_entry(path)
+        assert label == "새 메모에 링크로 넣기"
+        assert icon == shell_menu.icon_location()
+        assert command == shell_menu.link_command_line()
+        assert command.endswith('--link-note "%1"')
+    assert shell_menu.unregister()
+    for path in shell_menu.LINK_KEY_PATHS:
+        assert shell_menu._read_entry(path) == ("", "", "")
+    assert not shell_menu.is_registered()
+
+
+def test_refresh_adds_link_entries_for_an_older_install(test_key, monkeypatch):
+    # 옛 버전은 바탕화면 항목만 넣었다. 올라온 뒤 처음 켤 때 나머지가 생긴다.
+    shell_menu.register("새 메모")
+    assert shell_menu._read_entry(shell_menu.LINK_KEY_PATHS[0]) == ("", "", "")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", r"C:\Apps\Memo\Memo.exe")
+    monkeypatch.setattr(config, "isolated_run", lambda: False)
+    shell_menu.refresh("새 메모", "새 메모에 링크로 넣기")
+    for path in shell_menu.LINK_KEY_PATHS:
+        assert shell_menu._read_entry(path) == (
+            "새 메모에 링크로 넣기", r"C:\Apps\Memo\Memo.exe,0",
+            r'"C:\Apps\Memo\Memo.exe" --link-note "%1"')
+
+
+def test_refresh_leaves_link_entries_alone_when_the_menu_is_off(test_key, monkeypatch):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(config, "isolated_run", lambda: False)
+    shell_menu.refresh("새 메모", "새 메모에 링크로 넣기")
+    for path in shell_menu.LINK_KEY_PATHS:
+        assert shell_menu._read_entry(path) == ("", "", "")
+
+
+def test_only_one_process_boots_for_file_links(qapp, monkeypatch):
+    if sys.platform != "win32":
+        pytest.skip("Windows 에서만 프로세스가 여러 개 뜬다")
+    import ctypes
+
+    name = f"SyncNotesTests-Boot-{os.getpid()}-{time.monotonic_ns()}"
+    monkeypatch.setattr(ipc, "ipc_name", lambda: name)
+    monkeypatch.setattr(ipc, "_boot_mutex", None)
+    assert ipc.claim_boot() is True
+    assert ipc.claim_boot() is True            # 같은 프로세스는 몇 번을 물어도 같다
+    code = ("import sys; sys.path.insert(0, sys.argv[1]);"
+            "from app import ipc; ipc.ipc_name = lambda: sys.argv[2];"
+            "print(ipc.claim_boot())")
+    env = dict(os.environ)
+    real = env.get("SYNCNOTES_TEST_REAL_APPDATA")
+    if real:
+        env["APPDATA"] = real
+    root = str(Path(__file__).resolve().parent.parent)
+    proc = subprocess.Popen([sys.executable, "-c", code, root, name],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=env)
+    try:
+        # 먼저 나선 프로세스가 있으면 다른 프로세스는 앱을 켜지 않는다.
+        assert _wait_exit(qapp, proc) == "False"
+    finally:
+        ctypes.WinDLL("kernel32").CloseHandle(ctypes.c_void_p(ipc._boot_mutex))
+
+
+def test_file_link_request_makes_a_note_holding_the_link(window, qapp, monkeypatch):
+    path = r"C:\Work\견적 회신.xlsx"
+    spot = _avail().topLeft() + QPoint(300, 220)
+    monkeypatch.setattr(QCursor, "pos", staticmethod(lambda: spot))
+    window.handle_ipc_command(f"link-note {path}")
+    # 여럿을 골랐을 수 있어 잠깐 모은다. 그동안에는 아직 만들지 않는다.
+    assert window._client.created == [] and window._link_batch_timer.isActive()
+    window._link_batch_timer.stop()
+    window._flush_link_batch()
+
+    assert len(window._client.created) == 1
+    sticky = window._stickies["n1"]
+    assert sticky.isVisible() and not window.isVisible()
+    assert sticky.pos() == spot - mw.NEW_NOTE_CURSOR_INSET
+    # 빈 메모로 편집을 시작하지 않고, 잠금을 받아 링크를 넣는다.
+    assert window.fronted == [("n1", False)]
+    assert window._client.lock_requests == ["n1"]
+    assert window._client.updated == []
+
+    window._client.lockGranted.emit("n1")
+    # 앞에 서지 못한 창(시험 화면)은 넣은 것만 보내고 편집을 끝낸다.
+    assert [nid for nid, _html in window._client.updated] == ["n1"]
+    html = window._client.updated[0][1]
+    assert "견적 회신.xlsx" in html and "file:" in html
+    assert window._client.released == ["n1"]
+    assert not sticky._edit_mode and sticky._text.has_links()
+
+
+def test_several_files_go_into_one_note(window, qapp, monkeypatch):
+    monkeypatch.setattr(QCursor, "pos", staticmethod(lambda: QPoint(200, 200)))
+    paths = [r"C:\Work\a.pdf", r"C:\Work\b.docx", r"C:\Work\자료"]
+    for p in paths:
+        window.handle_ipc_command(f"link-note {p}")
+    window.handle_ipc_command(f"link-note {paths[0]}")      # 같은 경로는 한 번만
+    window._link_batch_timer.stop()
+    window._flush_link_batch()
+    assert len(window._client.created) == 1
+    window._client.lockGranted.emit("n1")
+    html = window._client.updated[-1][1]
+    assert all(name in html for name in ("a.pdf", "b.docx", "자료"))
+    assert html.count("a.pdf") >= 1
+    plain = window._stickies["n1"]._text.toPlainText()
+    assert len([ln for ln in plain.splitlines() if ln.strip()]) == 3   # 한 줄에 하나
+
+    # 조금 늦게 도착한 경로는 새 메모를 만들지 않고 같은 메모에 잇는다.
+    window._client.lockReleased.emit("n1")
+    window.handle_ipc_command(r"link-note C:\Work\late.txt")
+    assert not window._link_batch_timer.isActive()
+    assert len(window._client.created) == 1
+    assert window._client.lock_requests == ["n1", "n1"]
+    window._client.lockGranted.emit("n1")
+    assert "late.txt" in window._client.updated[-1][1]
+
+
+def test_late_path_makes_its_own_note_after_a_while(window, monkeypatch):
+    monkeypatch.setattr(QCursor, "pos", staticmethod(lambda: QPoint(200, 200)))
+    window.handle_link_note_request([r"C:\Work\a.pdf"], QPoint(200, 200))
+    assert len(window._client.created) == 1
+    note_id, made_at = window._link_note_recent
+    window._link_note_recent = (note_id, made_at - mw.LINK_NOTE_JOIN_SECONDS - 1)
+    window.handle_ipc_command(r"link-note C:\Work\b.pdf")
+    assert window._link_batch == [r"C:\Work\b.pdf"]
+    window._link_batch_timer.stop()
+    window._flush_link_batch()
+    assert len(window._client.created) == 2
+
+
+def test_file_link_request_while_disconnected_shows_main_window(window, qapp):
+    window._client.connectionChanged.emit(False)
+    window.handle_link_note_request([r"C:\Work\a.pdf"])
+    qapp.processEvents()
+    assert window._client.created == [] and window.isVisible()
+    assert window._link_note_queue == []

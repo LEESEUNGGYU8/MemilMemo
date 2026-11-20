@@ -48,11 +48,27 @@ CREATE TABLE IF NOT EXISTS meta (
 
 # 옮겨 둔 옛 사본을 몇 벌까지 남길지.
 KEEP_ARCHIVES = 5
+# 옮겨 둔 지 이만큼 지나지 않은 사본은 개수가 넘쳐도 지우지 않는다. 공유 PC 인
+# 척하는 상대가 서로 다른 메모 묶음을 잇달아 보내 진짜 사본을 밀어내지 못하게 한다.
+ARCHIVE_MIN_AGE_DAYS = 30
 _STAMP = "%Y%m%d_%H%M%S"
 
 
 def _stamp(note: dict[str, Any]) -> tuple[int, int]:
     return int(note.get("version") or 0), int(note.get("updated_at") or 0)
+
+
+def _older_than(archive: Path, now: datetime, days: int) -> bool:
+    """옮겨 둔 사본이 ``days`` 일보다 오래됐는가. 이름에 적힌 때로 본다
+    (읽지 못하면 오래되지 않은 것으로 보고 남긴다)."""
+    m = re.search(r"\.archive-(\d{8}_\d{6})", archive.name)
+    if not m:
+        return False
+    try:
+        moved = datetime.strptime(m.group(1), _STAMP)
+    except ValueError:
+        return False
+    return (now - moved).total_seconds() > days * 86400
 
 
 def archive_paths(replica_path: Path) -> list[Path]:
@@ -84,6 +100,8 @@ class CopyInfo:
     nickname: str
     host_id: str
     note_count: int
+    # "copy": 공유 PC 에서 받아 둔 사본. "host": 이 PC 가 공유 PC 였을 때의 메모 파일.
+    kind: str = "copy"
 
 
 def read_copy(path: Path | str) -> tuple[list[dict[str, Any]], list[dict[str, Any]],
@@ -113,8 +131,76 @@ def read_copy(path: Path | str) -> tuple[list[dict[str, Any]], list[dict[str, An
         conn.close()
 
 
-def list_copies(replica_path: Path | str) -> list[CopyInfo]:
+def copy_meta(path: Path | str) -> dict[str, str]:
+    """사본 파일에 딸린 정보만 읽는다(메모는 읽지 않는다). 읽지 못하면 빈 dict."""
+    path = Path(path)
+    if not path.is_file():
+        return {}
+    try:
+        conn = sqlite3.connect(str(path))
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            return {str(k): str(v)
+                    for k, v in conn.execute("SELECT key, value FROM meta")}
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {}
+
+
+def read_host_database(path: Path | str, nickname: str
+                       ) -> tuple[list[dict[str, Any]], list[dict[str, Any]],
+                                  dict[str, str]]:
+    """이 PC 가 공유 PC 였을 때의 메모 파일을 읽기만 한다: (메모들, 폴더들, 딸린 정보).
+
+    그 파일에는 모든 사람의 '나만 보기' 메모가 들어 있다. 공개 메모와
+    ``nickname`` 의 것만 돌려준다(남의 비공개 폴더 안의 메모도 뺀다). 지운
+    메모와 폴더는 넣지 않는다."""
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(str(path))
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        conn.row_factory = sqlite3.Row
+
+        def mine(owner) -> bool:
+            return not owner or owner == nickname
+
+        folders = [dict(r) for r in conn.execute(
+            "SELECT * FROM folders WHERE deleted = 0")]
+        hidden = {f["id"] for f in folders if not mine(f.get("private_owner"))}
+        folders = [f for f in folders if f["id"] not in hidden]
+        notes = [dict(r) for r in conn.execute(
+            "SELECT * FROM notes WHERE deleted = 0")]
+        notes = [n for n in notes if mine(n.get("private_owner"))
+                 and n.get("folder_id") not in hidden]
+        meta = {str(k): str(v) for k, v in conn.execute("SELECT key, value FROM meta")}
+    finally:
+        conn.close()
+    try:
+        meta["synced_at"] = str(int(path.stat().st_mtime * 1000))
+    except OSError:
+        pass
+    meta["nickname"] = nickname
+    return notes, folders, meta
+
+
+def read_source(info: CopyInfo, nickname: str = ""
+                ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, str]]:
+    """목록의 한 줄(``list_copies`` 가 돌려준 것)을 읽는다."""
+    if info.kind == "host":
+        return read_host_database(info.path, nickname)
+    return read_copy(info.path)
+
+
+def list_copies(replica_path: Path | str, host_db: Path | str | None = None,
+                nickname: str = "") -> list[CopyInfo]:
     """이 PC 에 있는 사본들. 지금 사본이 먼저, 옮겨 둔 것은 새것부터.
+
+    ``host_db`` 를 주면 이 PC 가 공유 PC 였을 때의 메모 파일도 끝에 넣는다
+    (참여 중인 PC 에서만 준다. 사본으로 공유를 이어받았다가 원래 공유 PC 로
+    돌아오면 그동안 쓴 메모가 거기에만 있다).
 
     메모가 하나도 없거나 읽지 못하는 파일은 넣지 않는다."""
     replica_path = Path(replica_path)
@@ -136,7 +222,39 @@ def list_copies(replica_path: Path | str) -> list[CopyInfo]:
                             nickname=meta.get("nickname", ""),
                             host_id=meta.get("host_id", ""),
                             note_count=len(notes)))
+    if host_db is not None:
+        try:
+            notes, _folders, meta = read_host_database(host_db, nickname)
+        except (OSError, sqlite3.Error):
+            notes = []
+        if notes:
+            out.append(CopyInfo(path=Path(host_db), current=False,
+                                synced_at=int(meta.get("synced_at") or 0),
+                                host="", nickname=nickname,
+                                host_id=meta.get("host_id", ""),
+                                note_count=len(notes), kind="host"))
     return out
+
+
+def copy_to_show(replica_path: Path | str, address: str, nickname: str
+                 ) -> Path | None:
+    """공유 PC 에 붙기 전에 보여 줄 사본 파일. 없으면 None.
+
+    붙으려는 주소에서 받은 사본을 고른다. 공유 PC 를 바꾼 직후에는 지금 사본이
+    다른 공유 PC 의 것이므로, 옮겨 둔 것 가운데 그 주소에서 받은 것을 찾는다.
+    다른 닉네임으로 받은 사본은 고르지 않는다(그 사람의 '나만 보기' 메모가 있다).
+    주소가 적혀 있지 않은 사본은 지금 사본일 때만 고른다."""
+    replica_path = Path(replica_path)
+    for path in [replica_path] + archive_paths(replica_path):
+        meta = copy_meta(path)
+        if not meta or meta.get("nickname") != nickname:
+            continue
+        got = meta.get("address", "")
+        if path == replica_path and (not got or not address):
+            return path
+        if got and got == address:
+            return path
+    return None
 
 
 def missing_notes(copy_notes: list[dict[str, Any]],
@@ -145,14 +263,18 @@ def missing_notes(copy_notes: list[dict[str, Any]],
 
     공유 PC 에 그 메모가 아예 없거나, 있더라도 사본 쪽이 더 나중에 고친 다른
     내용이면 넣는다. 가져올 때는 새 메모로 만들기 때문에 있는 메모를 덮어쓰지
-    않는다."""
+    않는다. 같은 글의 메모가 공유 PC 에 이미 있으면(앞서 가져온 것) 넣지 않는다:
+    가져온 메모는 새 id 를 받으므로, id 만 보면 한 번 가져온 것이 다시 잡힌다.
+    글이 없는 메모도 넣지 않는다."""
+    have = {(n.get("content") or "") for n in host_notes.values()}
     out = []
     for note in copy_notes:
+        content = note.get("content") or ""
+        if not content or content in have:
+            continue
         there = host_notes.get(note.get("id"))
-        if there is None:
-            out.append(note)
-        elif ((note.get("content") or "") != (there.get("content") or "")
-              and int(note.get("updated_at") or 0) > int(there.get("updated_at") or 0)):
+        if there is None or (
+                int(note.get("updated_at") or 0) > int(there.get("updated_at") or 0)):
             out.append(note)
     return out
 
@@ -276,16 +398,44 @@ class ReplicaStore:
         """다른 메모 묶음을 받느라 옮겨 둔 옛 사본들(새것부터)."""
         return archive_paths(self.path)
 
-    def _archive(self) -> None:
+    def _archive(self, host_id: str = "") -> None:
+        """지금 사본을 옮겨 두고 새로 시작한다.
+
+        ``host_id`` 의 공유 PC 에서 전에 받아 옮겨 둔 사본이 있으면 그것을 도로
+        가져와 이어 쓴다. 공유 PC 둘을 오가는 PC 에 오갈 때마다 사본이 한 벌씩
+        쌓이지 않고, 공유 PC 마다 한 벌만 남는다."""
         self._close_quietly()
+        back = self._archive_of(host_id) if host_id else None
         self._move_aside("archive")
+        if back is not None:
+            os.replace(back, self.path)
+            for extra in ("-wal", "-shm"):
+                side = back.with_name(back.name + extra)
+                if side.exists():
+                    os.replace(side, self.path.with_name(self.path.name + extra))
+        now = datetime.now()
         for old in self.archives()[KEEP_ARCHIVES:]:
+            if not _older_than(old, now, ARCHIVE_MIN_AGE_DAYS):
+                continue
             for extra in ("", "-wal", "-shm"):
                 try:
                     old.with_name(old.name + extra).unlink()
                 except OSError:
                     pass
-        self._open()
+        try:
+            self._open()
+        except sqlite3.DatabaseError:
+            # 도로 가져온 사본이 상해 있다. 지우지 않고 옮겨 둔 뒤 새로 시작한다.
+            self._close_quietly()
+            self._move_aside("damaged")
+            self._open()
+
+    def _archive_of(self, host_id: str) -> Path | None:
+        """옮겨 둔 사본 가운데 ``host_id`` 의 공유 PC 에서 받은 가장 새것."""
+        for path in self.archives():
+            if copy_meta(path).get("host_id") == host_id:
+                return path
+        return None
 
     # ── 읽기 ──
 
@@ -339,7 +489,7 @@ class ReplicaStore:
         incoming = {n["id"] for n in notes}
         archived = self._is_other_dataset(host_id, incoming)
         if archived:
-            self._archive()
+            self._archive(host_id)
         c = self._conn
         have = {r[0]: (int(r[1]), int(r[2])) for r in c.execute(
             "SELECT id, version, updated_at FROM notes")}

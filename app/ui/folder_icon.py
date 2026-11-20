@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 from .. import config, i18n
 from . import note_fold as nf
+from . import dwm
 from .theme import LIGHT_MENU_QSS
 
 
@@ -200,7 +201,9 @@ class FolderIconWidget(QWidget):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        _pin_to_bottom(int(self.winId()))
+        hwnd = int(self.winId())
+        dwm.set_bare(hwnd)
+        _pin_to_bottom(hwnd)
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)

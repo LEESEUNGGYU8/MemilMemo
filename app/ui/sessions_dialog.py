@@ -124,7 +124,9 @@ class _UserCard(QFrame):
         avatar.setPixmap(_avatar_pixmap(nickname, online=online))
         row.addWidget(avatar, 0, Qt.AlignVCenter)
 
-        name_lbl = QLabel(nickname)
+        name_lbl = QLabel()
+        name_lbl.setTextFormat(Qt.PlainText)
+        name_lbl.setText(nickname)
         name_lbl.setStyleSheet(
             "font-size: 13.5px; font-weight: 700; "
             f"color: {'#1F1F1F' if online else '#707070'};")
@@ -175,6 +177,7 @@ class _SessionHeader(QFrame):
         outer.addLayout(top)
 
         self._host_name = QLabel("")
+        self._host_name.setTextFormat(Qt.PlainText)
         self._host_name.setStyleSheet(
             "color: #1F1F1F; font-size: 17px; font-weight: 800;")
         self._host_name.setTextInteractionFlags(Qt.TextSelectableByMouse)

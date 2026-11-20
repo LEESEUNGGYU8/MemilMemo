@@ -6,10 +6,11 @@ best-effort try/except로 감싸, 어떤 COM 실패(Wine, 권한 거부, 특이�
 Windows 빌드)에도 등록만 건너뛰고 앱은 정상 동작한다."""
 from __future__ import annotations
 
-from . import config, i18n
+from . import config, i18n, packaging
 from .ipc import NEW_NOTE_FLAG
 
 import ctypes
+import os
 import sys
 from ctypes import (
     POINTER,
@@ -44,13 +45,52 @@ APP_USER_MODEL_ID = "SyncNotes.LeeSeungGyu.Desktop.1"
 def set_app_user_model_id() -> None:
     """어떤 창이든 표시되기 전에 호출해야 작업 표시줄 버튼이 이 ID를
     인식하고 점프리스트가 앱 아이콘과 연결된다."""
-    if sys.platform != "win32":
+    if sys.platform != "win32" or packaging.is_packaged():
+        # 스토어판은 패키지가 정한 ID 를 쓴다. 따로 정하면 작업 표시줄 단추가
+        # 시작 메뉴의 앱과 갈라진다.
         return
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
             _app_id())
     except Exception:
         pass
+
+
+# Windows 가 실행 파일마다 기억해 두는 프로그램 이름. 작업 표시줄이 이것을 쓴다.
+NAME_CACHE_KEY = (r"Software\Classes\Local Settings\Software\Microsoft"
+                  r"\Windows\Shell\MuiCache")
+
+
+def forget_stale_app_name(exe_path: str) -> bool:
+    """작업 표시줄에 파일 이름(SyncNotes.exe)이 프로그램 이름으로 나오는 것을 고친다.
+
+    1.0.1 까지는 실행 파일에 이름이 들어 있지 않아 Windows 가 파일 이름을 대신
+    기억해 두었다. 실행 파일에 이름을 넣은 뒤에도 기억해 둔 쪽이 먼저 쓰이므로
+    그것을 지운다. 기억해 둔 것이 파일 이름일 때만 지우고, 지운 뒤에는 Windows 가
+    실행 파일에서 이름을 다시 읽는다. 지웠으면 True."""
+    if sys.platform != "win32" or not exe_path:
+        return False
+    name = f"{exe_path}.FriendlyAppName"
+    try:
+        import winreg
+        with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, NAME_CACHE_KEY, 0,
+                winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE) as key:
+            value, _kind = winreg.QueryValueEx(key, name)
+            if str(value).lower() != os.path.basename(exe_path).lower():
+                return False
+            winreg.DeleteValue(key, name)
+            return True
+    except OSError:
+        return False
+
+
+def refresh_app_name() -> None:
+    """설치판을 켤 때 한 번 부른다(창을 띄우기 전에). 시험 실행과 스토어판은
+    건드리지 않는다: 스토어판의 이름은 패키지가 정한다."""
+    if (getattr(sys, "frozen", False) and not packaging.is_packaged()
+            and not config.isolated_run()):
+        forget_stale_app_name(sys.executable)
 
 
 def _app_id() -> str:
@@ -238,6 +278,10 @@ def register(*, exe_path: str = "", icon_path: str = "") -> None:
         return
     if config.isolated_run():
         # 시험 실행이 실제 앱의 목록을 자기 경로로 바꿔 놓으면 안 된다.
+        return
+    if packaging.is_packaged():
+        # 목록의 항목은 실행 파일 경로와 앱 ID 로 만든다. 스토어판은 둘 다
+        # 달라서(패키지 폴더의 실행 파일은 경로로 켤 수 없다) 넣지 않는다.
         return
     try:
         ctypes.windll.ole32.CoInitialize(None)

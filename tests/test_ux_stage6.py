@@ -624,8 +624,8 @@ def test_settings_and_banner_lead_to_the_copies(qapp, make_window, monkeypatch, 
     dlg.deleteLater()
 
     win, _client = make_window(connect=False)
-    monkeypatch.setattr(replica_mod, "list_copies", lambda path: [])
-    monkeypatch.setattr("app.ui.main_window.list_copies", lambda path: [])
+    monkeypatch.setattr(replica_mod, "list_copies", lambda path, **k: [])
+    monkeypatch.setattr("app.ui.main_window.list_copies", lambda path, **k: [])
     win._copies_btn.click()
     assert win.told == [(i18n.t("copies.window_title"), i18n.t("copies.empty"))]
     assert QMessageBox is not None

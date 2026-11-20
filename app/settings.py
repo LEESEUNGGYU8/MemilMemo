@@ -6,7 +6,7 @@ import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from . import config
+from . import config, packaging, startup_task
 
 IMAGE_VIEWER_BUILTIN = "builtin"
 IMAGE_VIEWER_SYSTEM = "system"
@@ -54,8 +54,16 @@ class AppSettings:
     default_port: int = config.DEFAULT_PORT
     default_heartbeat_ms: int = config.DEFAULT_HEARTBEAT_MS
 
+    # 켜 두면 실행할 때 새 버전을 묻지 않고 받아 설치한다.
+    auto_update: bool = False
+    # 자동으로 설치를 시작해 본 버전. 설치가 끝나지 않아 같은 버전이 다시 보이면
+    # (Windows 의 설치 허용 창에서 거절한 경우 등) 그때는 묻는 창으로 돌아간다.
+    auto_update_tried: str = ""
+
     # 다른 사람이 공개 메모를 새로 만들면 알린다.
     notify_new_note: bool = True
+    # 다른 사람이 메모를 고치고 편집을 마치면 알린다.
+    notify_note_edit: bool = True
     # 새 메모를 '나만 보기'로 만든다. 꺼져 있으면 모두에게 공개한다.
     new_note_private: bool = False
 
@@ -123,8 +131,24 @@ def _autostart_command() -> str:
     return f'"{sys.executable}" "{script}"'
 
 
-def set_windows_autostart(enabled: bool) -> bool:
+def autostart_supported() -> bool:
+    """이 앱이 자동 실행을 켜고 끌 수 있는가.
+
+    설치판은 레지스트리의 시작 프로그램 값으로 한다. 스토어판이 거기에 적는
+    값은 Windows 에 보이지 않으므로 패키지에 적어 둔 시작 작업으로 한다
+    (``startup_task``). 사용자가 Windows 설정의 시작 앱에서 꺼 둔 것은 앱이
+    다시 켤 수 없다."""
     if platform.system() != "Windows":
+        return False
+    if packaging.is_packaged():
+        return startup_task.can_change()
+    return True
+
+
+def set_windows_autostart(enabled: bool) -> bool:
+    if packaging.is_packaged():
+        return startup_task.set_enabled(enabled)
+    if not autostart_supported():
         return False
     try:
         import winreg
@@ -149,7 +173,9 @@ def set_windows_autostart(enabled: bool) -> bool:
 
 
 def get_windows_autostart() -> bool:
-    if platform.system() != "Windows":
+    if packaging.is_packaged():
+        return startup_task.is_enabled()
+    if not autostart_supported():
         return False
     try:
         import winreg

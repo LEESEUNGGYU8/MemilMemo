@@ -41,7 +41,10 @@ class CenteredMenuItem(QWidget):
             icon_lbl.setPixmap(icon.pixmap(self.ICON_SIZE, self.ICON_SIZE))
         row.addWidget(icon_lbl)
 
-        self._text_lbl = QLabel(text, self)
+        # 폴더 이름이나 링크 이름이 들어갈 수 있다. 글자 그대로 보인다.
+        self._text_lbl = QLabel(self)
+        self._text_lbl.setTextFormat(Qt.PlainText)
+        self._text_lbl.setText(text)
         if header:
             # 묶음 이름표: 누를 수 없지만 흐린 항목과는 달라 보여야 한다.
             style = ("color: #6B6B6B; font-size: 11px; font-weight: 700; "

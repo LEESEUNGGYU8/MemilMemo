@@ -39,6 +39,7 @@ from PySide6.QtWidgets import QLabel, QTextEdit
 from .. import config
 from .. import file_links as fl
 from .link_icons import link_icon_pixmap
+from .safe_text import SafeTextDocument, is_plain_raster
 
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".apng"}
@@ -53,9 +54,13 @@ def _data_url_payload(data_url: str) -> QByteArray:
         return QByteArray()
     try:
         _, payload = data_url.split(",", 1)
+        raw = QByteArray.fromBase64(payload.encode("ascii"))
     except ValueError:
         return QByteArray()
-    return QByteArray.fromBase64(payload.encode("ascii"))
+    # 본문의 그림은 남이 보낸 바이트다. 이 앱이 넣는 형식만 풀어 본다.
+    if not is_plain_raster(raw.left(16).data()):
+        return QByteArray()
+    return raw
 
 
 def _data_url_format_hint(data_url: str) -> str:
@@ -501,7 +506,8 @@ def html_to_plain(html: str) -> str:
         return ""
     if "<" not in html:
         return html
-    doc = QTextDocument()
+    # 읽기만 해도 본문이 가리키는 스타일시트를 파일에서 열려고 한다.
+    doc = SafeTextDocument()
     doc.setHtml(html)
     return doc.toPlainText().replace("￼", "")
 
@@ -585,11 +591,14 @@ class AnimationDriver(QObject):
         self._movies.clear()
 
 
-class _MarkerAwareDocument(QTextDocument):
+class _MarkerAwareDocument(SafeTextDocument):
     """``setHtml`` 이 렌더링 전에 리소스 캐시를 비우는데, 그 사이 Qt 가
     그린 깨진 이미지 placeholder 는 리소스를 재등록해도 남는다. 글머리
     URL 을 ``loadResource`` 에서 직접 해결하면 캐시가 비어 있어도 매
-    paint 가 이 메서드로 처리되어 그 문제가 사라진다."""
+    paint 가 이 메서드로 처리되어 그 문제가 사라진다.
+
+    그 밖의 주소는 ``SafeTextDocument`` 가 거른다: 본문에 든 ``data:`` 그림만
+    읽고, 파일이나 네트워크 경로는 열지 않는다."""
 
     def loadResource(self, resource_type, name):  # noqa: N802
         if resource_type == QTextDocument.ImageResource:

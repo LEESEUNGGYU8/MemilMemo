@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -156,6 +157,8 @@ class UpdateDownloader(QObject):
         self._expected_sha: str | None = None
         self._reply: QNetworkReply | None = None
         self._cancelled = False
+        # 확인을 마친 설치 파일의 해시. 실행 직전에 파일이 그대로인지 다시 본다.
+        self.verified_sha256 = ""
 
     def cancel(self) -> None:
         """받기를 멈춘다. 멈춘 뒤에는 어떤 신호도 내지 않는다."""
@@ -173,27 +176,29 @@ class UpdateDownloader(QObject):
             reply.finished.connect(
                 lambda r=reply: self._on_version_json(r))
         else:
-            # version.json이 없는 릴리스는 해시 검증을 건너뛴다.
-            self._expected_sha = None
-            self._download_installer()
+            # 받은 파일이 올린 것과 같은지 확인할 길이 없으면 설치하지 않는다.
+            self.error.emit(i18n.t("update.err_no_checksum"))
 
     def _on_version_json(self, reply: QNetworkReply) -> None:
         if self._cancelled:
             reply.deleteLater()
             return
         try:
+            self._expected_sha = None
             if reply.error() == QNetworkReply.NetworkError.NoError:
                 try:
                     meta = json.loads(
                         bytes(reply.readAll())
                         .decode("utf-8", errors="replace"))
-                    self._expected_sha = (
-                        (meta.get("sha256") or "").lower().strip()
-                        or None)
+                    value = meta.get("sha256") if isinstance(meta, dict) else ""
+                    value = str(value or "").lower().strip()
+                    if re.fullmatch(r"[0-9a-f]{64}", value):
+                        self._expected_sha = value
                 except json.JSONDecodeError:
-                    self._expected_sha = None
-            else:
-                self._expected_sha = None
+                    pass
+            if self._expected_sha is None:
+                self.error.emit(i18n.t("update.err_no_checksum"))
+                return
             self._download_installer()
         finally:
             reply.deleteLater()
@@ -222,35 +227,52 @@ class UpdateDownloader(QObject):
                 return
             data = bytes(reply.readAll())
             actual_sha = hashlib.sha256(data).hexdigest()
-            if (self._expected_sha
-                    and actual_sha.lower() != self._expected_sha):
+            if actual_sha.lower() != self._expected_sha:
                 # 게시된 바이트와 다르면(손상 또는 변조) 실행하지 않는다.
                 self.error.emit(
                     i18n.t("update.err_hash_mismatch",
                            expected=self._expected_sha, actual=actual_sha))
                 return
-            target = (Path(tempfile.gettempdir())
-                      / f"MemilMemo-Setup-{self._info['version']}.exe")
+            version = re.sub(r"[^0-9A-Za-z._-]", "_",
+                             str(self._info.get("version") or ""))
             try:
+                # 이름을 미리 알 수 없는, 이 사용자만 쓰는 새 폴더에 둔다.
+                folder = Path(tempfile.mkdtemp(prefix="MemilMemo-update-"))
+                target = folder / f"MemilMemo-Setup-{version}.exe"
                 target.write_bytes(data)
             except OSError as exc:
                 self.error.emit(i18n.t("update.err_temp_write", detail=exc))
                 return
+            self.verified_sha256 = actual_sha
             self.installerReady.emit(str(target))
         finally:
             reply.deleteLater()
 
 
-def launch_installer(installer_path: str) -> None:
-    """Inno Setup 인스톨러를 silent 모드로 실행한다.
+def launch_installer(installer_path: str, expected_sha256: str = "") -> bool:
+    """Inno Setup 인스톨러를 silent 모드로 실행한다. 실행했으면 True.
+
+    ``expected_sha256`` 을 주면 실행 직전에 파일을 다시 읽어 그 해시와 같은지
+    본다. 받아 둔 뒤 실행하기까지 시간이 걸릴 수 있고(편집이 끝나기를 기다리는
+    자동 업데이트), 그 사이에 파일이 바뀌었으면 실행하지 않는다.
 
     인스톨러가 실행 중인 앱을 종료시킨 뒤 바이너리를 교체하므로,
     호출 측도 곧바로 깨끗하게 exit해야 한다."""
     import subprocess
+    if expected_sha256:
+        try:
+            actual = hashlib.sha256(Path(installer_path).read_bytes()).hexdigest()
+        except OSError:
+            return False
+        if actual != expected_sha256.lower():
+            return False
     try:
         subprocess.Popen([
             installer_path,
             "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
         ], close_fds=True)
     except OSError as exc:
-        sys.stderr.write(f"[updater] failed to launch installer: {exc}\n")
+        if sys.stderr is not None:
+            sys.stderr.write(f"[updater] failed to launch installer: {exc}\n")
+        return False
+    return True

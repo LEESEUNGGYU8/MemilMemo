@@ -4,11 +4,11 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QEvent, QTimer
 from PySide6.QtGui import QCursor, QIcon
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
-from app import config, i18n, shell_menu
+from app import config, data_home, i18n, packaging, shell_menu
 from app.backup import (
     BackupManager, backup_time, latest_good_backup, list_backups,
     replace_database, set_aside,
@@ -16,7 +16,8 @@ from app.backup import (
 from app.database import SqliteRepository, check_database
 from app.datetime_fmt import fmt_relative
 from app.ipc import (
-    CMD_NEW_NOTE_HERE, IpcReceiver, forward_command, new_note_command,
+    CMD_NEW_NOTE_HERE, IpcReceiver, claim_boot, forward_command,
+    forward_when_ready, link_note_command, link_note_paths, new_note_command,
 )
 from app.local_state import LocalStateStore
 from app.network.guest_client import GuestClient
@@ -35,12 +36,20 @@ from app.ui.update_dialog import UpdateAvailableDialog
 from app.updater import (
     UpdateChecker, UpdateDownloader, launch_installer,
 )
-from app.win_jumplist import register as register_jumplist, set_app_user_model_id
+from app.win_jumplist import (
+    refresh_app_name,
+    register as register_jumplist,
+    set_app_user_model_id,
+)
 
 
 def _sync_autostart(settings: AppSettings) -> None:
     if config.isolated_run():
         # 시험 실행은 실제 자동 실행 값을 읽지도 고치지도 않는다.
+        return
+    if packaging.is_packaged():
+        # 스토어판의 자동 실행 상태는 Windows 가 쥐고 있다(사용자가 설정의 시작
+        # 앱에서 바꿀 수 있다). 설정 파일의 값으로 덮어쓰지 않는다.
         return
     actual = get_windows_autostart()
     if settings.autostart and not actual:
@@ -203,7 +212,48 @@ def _open_replica() -> ReplicaStore | None:
         return None
 
 
+def _prepare_process() -> None:
+    """창을 만들기 전에 이 프로세스에 해 둘 일."""
+    import os
+
+    # Qt 는 그림을 읽기 전에 같은 이름에 '@2x' 를 붙인 파일이 있는지 찾아본다.
+    # 메모 본문이 네트워크 경로의 그림을 가리키면 찾아보는 것만으로 그 서버에
+    # 접속한다. 이 앱은 그런 이름의 그림을 쓰지 않으므로 찾아보지 않게 한다.
+    os.environ.setdefault("QT_HIGHDPI_DISABLE_2X_IMAGE_LOADING", "1")
+    if getattr(sys, "frozen", False):
+        # 탐색기의 우클릭 메뉴로 켜지면 작업 폴더가 그 파일이 든 폴더다. 그 폴더의
+        # 파일이 프로그램 이름으로 잘못 잡히지 않게 설치 폴더로 옮겨 둔다.
+        try:
+            os.chdir(os.path.dirname(os.path.abspath(sys.executable)))
+        except OSError:
+            pass
+
+
+class _App(QApplication):
+    """끝내 달라는 요청을 창들보다 먼저 듣는 QApplication.
+
+    Qt 는 종료 요청을 받으면 보이는 창을 하나씩 닫아 본다. 메모 창은 닫기를
+    '숨기기'로 받으므로, 채비 없이 요청이 오면 메모 하나가 숨김으로 바뀌고
+    종료는 취소된다. 어디서 요청이 오든 창들이 먼저 채비하게 한다."""
+
+    def __init__(self, argv: list[str]) -> None:
+        super().__init__(argv)
+        self._before_quit = None
+
+    def set_before_quit(self, callback) -> None:
+        self._before_quit = callback
+
+    def event(self, e) -> bool:  # noqa: N802
+        if e.type() == QEvent.Quit and self._before_quit is not None:
+            try:
+                self._before_quit()
+            except Exception:
+                pass
+        return super().event(e)
+
+
 def main() -> int:
+    _prepare_process()
     _wait_for_previous_instance(sys.argv)
     # 작업 표시줄 목록이나 바탕 화면 우클릭 메뉴의 '새 메모'로 실행됐는가.
     new_note_cmd = new_note_command(sys.argv)
@@ -213,20 +263,36 @@ def main() -> int:
     if new_note_cmd and forward_command(new_note_cmd):
         return 0
 
+    # 파일·폴더 우클릭 메뉴의 '새 메모에 링크로 넣기'로 실행됐는가.
+    link_paths = link_note_paths(sys.argv)
+    if link_paths and forward_command(link_note_command(link_paths)):
+        return 0
+    # 여기부터는 앱을 켠다. 파일을 여럿 골랐으면 같은 실행이 동시에 여러 개
+    # 뜨므로 하나만 켜고, 나머지는 그쪽이 뜨기를 기다렸다가 넘기고 끝난다.
+    if not claim_boot() and link_paths:
+        forward_when_ready(link_note_command(link_paths))
+        return 0
+
     # 창이 표시되기 전에 호출해야 작업 표시줄이 본 프로세스를 AppUserModelID로 그룹화하고,
     # 뒤이어 등록하는 점프리스트가 앱 아이콘에 제대로 붙는다.
     set_app_user_model_id()
+    # 업데이트한 PC 의 작업 표시줄에 옛 파일 이름이 남지 않게 한다.
+    refresh_app_name()
 
-    app = QApplication(sys.argv)
+    app = _App(sys.argv)
     app.setApplicationName(config.APP_NAME)
     app.setOrganizationName(config.APP_NAME)
     app.setQuitOnLastWindowClosed(False)
 
     # 우클릭 메뉴로 켜진 경우 메모를 띄울 자리. 접속을 마칠 때쯤에는 마우스가
     # 다른 데 가 있으므로 지금 적어 둔다.
-    new_note_spot = (QCursor.pos() if new_note_cmd == CMD_NEW_NOTE_HERE
+    new_note_spot = (QCursor.pos()
+                     if new_note_cmd == CMD_NEW_NOTE_HERE or link_paths
                      else None)
 
+    # 스토어판을 처음 켰으면 설치판이 쓰던 메모와 설정을 가져온다(설정을 읽기
+    # 전에 한다). 설치판에서는 아무 일도 하지 않는다.
+    data_home.adopt_classic_data()
     settings = AppSettings.load()
 
     # 언어를 가장 먼저 확정한다.
@@ -246,7 +312,8 @@ def main() -> int:
     _sync_autostart(settings)
     settings.save()
     # 바탕 화면 우클릭 메뉴를 넣어 둔 경우 실행 파일 경로와 글자를 지금 것으로 맞춘다.
-    shell_menu.refresh(i18n.t("jumplist.new_note_title"))
+    shell_menu.refresh(i18n.t("jumplist.new_note_title"),
+                       i18n.t("shell.link_note_title"))
 
     local_store = LocalStateStore()
 
@@ -440,6 +507,7 @@ def main() -> int:
             break
 
     app.setQuitOnLastWindowClosed(True)
+    app.set_before_quit(window.prepare_quit)
     window.show()
 
     # 작업 표시줄 점프리스트 명령을 위한 단일 인스턴스 IPC.
@@ -456,30 +524,46 @@ def main() -> int:
     # 본 프로세스가 '새 메모'로 직접 실행된 경우(전달할 인스턴스가 없었을 때),
     # welcome 스냅샷을 받은 뒤에 메모를 만든다.
     # 그 전에 호출하면 클라이언트가 아직 연결되지 않아 create_note가 무산된다.
-    if new_note_cmd:
+    if new_note_cmd or link_paths:
         def _create_after_welcome(_data=None):
             try:
                 client.welcomed.disconnect(_create_after_welcome)
             except (RuntimeError, TypeError):
                 pass
-            QTimer.singleShot(
-                0, lambda: window.handle_new_note_request(new_note_spot))
+            if link_paths:
+                QTimer.singleShot(0, lambda: window.handle_link_note_request(
+                    link_paths, new_note_spot))
+            else:
+                QTimer.singleShot(
+                    0, lambda: window.handle_new_note_request(new_note_spot))
         client.welcomed.connect(_create_after_welcome)
 
     # 자동 업데이트 확인은 시작 5초 후에 동작한다.
     # welcome 핸드셰이크와 UI가 안정된 뒤에 수행하려는 목적이다.
     # 네트워크 오류는 조용히 무시하고, 새 버전이 있을 때만 다이얼로그를 띄운다.
-    _schedule_update_check(app, window)
+    _schedule_update_check(app, window, settings)
 
     return app.exec()
 
 
-def _schedule_update_check(app: QApplication, window: MainWindow) -> None:
+def _schedule_update_check(app: QApplication, window: MainWindow,
+                           settings: AppSettings) -> None:
+    if packaging.is_packaged():
+        # 스토어판은 스토어가 올린다. 설치 파일을 받아 실행하지 않는다.
+        return
+
     def _begin_check():
         checker = UpdateChecker(config.APP_VERSION, parent=app)
 
         def _on_available(info: dict):
-            _prompt_and_install(app, window, info)
+            version = str(info.get("version") or "")
+            if (settings.auto_update and version
+                    and settings.auto_update_tried != version):
+                _install_quietly(app, window, settings, info)
+            else:
+                # 자동 업데이트를 켜지 않았거나, 이 버전을 한 번 설치하려다
+                # 끝내지 못했다(설치 허용 창에서 거절한 경우 등). 묻는다.
+                _prompt_and_install(app, window, info)
 
         def _on_error(_msg: str):
             # 네트워크 오류는 흔하다(오프라인, rate-limit 등).
@@ -492,6 +576,40 @@ def _schedule_update_check(app: QApplication, window: MainWindow) -> None:
         checker.check()
 
     QTimer.singleShot(5000, _begin_check)
+
+
+# 자동 업데이트가 편집이 끝나기를 기다리며 다시 확인하는 간격.
+_AUTO_UPDATE_RETRY_MS = 3000
+
+
+def _install_quietly(app: QApplication, window: MainWindow,
+                     settings: AppSettings, info: dict) -> None:
+    """자동 업데이트: 묻지 않고 받아서 설치한다.
+
+    받다가 실패하면 조용히 넘어가고 다음 실행 때 다시 본다. 설치 파일은 관리자
+    권한으로 도므로 Windows 의 설치 허용 창은 그대로 뜬다(앱이 건너뛸 수 없다)."""
+    version = str(info.get("version") or "")
+    downloader = UpdateDownloader(info, parent=app)
+    # 잠시 뒤 앱이 꺼지고 설치 허용 창이 뜬다. 까닭을 먼저 알린다.
+    window.notify(i18n.t("boot.auto_update_started", version=version))
+
+    def _launch(path: str) -> None:
+        if window.is_editing():
+            # 쓰던 글을 끊지 않는다. 편집이 끝나면 설치한다.
+            QTimer.singleShot(_AUTO_UPDATE_RETRY_MS, lambda: _launch(path))
+            return
+        # 같은 버전을 실행할 때마다 되풀이해 설치하지 않도록 적어 둔다.
+        settings.auto_update_tried = version
+        settings.save()
+        sha = downloader.verified_sha256
+        # 여기서 스스로 끝내지 않는다. Windows 의 설치 허용 창에서 거절하면 설치는
+        # 시작되지 않는데, 그때 앱까지 꺼져 있으면 안 된다. 설치가 실제로 시작되면
+        # 설치 프로그램이 이 앱을 닫고, 끝난 뒤 새 버전을 다시 켠다.
+        launch_installer(path, sha)
+
+    downloader.installerReady.connect(_launch)
+    downloader.error.connect(lambda _message: None)
+    downloader.start()
 
 
 def _prompt_and_install(app: QApplication, window: MainWindow,
@@ -540,10 +658,17 @@ def _prompt_and_install(app: QApplication, window: MainWindow,
 
     def _on_ready(path: str):
         _close_progress()
-        launch_installer(path)
-        # Inno Setup이 본 프로세스를 종료시키지만,
-        # SmartScreen에서 사용자가 취소했을 경우를 대비해 짧게 대기 후 종료한다.
-        QTimer.singleShot(200, app.quit)
+        if not launch_installer(path, downloader.verified_sha256):
+            confirm.notify(
+                window, i18n.t("boot.update_failed_title"),
+                i18n.t("boot.update_failed_body",
+                       message=i18n.t("update.err_no_checksum")),
+                icon=QMessageBox.Warning)
+            return
+        # 여기서 스스로 끝내지 않는다(자동 업데이트와 같다). 설치가 시작되면
+        # 설치 프로그램이 이 앱을 닫고, 설치 허용 창에서 거절하면 앱이 남는다.
+        # 전에는 여기서 app.quit() 을 불렀는데, 메모 창이 떠 있으면 종료는
+        # 취소되고 메모 하나만 숨김으로 바뀌었다.
 
     def _on_error(message: str):
         _close_progress()

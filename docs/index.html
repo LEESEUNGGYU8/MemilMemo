@@ -163,13 +163,11 @@
   .faq details[open] summary::after { transform: translateY(-30%) rotate(-135deg); }
   .faq details p { margin: 0; padding: 0 40px 20px 0; color: var(--ink-soft); }
 
-  /* ── 맺음 ── */
-  .closing { text-align: center; }
-  .closing h2 { margin-bottom: 22px; }
-  .closing .cta { justify-content: center; margin-top: 0; }
+  /* 마지막 질문의 아랫줄이 곧 바닥글의 윗줄이다. */
+  .faq { padding-bottom: 0; }
 
   footer {
-    padding: 32px 0 56px; border-top: 1px solid var(--line);
+    padding: 32px 0 56px;
     color: var(--ink-soft); font-size: 15px;
     display: flex; flex-wrap: wrap; gap: 8px 22px;
   }
@@ -261,7 +259,7 @@
         <div class="feature flip reveal">
           <div class="text">
             <h3>메모 접기 및 화면 가장자리 고정</h3>
-            <p>쪽지나 아이콘으로 접고, 화면 가장자리에 탭으로 고정합니다.</p>
+            <p>쪽지나 아이콘으로 접고, 화면 끝으로 끌어 탭으로 고정합니다. 펴면 원래 자리로 돌아옵니다.</p>
           </div>
           <figure class="shot"><img src="images/fold.gif" width="560" height="380" loading="lazy" alt="메모가 쪽지로 접히고 화면 가장자리에 탭으로 붙는 모습"></figure>
         </div>
@@ -287,7 +285,7 @@
           <div class="reveal" style="--d:.05s"><dt>나만 보기</dt><dd>메모와 폴더를 본인에게만 표시합니다.</dd></div>
           <div class="reveal" style="--d:.1s"><dt>목록 보기 방식</dt><dd>리스트와 그리드, 세 가지 밀도 중에서 선택합니다.</dd></div>
           <div class="reveal"><dt>자동 백업과 복원</dt><dd>정해 둔 주기로 백업하고, 백업에서 복원합니다.</dd></div>
-          <div class="reveal" style="--d:.05s"><dt>새 메모 바로 가기</dt><dd>바탕화면 우클릭 메뉴와 작업 표시줄에서 만듭니다.</dd></div>
+          <div class="reveal" style="--d:.05s"><dt>새 메모 바로 가기</dt><dd>바탕화면 우클릭 메뉴와 작업 표시줄에서 만듭니다. 파일을 우클릭하면 링크 메모를 만듭니다.</dd></div>
           <div class="reveal" style="--d:.1s"><dt>다국어</dt><dd>한국어, 영어, 일본어 화면을 지원합니다.</dd></div>
         </dl>
       </section>
@@ -321,17 +319,6 @@
           </details>
         </div>
       </section>
-
-      <section class="closing" aria-labelledby="get">
-        <h2 id="get" class="reveal">메밀메모 내려받기</h2>
-        <div class="cta reveal">
-          <a class="download" href="https://github.com/LEESEUNGGYU8/MemilMemo/releases/latest/download/MemilMemo-Setup.exe">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11"/><path d="m7 11 5 5 5-5"/><path d="M5 20h14"/></svg>
-            Windows용 내려받기
-          </a>
-          <span class="meta"><span>무료</span><span>Windows 10, 11</span><span data-version></span></span>
-        </div>
-      </section>
     </main>
 
     <footer>
@@ -339,6 +326,7 @@
       <a href="https://github.com/LEESEUNGGYU8/MemilMemo/releases">변경 내역</a>
       <a href="https://github.com/LEESEUNGGYU8/MemilMemo/issues">문의</a>
       <a href="https://github.com/LEESEUNGGYU8/MemilMemo/blob/main/LICENSE.txt">라이선스</a>
+      <a href="privacy.html">개인정보처리방침</a>
     </footer>
   </div>
 

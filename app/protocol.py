@@ -7,6 +7,12 @@ from typing import Any
 
 LENGTH_HEADER = struct.Struct(">I")
 
+# 프레임 길이는 보낸 쪽이 4바이트로 적는다. 그대로 믿으면 받는 쪽이 4GB 까지
+# 모으려 든다. 공유 PC 는 참여자가 보낸 프레임에 상한을 둔다. 인사(hello)는
+# 닉네임 하나라 작고, 그 뒤로 가장 큰 것은 그림이 든 메모 한 장이다.
+MAX_FRAME_BEFORE_HELLO = 64 * 1024
+MAX_FRAME_FROM_GUEST = 256 * 1024 * 1024
+
 # 클라이언트 → 서버
 MSG_HELLO = "hello"
 MSG_ACQUIRE_LOCK = "acquire_lock"
@@ -53,16 +59,33 @@ class Message:
 
 
 class FrameParser:
-    def __init__(self) -> None:
+    """이어 붙여 온 바이트에서 프레임을 하나씩 꺼낸다.
+
+    ``max_frame`` 을 주면 그보다 긴 프레임이 왔을 때 받기를 그만두고
+    ``overflowed`` 를 켠다(부르는 쪽이 연결을 끊는다). 값은 도중에 바꿀 수 있다."""
+
+    def __init__(self, max_frame: int | None = None) -> None:
         self._buf = bytearray()
+        self.max_frame = max_frame
+        self.overflowed = False
 
     def feed(self, chunk: bytes) -> list[Message]:
+        return list(self.iter_feed(chunk))
+
+    def iter_feed(self, chunk: bytes):
+        """``feed`` 와 같되 하나씩 내준다. 메시지를 처리하는 사이에 바뀐
+        ``max_frame`` 이 바로 다음 프레임부터 적용된다."""
+        if self.overflowed:
+            return
         self._buf.extend(chunk)
-        out: list[Message] = []
         while True:
             if len(self._buf) < LENGTH_HEADER.size:
                 break
             (length,) = LENGTH_HEADER.unpack_from(self._buf, 0)
+            if self.max_frame is not None and length > self.max_frame:
+                self.overflowed = True
+                self._buf.clear()
+                break
             total = LENGTH_HEADER.size + length
             if len(self._buf) < total:
                 break
@@ -70,11 +93,15 @@ class FrameParser:
             del self._buf[:total]
             try:
                 payload = json.loads(body.decode("utf-8"))
-                out.append(Message(type=payload["type"], data=payload.get("data", {})))
-            except (json.JSONDecodeError, KeyError, UnicodeDecodeError):
+                msg_type = payload["type"]
+                data = payload.get("data", {})
+            except (json.JSONDecodeError, KeyError, UnicodeDecodeError,
+                    TypeError, AttributeError, RecursionError):
                 # 잘못된 프레임은 연결을 끊지 않고 건너뛴다.
                 continue
-        return out
+            if not isinstance(msg_type, str) or not isinstance(data, dict):
+                continue
+            yield Message(type=msg_type, data=data)
 
 
 def make(msg_type: str, **data: Any) -> Message:

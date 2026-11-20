@@ -331,6 +331,40 @@ _SVG = {
         'stroke="{color}" stroke-width="2" fill="none"/>'
         '<rect x="8.5" y="8.5" width="7" height="7" rx="1.2" fill="{color}"/></svg>'
     ),
+    # 설정 창의 구역 표시.
+    "bell": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<path d="M6 16.5V11a6 6 0 0 1 12 0v5.5l1.5 2h-15z" stroke="{color}" '
+        'stroke-width="2" fill="none" stroke-linejoin="round"/>'
+        '<path d="M10 20.5a2.2 2.2 0 0 0 4 0" stroke="{color}" stroke-width="2" '
+        'fill="none" stroke-linecap="round"/></svg>'
+    ),
+    "network": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<rect x="9" y="3.5" width="6" height="5" rx="1.4" '
+        'stroke="{color}" stroke-width="2" fill="none"/>'
+        '<rect x="3" y="15.5" width="6" height="5" rx="1.4" '
+        'stroke="{color}" stroke-width="2" fill="none"/>'
+        '<rect x="15" y="15.5" width="6" height="5" rx="1.4" '
+        'stroke="{color}" stroke-width="2" fill="none"/>'
+        '<path d="M12 8.5V12M6 15.5V12h12v3.5" stroke="{color}" stroke-width="2" '
+        'fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    ),
+    "archive": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<rect x="3" y="4.5" width="18" height="4.5" rx="1.4" '
+        'stroke="{color}" stroke-width="2" fill="none"/>'
+        '<path d="M5 9v8.5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9M10 13h4" '
+        'stroke="{color}" stroke-width="2" fill="none" '
+        'stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    ),
+    "info": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<circle cx="12" cy="12" r="8.5" stroke="{color}" stroke-width="2" fill="none"/>'
+        '<path d="M12 11v5.5" stroke="{color}" stroke-width="2" '
+        'fill="none" stroke-linecap="round"/>'
+        '<circle cx="12" cy="7.8" r="1.2" fill="{color}"/></svg>'
+    ),
 }
 
 

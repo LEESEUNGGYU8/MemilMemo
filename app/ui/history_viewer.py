@@ -9,6 +9,7 @@ from typing import Any
 from PySide6.QtCore import QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QComboBox,
     QDialog,
     QFrame,
@@ -27,7 +28,8 @@ from PySide6.QtWidgets import (
 
 from .. import datetime_fmt, i18n
 from . import confirm, theme
-from .rich_text import html_to_plain, is_marker_url
+from .rich_text import has_non_checkbox_image, html_to_plain, is_marker_url
+from .safe_text import SafeTextDocument, safe_color
 
 
 _IMG_SRC_RE = re.compile(r'<img[^>]*src=["\']([^"\']+)["\']', re.IGNORECASE)
@@ -129,6 +131,54 @@ def _render_inline_diff(before: str | None, after: str | None) -> str:
         'white-space: pre-wrap;">' + "".join(parts) + "</div>")
 
 
+def _render_plain(content: str | None) -> str:
+    """지워진 메모의 본문을 그대로 보인다(지운 글 표시 없이 읽을 수 있게)."""
+    text = html_to_plain(content or "")
+    images = _count_content_images(content)
+    note_html = ""
+    if images:
+        note_html = (
+            '<div style="margin-bottom:8px; padding:4px 10px; '
+            'background:#F1F1F1; color:#555555; border-radius:6px; '
+            'font-weight:600;">'
+            + html.escape(i18n.t("history.image_count", n=images)) + '</div>')
+    if not text.strip():
+        return note_html or (
+            '<div style="color:#8A8A8A; font-style:italic;">'
+            + i18n.t("history.empty_note") + '</div>')
+    return note_html + (
+        f'<div style="font-family: {theme.CONTENT_FONT_STACK}; '
+        'font-size: 13px; line-height: 1.7; color:#1F1F1F; '
+        'white-space: pre-wrap;">'
+        + html.escape(text).replace("\n", "<br/>") + "</div>")
+
+
+def _title_of(content: str | None, limit: int = 40) -> str:
+    """메모를 가리키는 이름: 첫 줄, 없으면 내용의 종류."""
+    raw = content or ""
+    first = (html_to_plain(raw).splitlines() or [""])[0].strip()
+    if not first:
+        first = (i18n.t("main.note_title_image") if has_non_checkbox_image(raw)
+                 else i18n.t("history.empty_note"))
+    return first[:limit] + ("…" if len(first) > limit else "")
+
+
+# 여러 메모의 이력을 섞어 보일 때 줄에 적는 메모 이름.
+_TITLE_ROLE = Qt.UserRole + 1
+
+_SCOPE_QSS = """
+QFrame#Scope { background: #F1F1F1; border-radius: 9px; }
+QFrame#Scope QPushButton {
+    background: transparent; color: #6B6B6B; border: none; border-radius: 7px;
+    padding: 5px 14px; min-height: 18px; min-width: 0;
+    font-size: 12px; font-weight: 600;
+}
+QFrame#Scope QPushButton:hover { background: transparent; color: #1F1F1F; }
+QFrame#Scope QPushButton:checked { background: #FFFFFF; color: #1F1F1F; }
+QFrame#Scope QPushButton:disabled { background: transparent; color: #C4C4C4; }
+"""
+
+
 class _HistoryItemDelegate(QStyledItemDelegate):
     """선택·호버 배경을 직접 그린다. 그렇지 않으면 기본 배경이 행 요소를 가린다."""
 
@@ -177,6 +227,12 @@ class _HistoryItemDelegate(QStyledItemDelegate):
         painter.setPen(QColor(fg))
         painter.drawText(badge_rect, Qt.AlignCenter, label)
 
+        # 한 메모의 이력만 볼 때는 첫 줄에 고친 사람을, 여러 메모를 섞어 볼
+        # 때는 첫 줄에 메모 이름을 적고 고친 사람은 둘째 줄로 내린다.
+        title = index.data(_TITLE_ROLE) or ""
+        user = entry.get("user", "")
+        when = _fmt_relative(entry.get("session_end", 0))
+
         font_user = QFont(option.font)
         font_user.setBold(True)
         font_user.setPointSizeF(10.5)
@@ -184,16 +240,22 @@ class _HistoryItemDelegate(QStyledItemDelegate):
         painter.setPen(QColor("#FFFFFF" if is_selected else "#1F1F1F"))
         user_x = badge_rect.right() + 10
         user_rect = QRect(user_x, rect.y() + 10, rect.right() - user_x - 8, 22)
-        painter.drawText(user_rect, Qt.AlignVCenter | Qt.AlignLeft,
-                         entry.get("user", ""))
+        first = title or user
+        painter.drawText(
+            user_rect, Qt.AlignVCenter | Qt.AlignLeft,
+            painter.fontMetrics().elidedText(first, Qt.ElideRight,
+                                             user_rect.width()))
 
         font_ts = QFont(option.font)
         font_ts.setPointSizeF(9.5)
         painter.setFont(font_ts)
         painter.setPen(QColor("#B4B4B4" if is_selected else "#6B6B6B"))
         ts_rect = QRect(rect.x() + 12, rect.y() + 34, rect.width() - 20, 18)
-        painter.drawText(ts_rect, Qt.AlignVCenter | Qt.AlignLeft,
-                         _fmt_relative(entry.get("session_end", 0)))
+        second = f"{user}   {when}" if title else when
+        painter.drawText(
+            ts_rect, Qt.AlignVCenter | Qt.AlignLeft,
+            painter.fontMetrics().elidedText(second, Qt.ElideRight,
+                                             ts_rect.width()))
 
         painter.restore()
 
@@ -201,6 +263,8 @@ class _HistoryItemDelegate(QStyledItemDelegate):
 class HistoryViewer(QDialog):
     # (note_id, content_after)
     restoreRequested = Signal(str, str)
+    # 삭제된 메모를 새 메모로 되살린다: (content, color)
+    reviveRequested = Signal(str, str)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -210,6 +274,10 @@ class HistoryViewer(QDialog):
 
         self._entries: list[dict[str, Any]] = []
         self._notes: dict[str, dict[str, Any]] = {}
+        # 삭제된 메모: id -> 지워질 때의 본문과 색. 새로 지워진 것부터다.
+        self._gone: dict[str, dict[str, Any]] = {}
+        self._titles: dict[str, str] = {}
+        self._show_gone = False
         self._current_entry: dict[str, Any] | None = None
 
         root = QVBoxLayout(self)
@@ -217,10 +285,27 @@ class HistoryViewer(QDialog):
         root.setSpacing(12)
 
         top = QHBoxLayout()
-        lbl = QLabel(i18n.t("history.filter_label"))
-        lbl.setStyleSheet(
-            "color:#6B6B6B; font-size: 12px; font-weight: 600;")
-        top.addWidget(lbl)
+        top.setSpacing(10)
+        # 지금 있는 메모의 이력과 삭제된 메모의 이력을 나눠 본다.
+        scope = QFrame()
+        scope.setObjectName("Scope")
+        scope.setStyleSheet(_SCOPE_QSS)
+        scope_h = QHBoxLayout(scope)
+        scope_h.setContentsMargins(3, 3, 3, 3)
+        scope_h.setSpacing(2)
+        self._scope = QButtonGroup(self)
+        self._live_btn = QPushButton(i18n.t("history.tab_live"))
+        self._gone_btn = QPushButton(i18n.t("history.tab_deleted"))
+        for i, btn in enumerate((self._live_btn, self._gone_btn)):
+            btn.setCheckable(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFocusPolicy(Qt.TabFocus)
+            self._scope.addButton(btn, i)
+            scope_h.addWidget(btn)
+        self._live_btn.setChecked(True)
+        self._gone_btn.setEnabled(False)
+        self._scope.idClicked.connect(lambda i: self._set_scope(bool(i)))
+        top.addWidget(scope)
         self._note_combo = QComboBox()
         self._note_combo.addItem(i18n.t("history.all"), userData=None)
         self._note_combo.currentIndexChanged.connect(self._refresh_list)
@@ -259,6 +344,8 @@ class HistoryViewer(QDialog):
         right_v.setSpacing(10)
 
         self._header = QLabel(i18n.t("history.select_prompt"))
+        # 고친 사람의 닉네임이 들어간다. 글자 그대로 보인다.
+        self._header.setTextFormat(Qt.PlainText)
         self._header.setStyleSheet(
             "font-size: 16px; font-weight: 700; color: #1F1F1F;")
         right_v.addWidget(self._header)
@@ -275,12 +362,14 @@ class HistoryViewer(QDialog):
         self._color_row.setVisible(False)
         right_v.addWidget(self._color_row)
 
-        section = QLabel(i18n.t("history.section_body"))
-        section.setProperty("role", "sectionHeader")
-        section.setStyleSheet("font-size: 12px; font-weight: 700; color:#1F1F1F; margin-top: 4px;")
-        right_v.addWidget(section)
+        self._section = QLabel(i18n.t("history.section_body"))
+        self._section.setProperty("role", "sectionHeader")
+        self._section.setStyleSheet(
+            "font-size: 12px; font-weight: 700; color:#1F1F1F; margin-top: 4px;")
+        right_v.addWidget(self._section)
 
         self._detail = QTextBrowser()
+        self._detail.setDocument(SafeTextDocument(self._detail))
         self._detail.setOpenExternalLinks(False)
         self._detail.setStyleSheet(
             "QTextBrowser { background:#FAFAFA; border:1px solid #EAEAEA; "
@@ -308,48 +397,97 @@ class HistoryViewer(QDialog):
 
     def set_notes(self, notes: list[dict[str, Any]]) -> None:
         self._notes = {n["id"]: n for n in notes}
-        current_data = self._note_combo.currentData()
-        self._note_combo.blockSignals(True)
-        self._note_combo.clear()
-        self._note_combo.addItem(i18n.t("history.all"), userData=None)
-        for n in notes:
-            preview = html_to_plain(n.get("content") or "").splitlines()[:1]
-            label = preview[0] if preview else i18n.t("history.empty_note")
-            label = label[:40] + ("…" if len(label) > 40 else "")
-            self._note_combo.addItem(label, userData=n["id"])
-        idx = self._note_combo.findData(current_data)
-        if idx < 0:
-            idx = 0
-        self._note_combo.setCurrentIndex(idx)
-        self._note_combo.blockSignals(False)
-        self._refresh_list()
+        self._titles = {n["id"]: _title_of(n.get("content")) for n in notes}
+        self._rebuild()
 
     def set_entries(self, entries: list[dict[str, Any]]) -> None:
-        self._entries = sorted(entries, key=lambda e: e.get("session_end", 0),
-                               reverse=True)
-        self._refresh_list()
+        self._entries = sorted(
+            (e for e in entries if isinstance(e, dict)),
+            key=lambda e: e.get("session_end", 0), reverse=True)
+        self._rebuild()
 
     def append_entry(self, entry: dict[str, Any]) -> None:
         self._entries.insert(0, entry)
+        self._rebuild()
+
+    def select_note(self, note_id: str) -> None:
+        """그 메모의 이력만 보인다(목록의 메모에서 이력을 열었을 때)."""
+        self._set_scope(note_id in self._gone)
+        idx = self._note_combo.findData(note_id)
+        if idx >= 0:
+            self._note_combo.setCurrentIndex(idx)
+
+    def _set_scope(self, gone: bool) -> None:
+        gone = gone and bool(self._gone)
+        self._show_gone = gone
+        (self._gone_btn if gone else self._live_btn).setChecked(True)
+        self._fill_combo(None)
         self._refresh_list()
+
+    def _rebuild(self) -> None:
+        """받은 이력에서 삭제된 메모를 가려내고 화면을 다시 채운다."""
+        gone: dict[str, dict[str, Any]] = {}
+        for e in self._entries:          # 새것부터
+            nid = e.get("note_id")
+            if (not nid or nid in self._notes or nid in gone
+                    or e.get("action") != "delete"):
+                continue
+            content = e.get("content_before")
+            if content is None:
+                content = e.get("content_after")
+            gone[nid] = {"content": content or "",
+                         "color": e.get("color_before") or e.get("color_after")
+                         or ""}
+            if nid not in self._titles:
+                self._titles[nid] = _title_of(content)
+        self._gone = gone
+        self._gone_btn.setEnabled(bool(gone))
+        if self._show_gone and not gone:
+            self._show_gone = False
+        (self._gone_btn if self._show_gone else self._live_btn).setChecked(True)
+        self._fill_combo(self._note_combo.currentData())
+        self._refresh_list()
+
+    def _fill_combo(self, keep: str | None) -> None:
+        ids = list(self._gone) if self._show_gone else list(self._notes)
+        self._note_combo.blockSignals(True)
+        self._note_combo.clear()
+        self._note_combo.addItem(i18n.t("history.all"), userData=None)
+        for nid in ids:
+            self._note_combo.addItem(self._titles.get(nid, ""), userData=nid)
+        idx = self._note_combo.findData(keep) if keep is not None else 0
+        self._note_combo.setCurrentIndex(max(0, idx))
+        self._note_combo.blockSignals(False)
 
     def _current_note_filter(self) -> str | None:
         return self._note_combo.currentData()
 
     def _refresh_list(self) -> None:
+        keep = self._current_entry
         self._list.clear()
         note_id = self._current_note_filter()
         for e in self._entries:
-            if note_id is not None and e.get("note_id") != note_id:
+            nid = e.get("note_id")
+            if (nid in self._gone) != self._show_gone:
+                continue
+            if note_id is not None and nid != note_id:
                 continue
             item = QListWidgetItem()
             item.setData(Qt.UserRole, e)
+            if note_id is None:
+                if nid not in self._titles:
+                    self._titles[nid] = _title_of(
+                        e.get("content_after") or e.get("content_before"))
+                item.setData(_TITLE_ROLE, self._titles[nid])
             self._list.addItem(item)
+            if keep is not None and e is keep:
+                self._list.setCurrentItem(item)
 
     def _on_select(self, current: QListWidgetItem | None, _prev) -> None:
         if current is None:
             self._header.setText(i18n.t("history.select_prompt"))
             self._meta.setText("")
+            self._section.setText(i18n.t("history.section_body"))
             self._color_row.setVisible(False)
             self._detail.clear()
             self._current_entry = None
@@ -367,24 +505,38 @@ class HistoryViewer(QDialog):
             i18n.t("history.meta", start=start, end=end)
         )
         cb, ca = e.get("color_before"), e.get("color_after")
-        if cb != ca and (cb or ca):
+        # 삭제 항목에는 뒤의 색이 없다. 색이 바뀐 것처럼 보이지 않게 한다.
+        if action != "delete" and cb != ca and (cb or ca):
+            # 색 값도 남이 보낸 글자다. 색 꼴일 때만 서식 안에 넣는다.
             self._color_row.setText(
                 i18n.t("history.color_change") + " "
-                f"<span style='display:inline-block; background:{cb or '#ccc'}; "
+                f"<span style='display:inline-block; background:{safe_color(cb)}; "
                 f"padding: 0 10px; border-radius:3px;'>&nbsp;</span> "
                 f"<b>→</b> "
-                f"<span style='display:inline-block; background:{ca or '#ccc'}; "
+                f"<span style='display:inline-block; background:{safe_color(ca)}; "
                 f"padding: 0 10px; border-radius:3px;'>&nbsp;</span>"
             )
             self._color_row.setVisible(True)
         else:
             self._color_row.setVisible(False)
-        self._detail.setHtml(
-            _render_inline_diff(e.get("content_before"), e.get("content_after")))
+        if action == "delete":
+            # 지워질 때의 본문이다. 지운 글 표시 없이 그대로 보인다.
+            self._section.setText(i18n.t("history.section_deleted"))
+            self._detail.setHtml(_render_plain(e.get("content_before")))
+        else:
+            self._section.setText(i18n.t("history.section_body"))
+            self._detail.setHtml(_render_inline_diff(
+                e.get("content_before"), e.get("content_after")))
 
-        # 내용을 알고 메모가 아직 존재할 때만 복원할 수 있다. 서버가 soft-delete
-        # 된 메모의 업데이트를 거부하므로 'delete' 항목은 복원 불가다.
         note_id = e.get("note_id")
+        if note_id in self._gone:
+            # 삭제된 메모는 그 자리에 되돌릴 수 없다(서버가 받지 않는다). 그
+            # 시점의 본문으로 새 메모를 만든다.
+            self._restore_btn.setText(i18n.t("history.btn_revive"))
+            self._restore_btn.setEnabled(self._entry_content(e) is not None)
+            self._restore_btn.setToolTip("")
+            return
+        self._restore_btn.setText(i18n.t("history.btn_restore"))
         can_restore = (
             action != "delete"
             and e.get("content_after") is not None
@@ -394,9 +546,6 @@ class HistoryViewer(QDialog):
         if can_restore:
             self._restore_btn.setToolTip(
                 i18n.t("history.tip_restore"))
-        elif action == "delete":
-            self._restore_btn.setToolTip(
-                i18n.t("history.tip_delete"))
         elif note_id not in self._notes:
             self._restore_btn.setToolTip(
                 i18n.t("history.tip_gone"))
@@ -404,16 +553,35 @@ class HistoryViewer(QDialog):
             self._restore_btn.setToolTip(
                 i18n.t("history.tip_no_content"))
 
+    @staticmethod
+    def _entry_content(e: dict[str, Any]) -> str | None:
+        """그 항목이 가리키는 시점의 본문. 삭제 항목은 지워지기 직전의 본문이다."""
+        if e.get("action") == "delete":
+            return e.get("content_before")
+        return e.get("content_after")
+
     def _on_restore_clicked(self) -> None:
         e = self._current_entry
         if e is None:
             return
         note_id = e.get("note_id")
+        when = _fmt_ts(e.get("session_end", 0))
+        user = e.get("user") or ""
+        if note_id in self._gone:
+            content = self._entry_content(e)
+            if content is None:
+                return
+            if confirm.ask(
+                    self, i18n.t("history.revive_title"),
+                    i18n.t("history.revive_body", when=when, user=user),
+                    action=i18n.t("history.revive_action")):
+                color = (e.get("color_after") or e.get("color_before")
+                         or self._gone[note_id].get("color") or "")
+                self.reviveRequested.emit(content, str(color))
+            return
         content = e.get("content_after")
         if not note_id or content is None:
             return
-        when = _fmt_ts(e.get("session_end", 0))
-        user = e.get("user") or ""
         if not confirm.ask(
                 self, i18n.t("history.confirm_title"),
                 i18n.t("history.confirm_body", when=when, user=user),

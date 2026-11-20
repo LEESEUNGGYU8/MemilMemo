@@ -2,12 +2,14 @@ import os
 import sys
 from pathlib import Path
 
+from . import packaging
+
 # 내부 식별자. 데이터 폴더(%APPDATA%\SyncNotes)와 자동 실행 값 이름의 원천이라
 # 바꾸면 기존 메모가 보이지 않는다. 화면에 보이는 이름은 i18n 의 "app.name"(메밀메모).
 APP_NAME = "SyncNotes"
 # 앱 버전의 단일 출처. 자동 업데이트가 이 값을 GitHub 릴리스 태그와 비교한다.
 # 메밀메모로 이름을 바꾸면서 1.0.0 부터 다시 센다(SyncNotes 는 1.0.7 까지였다).
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
 # 포크해서 다른 곳에 배포하려면 이 두 값만 바꾼다.
 UPDATE_REPO_OWNER = "LEESEUNGGYU8"
@@ -112,9 +114,26 @@ def isolated_run() -> bool:
     return norm(env) != norm(real)
 
 
-def app_data_dir() -> Path:
+# 스토어판이 메모를 두는 폴더(사용자 폴더 바로 아래). 패키지 앱이 AppData 에
+# 새로 만드는 파일은 앱 전용 자리로 돌려져 앱을 제거할 때 지워진다. 메모는
+# 제거해도 남아야 하므로 AppData 밖에 둔다.
+PACKAGED_DATA_FOLDER = "MemilMemo"
+
+
+def classic_data_dir() -> Path:
+    """설치판의 데이터 폴더. 폴더를 만들지 않는다."""
     base = os.environ.get("APPDATA") or str(Path.home() / ".config")
-    path = Path(base) / APP_NAME
+    return Path(base) / APP_NAME
+
+
+def packaged_data_dir() -> Path:
+    """스토어판의 데이터 폴더. 폴더를 만들지 않는다."""
+    base = os.environ.get("USERPROFILE") or str(Path.home())
+    return Path(base) / PACKAGED_DATA_FOLDER
+
+
+def app_data_dir() -> Path:
+    path = packaged_data_dir() if packaging.is_packaged() else classic_data_dir()
     path.mkdir(parents=True, exist_ok=True)
     return path
 

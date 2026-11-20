@@ -16,12 +16,18 @@ class NoteLocalState:
     hidden: bool = False
     w: int = 0   # 0 이면 서버에 저장된 기본 크기를 쓴다.
     h: int = 0
-    # 쪽지로 접어 둔 상태와, 붙여 둔 화면 가장자리("left"/"right")·세로 자리.
+    # 쪽지로 접어 둔 상태와, 붙여 둔 화면 벽("left"·"right"·"top"·"bottom"),
+    # 벽을 따라 잰 탭의 자리(좌우 벽은 y, 위아래 벽은 x).
     folded: bool = False
     dock: str = ""
     dock_y: int = 0
     # 이 메모를 접었을 때의 모양("slip"·"icon"). 비어 있으면 설정의 기본 모양.
     fold_style: str = ""
+    # 접힌 메모를 끌어다 둔 자리. x·y(펼친 자리)와 따로 기억해, 접으면 이리로
+    # 가고 펴면 펼쳐 있던 자리로 돌아간다. fold_at 이 거짓이면 둔 자리가 없다.
+    fold_x: int = 0
+    fold_y: int = 0
+    fold_at: bool = False
 
 
 @dataclass
@@ -37,8 +43,17 @@ class FolderIconState:
 # 만나면 파일 전체를 버리고 빈 상태로 시작하므로(닉네임·위치가 함께 사라진다),
 # 뒤에 생긴 값은 옛 버전이 읽지 않는 별도 키("note_folds")에 둔다.
 _NOTE_BASE_KEYS = ("x", "y", "hidden", "w", "h")
-_NOTE_FOLD_KEYS = ("folded", "dock", "dock_y", "fold_style")
+_NOTE_FOLD_KEYS = ("folded", "dock", "dock_y", "fold_style",
+                   "fold_x", "fold_y", "fold_at")
 _NOTE_FIELDS = {f.name for f in fields(NoteLocalState)}
+_DOCK_SIDES = ("left", "right", "top", "bottom")
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _note_from_raw(payload: Any, fold: Any) -> NoteLocalState:
@@ -50,15 +65,20 @@ def _note_from_raw(payload: Any, fold: Any) -> NoteLocalState:
     if isinstance(fold, dict):
         data.update({k: v for k, v in fold.items() if k in _NOTE_FOLD_KEYS})
     state = NoteLocalState(**data)
-    if state.dock not in ("left", "right"):
+    if state.dock not in _DOCK_SIDES:
         state.dock = ""
     state.folded = bool(state.folded)
     if state.fold_style not in ("slip", "icon"):
         state.fold_style = ""
-    try:
-        state.dock_y = int(state.dock_y)
-    except (TypeError, ValueError):
-        state.dock_y = 0
+    state.dock_y = _as_int(state.dock_y)
+    state.fold_x = _as_int(state.fold_x)
+    state.fold_y = _as_int(state.fold_y)
+    state.fold_at = bool(state.fold_at)
+    if (isinstance(fold, dict) and "fold_at" not in fold
+            and state.folded and not state.dock):
+        # 접힌 자리를 따로 적지 않던 버전(1.0.1 이하)은 쪽지를 둔 자리를 x·y 에
+        # 적었다. 그 자리를 접힌 자리로 삼아, 펴고 접어도 쪽지가 옮겨 가지 않게 한다.
+        state.fold_x, state.fold_y, state.fold_at = state.x, state.y, True
     return state
 
 
@@ -111,6 +131,8 @@ class LocalState:
         hidden: bool | None = None, w: int | None = None, h: int | None = None,
         folded: bool | None = None, dock: str | None = None,
         dock_y: int | None = None, fold_style: str | None = None,
+        fold_x: int | None = None, fold_y: int | None = None,
+        fold_at: bool | None = None,
     ) -> NoteLocalState:
         state = self.get_note_state(note_id)
         if fold_style is not None:
@@ -118,9 +140,15 @@ class LocalState:
         if folded is not None:
             state.folded = bool(folded)
         if dock is not None:
-            state.dock = dock if dock in ("left", "right") else ""
+            state.dock = dock if dock in _DOCK_SIDES else ""
         if dock_y is not None:
             state.dock_y = int(dock_y)
+        if fold_x is not None:
+            state.fold_x = int(fold_x)
+        if fold_y is not None:
+            state.fold_y = int(fold_y)
+        if fold_at is not None:
+            state.fold_at = bool(fold_at)
         if x is not None:
             state.x = x
         if y is not None:
@@ -224,7 +252,7 @@ class LocalStateStore:
             "note_folds": {
                 nid: {k: getattr(v, k) for k in _NOTE_FOLD_KEYS}
                 for nid, v in self.state.notes.items()
-                if v.folded or v.dock or v.fold_style
+                if v.folded or v.dock or v.fold_style or v.fold_at
             },
             "folder_icons": {
                 fid: asdict(v) for fid, v in self.state.folder_icons.items()
