@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Callable
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QCoreApplication, QEvent, QObject, QTimer, Signal
 from PySide6.QtNetwork import QHostAddress, QTcpServer, QTcpSocket
 
 from .. import html_guard
 
 from .. import config
+from ..share_auth import ShareAuth, guest_proof, host_proof, new_nonce, same, valid_nonce
 from ..database import SqliteRepository
 from ..models import Folder, Note, now_ms
 from ..protocol import (
@@ -16,6 +18,9 @@ from ..protocol import (
     MAX_FRAME_BEFORE_HELLO,
     MAX_FRAME_FROM_GUEST,
     MSG_ACQUIRE_LOCK,
+    MSG_AUTH,
+    MSG_AUTH_FAILED,
+    MSG_AUTH_REQUIRED,
     MSG_CREATE_FOLDER,
     MSG_CREATE_NOTE,
     MSG_DELETE_FOLDER,
@@ -57,7 +62,26 @@ class _Session:
     parser: FrameParser
     nickname: str = ""
     hello_received: bool = False
+    # 이 접속이 받아 쥐고 있는 잠금. 잠금은 닉네임으로 적히지만 같은 닉네임의
+    # 접속이 둘일 수 있다(한 사람의 PC 두 대, 다시 붙었는데 공유 PC 는 아직 옛
+    # 접속이 죽은 줄 모르는 동안). 한쪽이 끊길 때 다른 쪽의 잠금까지 풀지 않는다.
+    held: set[str] = field(default_factory=set)
+    # 암호가 걸린 공유에 들어오려는 접속: 인사한 이름, 이번에 낸 값(nonce), 틀린 횟수.
+    pending_nick: str = ""
+    challenge: str = ""
+    auth_tries: int = 0
 
+
+# 암호를 한 접속에서 이만큼 틀리면 끊는다. 한 주소에서 잇달아 이만큼 틀리면
+# 잠깐 받지 않는다(틀릴수록 길어진다). 암호를 하나씩 넣어 보는 것을 늦춘다.
+AUTH_TRIES_PER_CONNECTION = 5
+AUTH_FAILS_BEFORE_WAIT = 5
+AUTH_WAIT_SECONDS = 30
+AUTH_WAIT_MAX_SECONDS = 600
+
+# 답을 이만큼 보내지 못하고 쌓아 둔 상대의 이력 요청은 받지 않는다. 이력은
+# 통째로 보내므로, 요청만 되풀이해도 공유 PC 의 메모리가 답으로 찬다.
+MAX_QUEUED_REPLY = 8 * 1024 * 1024
 
 LocalSubscriber = Callable[[str, dict], None]
 
@@ -77,6 +101,7 @@ class HostServer(QObject):
         host_nickname: str,
         heartbeat_ms: int = config.DEFAULT_HEARTBEAT_MS,
         parent: QObject | None = None,
+        auth: ShareAuth | None = None,
     ) -> None:
         super().__init__(parent)
         self.repo = repo
@@ -84,6 +109,12 @@ class HostServer(QObject):
         self.history = history_tracker
         self.host_nickname = host_nickname
         self.heartbeat_ms = heartbeat_ms
+        # 공유에 건 암호. None 이면 누구나 들어온다.
+        self.auth = auth
+        # 암호를 모르는 옛 버전이 붙었을 때 보여 줄 글(그쪽 화면에 그대로 나온다).
+        self.old_version_message = "password required. update the app."
+        # 암호를 틀린 주소 → (잇달아 틀린 횟수, 다시 받기 시작하는 때).
+        self._auth_fails: dict[str, tuple[int, float]] = {}
 
         self._server = QTcpServer(self)
         self._server.newConnection.connect(self._on_new_connection)
@@ -112,6 +143,9 @@ class HostServer(QObject):
         for sock in list(self._sessions):
             sock.disconnectFromHost()
             sock.deleteLater()
+            # 미뤄 두지 않고 지금 지운다. 지우기를 미뤄 둔 채 이 서버가 먼저
+            # 사라지면(끝나는 길에는 순서를 알 수 없다) 뒤늦게 지워지다 죽는다.
+            QCoreApplication.sendPostedEvents(sock, QEvent.DeferredDelete)
         self._sessions.clear()
         self._server.close()
         self.serverStopped.emit()
@@ -154,18 +188,67 @@ class HostServer(QObject):
             sock.abort()
 
     def _on_disconnected(self, sock: QTcpSocket) -> None:
+        if sock in self._sessions:
+            # 끊기기 직전에 보낸 것이 아직 남아 있으면 마저 처리한다(끝내면서
+            # 보낸 마지막 저장과 잠금 반납).
+            try:
+                if sock.bytesAvailable() > 0:
+                    self._on_ready_read(sock)
+            except Exception:
+                pass
         session = self._sessions.pop(sock, None)
         if session is None:
             return
-        if session.nickname:
-            released = self.locks.release_all_by(session.nickname)
+        nick = session.nickname
+        if nick:
+            # 같은 닉네임의 접속이 남아 있으면 이 접속이 받은 잠금만 푼다. 남은
+            # 쪽이 쓰고 있는 메모의 잠금까지 풀면 그 편집이 도중에 끊긴다.
+            twin = self._has_session(nick)
+            if twin:
+                released = [nid for nid in session.held
+                            if self.locks.release(nid, nick)]
+            else:
+                released = self.locks.release_all_by(nick)
             for nid in released:
-                self.history.cancel_session(nid, session.nickname)
+                self._forget_held(nid)
+                self._close_edit(nid, nick)
                 # 나만 보는 메모의 잠금이 풀린 것은 그 메모를 보는 사람에게만 알린다.
                 self._broadcast_for_note(
                     nid, make(MSG_LOCK_RELEASED, note_id=nid))
-            self._broadcast(make(MSG_USER_LEFT, nickname=session.nickname))
+            if not twin:
+                self._broadcast(make(MSG_USER_LEFT, nickname=nick))
         sock.deleteLater()
+
+    def _has_session(self, nickname: str) -> bool:
+        """이 닉네임으로 붙어 있는 접속이 있는가(공유 PC 자신도 센다)."""
+        if self._local is not None and self._local.nickname == nickname:
+            return True
+        return any(s.hello_received and s.nickname == nickname
+                   for s in self._sessions.values())
+
+    def _forget_held(self, note_id: str) -> None:
+        for s in self._sessions.values():
+            s.held.discard(note_id)
+        if self._local is not None:
+            self._local.held.discard(note_id)
+
+    def _close_edit(self, note_id: str, nickname: str, *,
+                    reopen: bool = False) -> None:
+        """잠금이 끝나기 전에 저장된 글을 이력에 남긴다(쓰던 사람이 끊겼거나
+        오래 손대지 않아 잠금을 거둘 때). 그냥 버리면 그 편집이 이력에 없다.
+
+        ``reopen`` 이면 그 사람의 편집을 지금 글에서 다시 시작해 둔다. 잠금을
+        거둔 줄 모르고 계속 쓰는 옛 버전의 글도 끝낼 때 이력에 남는다."""
+        note = self.repo.get_note(note_id)
+        if note is None or not nickname:
+            self.history.cancel_session(note_id, nickname)
+            return
+        entry = self.history.end_session(note, nickname)
+        if entry is not None:
+            self._broadcast_for_note(
+                note_id, make(MSG_HISTORY_APPENDED, entry=entry.to_dict()))
+        if reopen and not note.deleted:
+            self.history.begin_session(note, nickname)
 
     def _send_to(self, session: _Session, msg: Message) -> None:
         if session.socket is None:
@@ -297,7 +380,8 @@ class HostServer(QObject):
         users = [s.nickname for s in self._sessions.values() if s.hello_received]
         if self._local:
             users.append(self._local.nickname)
-        return users
+        # 같은 닉네임의 접속이 둘이어도 한 사람이다.
+        return list(dict.fromkeys(users))
 
     def _handle(self, session: _Session, msg: Message) -> None:
         t = msg.type
@@ -307,7 +391,10 @@ class HostServer(QObject):
                 # 인사는 접속마다 한 번이다. 되풀이할 때마다 메모 전체를 다시
                 # 보내 주면 그것만으로 공유 PC 의 메모리를 채울 수 있다.
                 return
-            self._handle_hello(session, d.get("nickname", "anon"))
+            self._handle_hello(session, d.get("nickname", "anon"), d)
+        elif (t == MSG_AUTH and not session.hello_received
+              and session is not self._local):
+            self._handle_auth(session, d)
         elif not session.hello_received and session is not self._local:
             self._send_to(session, make(MSG_ERROR, message="hello required first"))
         elif t == MSG_ACQUIRE_LOCK:
@@ -335,17 +422,115 @@ class HostServer(QObject):
         elif t == MSG_GET_HISTORY:
             self._handle_get_history(session, d.get("note_id"))
 
-    def _handle_hello(self, session: _Session, nickname: str) -> None:
+    def _handle_hello(self, session: _Session, nickname: str,
+                      d: dict | None = None) -> None:
         if not isinstance(nickname, str) or not nickname:
             nickname = "anon"
+        if (session.socket is not None
+                and len(nickname) > config.MAX_NICKNAME_LENGTH):
+            # 이 이름은 모든 참가자에게 알려지고 각 PC 에 적힌다.
+            self._send_to(session, make(MSG_ERROR, message="nickname too long"))
+            session.socket.disconnectFromHost()
+            return
+        if self.auth is not None and session.socket is not None:
+            self._ask_for_proof(session, nickname, d or {})
+            return
+        self._admit(session, nickname)
+
+    def _admit(self, session: _Session, nickname: str, proof: str = "") -> None:
         session.nickname = nickname
         session.hello_received = True
         session.parser.max_frame = MAX_FRAME_FROM_GUEST
-        self._send_welcome(session)
+        self._send_welcome(session, proof)
         self._broadcast(make(MSG_USER_JOINED, nickname=session.nickname),
                         exclude=session)
 
-    def _send_welcome(self, session: _Session) -> None:
+    # ── 참여 암호 ──
+
+    def _ask_for_proof(self, session: _Session, nickname: str, d: dict) -> None:
+        """암호가 걸린 공유다. 메모를 보내기 전에 암호를 아는지 묻는다."""
+        if session.challenge:
+            return                      # 이미 물었다. 인사는 접속마다 한 번이다
+        if not d.get("auth"):
+            # 암호를 모르는 옛 버전이다. 그쪽 화면에 까닭을 띄우고 끊는다(붙여
+            # 두면 그 PC 는 연결된 줄 알고 메모를 고치려 든다).
+            self._send_to(session, make(MSG_ERROR, message=self.old_version_message))
+            session.socket.disconnectFromHost()
+            return
+        wait = self._auth_wait(session)
+        if wait:
+            self._send_to(session, make(MSG_AUTH_FAILED, left=0, wait=wait))
+            session.socket.disconnectFromHost()
+            return
+        session.pending_nick = nickname
+        session.challenge = new_nonce()
+        self._send_to(session, make(MSG_AUTH_REQUIRED, **self._challenge(session)))
+
+    def _challenge(self, session: _Session) -> dict:
+        return {"salt": self.auth.salt.hex(), "iterations": self.auth.iterations,
+                "nonce": session.challenge}
+
+    def _handle_auth(self, session: _Session, d: dict) -> None:
+        if self.auth is None or not session.challenge:
+            return
+        guest_nonce = d.get("nonce")
+        ok = valid_nonce(guest_nonce) and same(
+            d.get("proof"),
+            guest_proof(self.auth.key, session.challenge, guest_nonce,
+                        session.pending_nick))
+        if not ok:
+            session.auth_tries += 1
+            wait = self._count_auth_failure(session)
+            left = max(0, AUTH_TRIES_PER_CONNECTION - session.auth_tries)
+            if wait or not left:
+                self._send_to(session, make(MSG_AUTH_FAILED, left=0, wait=wait))
+                session.socket.disconnectFromHost()
+                return
+            # 같은 값으로 다시 증명하지 못하게 새 값을 낸다.
+            session.challenge = new_nonce()
+            self._send_to(session, make(MSG_AUTH_FAILED, left=left,
+                                        **self._challenge(session)))
+            return
+        self._auth_fails.pop(self._peer(session), None)
+        host_nonce, session.challenge = session.challenge, ""
+        self._admit(session, session.pending_nick,
+                    proof=host_proof(self.auth.key, host_nonce, guest_nonce))
+
+    @staticmethod
+    def _peer(session: _Session) -> str:
+        try:
+            return str(session.socket.peerAddress().toString())
+        except Exception:
+            return ""
+
+    def _auth_wait(self, session: _Session) -> int:
+        """이 주소가 암호를 너무 틀려 기다려야 하는 초. 받아도 되면 0."""
+        _count, until = self._auth_fails.get(self._peer(session), (0, 0.0))
+        return max(0, int(until - time.monotonic() + 0.999))
+
+    def _count_auth_failure(self, session: _Session) -> int:
+        now = time.monotonic()
+        # 오래된 기록은 버린다(주소를 바꿔 가며 틀려도 표가 끝없이 자라지 않게).
+        for peer, (_n, until) in list(self._auth_fails.items()):
+            if until + 3600 < now and len(self._auth_fails) > 256:
+                del self._auth_fails[peer]
+        peer = self._peer(session)
+        count = self._auth_fails.get(peer, (0, 0.0))[0] + 1
+        wait = 0
+        if count % AUTH_FAILS_BEFORE_WAIT == 0:
+            wait = min(AUTH_WAIT_SECONDS * 2 ** (count // AUTH_FAILS_BEFORE_WAIT - 1),
+                       AUTH_WAIT_MAX_SECONDS)
+        self._auth_fails[peer] = (count, now + wait)
+        return wait
+
+    def beacon(self, port: int) -> dict:
+        """내부망에서 공유 PC 를 찾는 신호에 답할 내용(app/network/discovery.py)."""
+        return {"host": self.host_nickname, "port": int(port),
+                "host_id": self.repo.host_id(),
+                "took_over_from": self.repo.took_over_from(),
+                "locked": self.auth is not None, "ver": config.APP_VERSION}
+
+    def _send_welcome(self, session: _Session, proof: str = "") -> None:
         """그 참가자가 볼 수 있는 메모와 폴더를 처음 상태로 보낸다."""
         notes = [n.to_dict() for n in self._visible_notes_for(session.nickname)]
         folders = [f.to_dict()
@@ -364,6 +549,9 @@ class HostServer(QObject):
             host=self.host_nickname,
             # 메모 묶음의 식별값. 참여한 PC 가 가진 사본이 이 묶음의 것인지 가린다.
             host_id=self.repo.host_id(),
+            # 암호가 걸린 공유인가, 그리고 이 공유 PC 도 암호를 안다는 증명.
+            locked=self.auth is not None,
+            **({"auth": proof} if proof else {}),
         ))
 
     def resync_all(self) -> None:
@@ -374,9 +562,11 @@ class HostServer(QObject):
         self.locks.clear()
         self.history.clear()
         for s in list(self._sessions.values()):
+            s.held.clear()
             if s.hello_received:
                 self._send_welcome(s)
         if self._local is not None:
+            self._local.held.clear()
             self._send_welcome(self._local)
 
     def _handle_acquire(self, session: _Session, note_id: str) -> None:
@@ -393,6 +583,9 @@ class HostServer(QObject):
             return
         granted, holder = self.locks.acquire(note_id, session.nickname)
         if granted:
+            # 같은 닉네임의 다른 접속이 쥐고 있었다면 이제 이 접속의 것이다.
+            self._forget_held(note_id)
+            session.held.add(note_id)
             self.history.begin_session(note, session.nickname)
             self._send_to(session, make(MSG_LOCK_GRANTED, note_id=note_id))
             self._broadcast_for_note(
@@ -413,6 +606,7 @@ class HostServer(QObject):
                     note_id,
                     make(MSG_HISTORY_APPENDED, entry=entry.to_dict()))
         if self.locks.release(note_id, session.nickname):
+            self._forget_held(note_id)
             self._broadcast_for_note(
                 note_id, make(MSG_LOCK_RELEASED, note_id=note_id))
 
@@ -503,6 +697,7 @@ class HostServer(QObject):
         entry = self.history.record_delete(existing, session.nickname)
         self.repo.soft_delete_note(note_id, session.nickname)
         self.locks.release(note_id, session.nickname)
+        self._forget_held(note_id)
         self._broadcast_for_owner(
             make(MSG_NOTE_DELETED, id=note_id), private_owner=owner)
         self._broadcast_for_owner(
@@ -528,6 +723,13 @@ class HostServer(QObject):
             self._send_to(session, make(MSG_ERROR,
                 message="cannot move into another user's private folder"))
             return
+        # 옮긴 뒤 누가 보게 되는가. 달라지는데 다른 사람이 편집 중이면 거절한다
+        # (그 사람의 창이 쓰던 글과 함께 닫힌다).
+        next_owner = existing.private_owner or (
+            target_folder.private_owner if target_folder else None)
+        if next_owner != owner and self._locked_by_other(note_id, session):
+            self._send_back(session, existing)
+            return
         updated = self.repo.set_note_folder(
             note_id, folder_id, session.nickname)
         if updated is None:
@@ -548,6 +750,9 @@ class HostServer(QObject):
         if owner and owner != session.nickname:
             self._send_to(session, make(MSG_ERROR, message="not allowed"))
             return
+        if self._locked_by_other(note_id, session):
+            self._send_back(session, existing)
+            return
         new_owner_value = session.nickname if private else None
         updated = self.repo.set_note_private_owner(
             note_id, new_owner_value, session.nickname)
@@ -557,6 +762,20 @@ class HostServer(QObject):
         self._propagate_audience_change(
             note_id, updated.to_dict(),
             prev_owner=owner, new_owner=new_effective, actor=session.nickname)
+
+    def _locked_by_other(self, note_id: str, session: _Session) -> bool:
+        """다른 사람이 편집 중인 메모인가. 그렇다면 요청한 쪽에 까닭을 알린다."""
+        holder = self.locks.holder(note_id)
+        if not holder or holder == session.nickname:
+            return False
+        self._send_to(session, make(MSG_ERROR,
+                                    message=f"note locked by {holder}"))
+        return True
+
+    def _send_back(self, session: _Session, note: Note) -> None:
+        """청한 일을 거절했다. 청한 쪽은 화면을 먼저 바꿔 놓았으므로(나만 보기
+        표시, 폴더) 지금 상태를 보내 되돌리게 한다."""
+        self._send_to(session, make(MSG_NOTE_UPDATED, note=note.to_dict()))
 
     def _handle_folder_create(self, session: _Session, d: dict) -> None:
         private_owner = session.nickname if d.get("private") else None
@@ -591,6 +810,19 @@ class HostServer(QObject):
         if "private" in d:
             kwargs["private_owner"] = (
                 session.nickname if d["private"] else None)
+            if kwargs["private_owner"] != existing.private_owner:
+                # 폴더를 나만 보기로 바꾸면 그 안의 메모가 남에게서 사라진다.
+                # 그 가운데 다른 사람이 편집 중인 것이 있으면 거절한다.
+                for note in self.repo.list_notes_in_folder(folder_id):
+                    if self._locked_by_other(note.id, session):
+                        # 청한 쪽이 먼저 바꿔 놓은 폴더 표시를 되돌리게 한다.
+                        self._send_to(session, make(
+                            MSG_FOLDER_UPDATED, folder=existing.to_dict()))
+                        return
+                if existing.private_owner:
+                    # 공개로 바꾼다. 이 폴더에서 지운 메모는 계속 주인만 본다.
+                    self.repo.keep_deleted_notes_private(
+                        folder_id, existing.private_owner)
         updated = self.repo.update_folder(folder_id, **kwargs)
         if updated is None:
             return
@@ -602,22 +834,26 @@ class HostServer(QObject):
                 make(MSG_FOLDER_UPDATED, folder=updated.to_dict()),
                 private_owner=next_owner)
         else:
-            self._broadcast_for_owner(
-                make(MSG_FOLDER_DELETED, id=folder_id),
-                private_owner=prev_owner)
-            self._broadcast_for_owner(
-                make(MSG_FOLDER_CREATED, folder=updated.to_dict()),
-                private_owner=next_owner)
+            # 계속 보는 사람(폴더의 주인)에게는 고친 것으로 알리고, 보게 되거나
+            # 못 보게 되는 사람에게만 만들기와 지우기를 보낸다. 주인에게도
+            # 지웠다 다시 만들어 보내면 그 PC 에서 폴더와 메모의 자리, 크기,
+            # 접힘이 모두 처음으로 돌아간다.
+            keeper = prev_owner or next_owner
+            self._send_to_nickname(
+                keeper, make(MSG_FOLDER_UPDATED, folder=updated.to_dict()))
+            self._broadcast_to_all_except_nickname(
+                make(MSG_FOLDER_DELETED if next_owner else MSG_FOLDER_CREATED,
+                     **({"id": folder_id} if next_owner
+                        else {"folder": updated.to_dict()})),
+                except_nickname=keeper)
             for note in self.repo.list_notes_in_folder(folder_id):
-                eff = self._effective_owner_for_note(note)
-                self._broadcast_for_owner(
-                    make(MSG_NOTE_DELETED, id=note.id),
-                    private_owner=prev_owner)
-                # 나만 보던 폴더를 공개로 바꾸면 그 안의 메모도 공개된다.
-                created = (self._shared_note(note.to_dict(), session.nickname)
-                           if prev_owner is not None and eff is None
-                           else make(MSG_NOTE_CREATED, note=note.to_dict()))
-                self._broadcast_for_owner(created, private_owner=eff)
+                # 폴더에 기대어 보이던 메모만 보는 사람이 바뀐다. 제 주인이 따로
+                # 적힌 메모는 그대로다.
+                self._propagate_audience_change(
+                    note.id, note.to_dict(),
+                    prev_owner=note.private_owner or prev_owner,
+                    new_owner=self._effective_owner_for_note(note),
+                    actor=session.nickname)
 
     def _handle_folder_delete(self, session: _Session,
                                folder_id: str) -> None:
@@ -638,6 +874,8 @@ class HostServer(QObject):
                 if not note.private_owner:
                     self.repo.set_note_private_owner(
                         note.id, prev_owner, session.nickname)
+            # 이 폴더에서 이미 지운 메모도 같다(지운 글이 이력에 남아 있다).
+            self.repo.keep_deleted_notes_private(folder_id, prev_owner)
         deleted_folder = self.repo.soft_delete_folder(folder_id)
         if deleted_folder is None:
             return
@@ -664,6 +902,9 @@ class HostServer(QObject):
                 self._broadcast_for_owner(created, private_owner=new_eff)
 
     def _handle_get_history(self, session: _Session, note_id: str | None) -> None:
+        if (session.socket is not None
+                and session.socket.bytesToWrite() > MAX_QUEUED_REPLY):
+            return      # 앞서 보낸 답도 아직 받아 가지 않았다
         visible_ids = {n.id
                        for n in self._visible_notes_for(session.nickname)}
         # soft-delete 된 메모도 포함하지 않으면 그 삭제 이력이 사라진다.
@@ -683,6 +924,10 @@ class HostServer(QObject):
         self._broadcast(make(MSG_PING, ts=now_ms()))
 
     def _on_idle_reap(self) -> None:
+        holders = self.locks.snapshot()
         for nid in self.locks.reap_idle():
-            # 편집 세션은 정리하지 않고 남겨 둔다. 다음 acquire 의 begin_session 이 덮어쓴다.
+            self._forget_held(nid)
+            # 거두기 전에 저장된 글은 이력에 남긴다. 그냥 두면 같은 사람이 잠금을
+            # 다시 받을 때 그 편집의 시작점이 지금 글로 바뀌어 이력에서 빠진다.
+            self._close_edit(nid, holders.get(nid, ""), reopen=True)
             self._broadcast_for_note(nid, make(MSG_LOCK_RELEASED, note_id=nid))

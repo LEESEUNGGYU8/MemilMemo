@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from .. import config, i18n
 from ..local_state import UserRecord
+from .icons import svg_icon
 from .theme import RoundedScrollBar
 
 # 사람 표시에 쓰는 색. 어두운 메모 색과 흰색은 글자가 묻혀 뺀다.
@@ -167,6 +168,13 @@ class _SessionHeader(QFrame):
         caption.setStyleSheet(
             "color: #6B7280; font-size: 11px; font-weight: 700;")
         top.addWidget(caption, 0, Qt.AlignVCenter)
+        # 비밀번호가 걸린 공유면 자물쇠를 보인다(공유 PC 가 걸려 있는지 확인하는 곳).
+        self._lock = QLabel()
+        self._lock.setPixmap(svg_icon("lock", 13, "#6B7280").pixmap(13, 13))
+        self._lock.setToolTip(i18n.t("sessions.locked"))
+        self._lock.setAccessibleName(i18n.t("sessions.locked"))
+        self._lock.hide()
+        top.addWidget(self._lock, 0, Qt.AlignVCenter)
         top.addStretch(1)
         self._count_pill = QLabel("")
         self._count_pill.setStyleSheet(
@@ -213,7 +221,8 @@ class _SessionHeader(QFrame):
             lambda: self._copy_btn.setText(i18n.t("sessions.btn_copy_address")))
 
     def update_text(self, *, host: str, online_count: int,
-                    peer_address: str) -> None:
+                    peer_address: str, locked: bool = False) -> None:
+        self._lock.setVisible(locked)
         self._host_name.setText(host or i18n.t("sessions.host_unknown"))
         self._count_pill.setText(
             i18n.t("sessions.count_online", online=online_count))
@@ -293,6 +302,7 @@ class SessionsDialog(QDialog):
         connected: bool,
         heartbeat_ms: int = 0,
         peer_address: str = "",
+        locked: bool = False,
     ) -> None:
         all_nicks: set[str] = set(online) | set(records.keys())
         if host:
@@ -325,6 +335,7 @@ class SessionsDialog(QDialog):
             host=host,
             online_count=len(online_nicks),
             peer_address=peer_address,
+            locked=locked,
         )
 
         self._clear_content()

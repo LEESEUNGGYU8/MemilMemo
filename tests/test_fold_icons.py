@@ -21,6 +21,13 @@ from app.ui.folder_icon import FolderIconWidget  # noqa: E402
 from app.ui.sticky_note import StickyNoteWidget  # noqa: E402
 
 SCREEN = QRect(0, 0, 1600, 900)
+# 바탕화면을 읽지 않는 시험에서는 기본 격자(100% 배율의 기본 아이콘 크기)를 쓴다.
+CELL = nf.ICON_CELL_DEFAULT
+
+
+def _on_grid(pos: QPoint, area: QRect) -> bool:
+    grid = nf.icon_grid(area)
+    return grid.pos_of(*grid.cell_at(pos)) == pos
 
 
 @pytest.fixture(scope="module")
@@ -58,9 +65,8 @@ def _dclick(w, pos: QPoint) -> None:
 # ── 격자 자리 ───────────────────────────────────────────────────────────
 
 def test_snap_icon_pos_uses_grid_and_avoids_taken_cells():
-    gw, gh = nf.ICON_GRID.width(), nf.ICON_GRID.height()
-    origin = QPoint(SCREEN.left() + nf.ICON_GRID_ORIGIN.x(),
-                    SCREEN.top() + nf.ICON_GRID_ORIGIN.y())
+    gw, gh = CELL.width(), CELL.height()
+    origin = nf.icon_grid(SCREEN).pos_of(0, 0)
     got = nf.snap_icon_pos(QPoint(origin.x() + gw * 2 + 20,
                                   origin.y() + gh + 30), SCREEN, [])
     assert got == QPoint(origin.x() + gw * 2, origin.y() + gh)
@@ -72,14 +78,14 @@ def test_snap_icon_pos_uses_grid_and_avoids_taken_cells():
     assert (other.y() - origin.y()) % gh == 0
     # 화면 밖에 놓아도 화면 안 칸으로 들어온다.
     far = nf.snap_icon_pos(QPoint(99999, -500), SCREEN, [])
-    assert SCREEN.contains(QRect(far, nf.ICON_SIZE))
+    assert SCREEN.contains(QRect(far, CELL))
 
 
 def test_icon_faces_paint_and_keep_cell_hittable(qapp):
-    img = QImage(nf.ICON_SIZE, QImage.Format_ARGB32_Premultiplied)
+    img = QImage(CELL, QImage.Format_ARGB32_Premultiplied)
     img.fill(Qt.transparent)
     p = QPainter(img)
-    cell = QRectF(0, 0, nf.ICON_SIZE.width(), nf.ICON_SIZE.height())
+    cell = QRectF(0, 0, CELL.width(), CELL.height())
     nf.paint_icon(p, cell, "#FFE066", "주간 회의 메모", font=qapp.font())
     p.end()
     glyph = nf.icon_glyph_rect(cell).center().toPoint()
@@ -110,7 +116,7 @@ def test_icon_faces_paint_and_keep_cell_hittable(qapp):
 def test_fold_frames_end_as_icon(qapp):
     pix = QPixmap(280, 260)
     pix.fill(QColor("#FFE066"))
-    frames = nf.FoldFrames(pix, nf.ICON_SIZE, color="#FFE066", title="메모",
+    frames = nf.FoldFrames(pix, CELL, color="#FFE066", title="메모",
                            font=qapp.font(), style=nf.FOLD_ICON)
     want = QImage(280, 260, QImage.Format_ARGB32_Premultiplied)
     want.fill(Qt.transparent)
@@ -144,9 +150,14 @@ def test_icon_style_folds_to_icon_and_opens_on_double_click(qapp):
     events: list[tuple] = []
     w.foldChanged.connect(lambda *a: events.append(a))
     open_geo = QRect(w.geometry())
+    avail = QGuiApplication.primaryScreen().availableGeometry()
     w.fold()
     assert w.is_folded() and w.fold_style() == nf.FOLD_ICON
-    assert w.geometry() == QRect(open_geo.topLeft(), nf.ICON_SIZE)
+    # 아이콘은 펼쳐 있던 곳에서 가장 가까운 칸에 놓인다.
+    spot = nf.snap_icon_pos(open_geo.topLeft(), avail)
+    assert w.geometry() == QRect(spot, CELL)
+    assert abs(spot.x() - open_geo.x()) <= CELL.width() // 2
+    assert abs(spot.y() - open_geo.y()) <= CELL.height() // 2
     assert w.toolTip() == "주간 회의 메모"
     # 설정의 기본 모양을 따랐을 뿐이라 메모에는 모양이 기록되지 않는다.
     assert events[-1][0] == "n1"
@@ -168,7 +179,7 @@ def test_style_can_be_switched_per_note(qapp):
     events: list[tuple] = []
     w.foldChanged.connect(lambda *a: events.append(a))
     w.fold(style=nf.FOLD_ICON)
-    assert w.size() == nf.ICON_SIZE
+    assert w.size() == CELL
     assert events[-1][1]["fold_style"] == nf.FOLD_ICON
     w.set_fold_style(nf.FOLD_SLIP)
     assert w.size() == nf.SLIP_SIZE
@@ -185,6 +196,43 @@ def test_style_can_be_switched_per_note(qapp):
     w.close()
 
 
+def test_folded_note_follows_a_changed_default_shape(qapp):
+    settings = _settings("slip")
+    w = _sticky(qapp, settings)
+    w.fold()
+    at = w.pos()
+    assert w.size() == nf.SLIP_SIZE
+    settings.fold_style = "icon"
+    w.refresh_fold_face()
+    avail = QGuiApplication.primaryScreen().availableGeometry()
+    # 아이콘이 되면서 가까운 칸에 맞춰진다.
+    assert w.size() == CELL and w.pos() == nf.snap_icon_pos(at, avail)
+    assert w.toolTip() == "주간 회의 메모"
+    settings.fold_style = "slip"
+    w.refresh_fold_face()
+    assert w.size() == nf.SLIP_SIZE and w.toolTip() == ""
+    w._teardown = True
+    w.close()
+
+
+def test_a_shape_chosen_for_one_note_ignores_the_default(qapp):
+    settings = _settings("slip")
+    w = _sticky(qapp, settings)
+    w.fold(style=nf.FOLD_SLIP)
+    settings.fold_style = "icon"
+    w.refresh_fold_face()
+    assert w.size() == nf.SLIP_SIZE
+    # 벽에 붙인 메모는 늘 탭이다.
+    docked = _sticky(qapp, settings, id="n2")
+    docked.fold(dock=nf.DOCK_LEFT)
+    tab = docked.size()
+    docked.refresh_fold_face()
+    assert docked.size() == tab
+    for x in (w, docked):
+        x._teardown = True
+        x.close()
+
+
 def test_dragged_icon_snaps_to_grid_without_docking(qapp):
     w = _sticky(qapp, _settings("icon"))
     avail = QGuiApplication.primaryScreen().availableGeometry()
@@ -195,25 +243,23 @@ def test_dragged_icon_snaps_to_grid_without_docking(qapp):
     w._slip_press = w.mapToGlobal(QPoint(30, 30))
     w._slip_grab = QPoint(30, 30)
     w._begin_slip_drag()
-    # 벽 바로 옆 칸까지 끌어도 벽에 닿지 않으면 아이콘으로 남는다.
-    w._drag_slip_to(QPoint(avail.left() + 40, 360))
+    # 벽에 닿아 있는 첫 칸까지 끌어도(창의 끝이 벽에 닿는다) 아이콘으로 남는다.
+    w._drag_slip_to(QPoint(avail.left() + 30, 360))
+    assert w.geometry().left() == avail.left()
     assert w._drag_dock == nf.DOCK_NONE
-    assert w.size() == nf.ICON_SIZE
+    assert w.size() == CELL
     w._slip_press = None
     w._slip_dragging = False
     w._end_slip_drag()
     assert w.dock_side() == nf.DOCK_NONE and w.is_folded()
     pos = w.pos()
     assert pos != taken[0]
-    assert (pos.x() - avail.left() - nf.ICON_GRID_ORIGIN.x()) \
-        % nf.ICON_GRID.width() == 0
-    assert (pos.y() - avail.top() - nf.ICON_GRID_ORIGIN.y()) \
-        % nf.ICON_GRID.height() == 0
+    assert _on_grid(pos, avail)
     # 펴면 펼쳐 있던 자리로 돌아가고, 접으면 아이콘을 둔 자리로 온다.
     w.unfold()
     assert w.pos() == QPoint(300, 200)
     w.fold()
-    assert w.pos() == pos and w.size() == nf.ICON_SIZE
+    assert w.pos() == pos and w.size() == CELL
     w._teardown = True
     w.close()
 
@@ -225,8 +271,11 @@ def test_icon_pushed_into_a_wall_becomes_a_tab(qapp):
     w._slip_press = w.mapToGlobal(QPoint(30, 30))
     w._slip_grab = QPoint(30, 30)
     w._begin_slip_drag()
-    # 아이콘 설정과 무관하게, 벽에 닿으면 쪽지 모양으로 붙는다.
+    # 그림이 벽에 닿기 전에는 아이콘이다(첫 칸에 놓으려는 것일 수 있다).
     w._drag_slip_to(QPoint(avail.left() + 20, 360))
+    assert w._drag_dock == nf.DOCK_NONE
+    # 그림이 벽을 넘도록 밀면, 아이콘 설정과 무관하게 쪽지 모양으로 붙는다.
+    w._drag_slip_to(QPoint(avail.left() + 8, 360))
     assert w._drag_dock == nf.DOCK_LEFT
     assert w.size() == nf.SLIP_SIZE and w.geometry().left() == avail.left()
     w._slip_press = None
@@ -238,8 +287,11 @@ def test_icon_pushed_into_a_wall_becomes_a_tab(qapp):
     w._slip_press = w.mapToGlobal(QPoint(20, 20))
     w._slip_grab = QPoint(20, 20)
     w._begin_slip_drag()
+    # 붙어 있던 탭은 벽을 따라 끄는 동안 탭으로 남는다.
+    w._drag_slip_to(QPoint(avail.left() + 22, 420))
+    assert w._drag_dock == nf.DOCK_LEFT
     w._drag_slip_to(QPoint(avail.left() + 300, 360))
-    assert w._drag_dock == nf.DOCK_NONE and w.size() == nf.ICON_SIZE
+    assert w._drag_dock == nf.DOCK_NONE and w.size() == CELL
     w._slip_press = None
     w._slip_dragging = False
     w._end_slip_drag()
@@ -280,7 +332,9 @@ def test_docking_an_icon_note_uses_a_tab_and_returns_to_icon(qapp):
     assert w.size() == nf.TAB_SIZE and w.geometry().left() == avail.left()
     assert w.fold_style() == nf.FOLD_SLIP      # 붙인 동안은 탭이다.
     w.undock()
-    assert w.dock_side() == nf.DOCK_NONE and w.size() == nf.ICON_SIZE
+    assert w.dock_side() == nf.DOCK_NONE and w.size() == CELL
+    # 벽에서 뗀 아이콘도 바탕화면 아이콘의 칸에 놓인다.
+    assert _on_grid(w.pos(), avail)
     w._teardown = True
     w.close()
 
@@ -290,7 +344,7 @@ def test_restore_icon_style(qapp):
                           "width": 280, "height": 260, "content": "복원"},
                          "지우", settings=_settings("slip"))
     w.apply_local_state(410, 222, 300, 240, folded=True, fold_style="icon")
-    assert w.geometry() == QRect(QPoint(410, 222), nf.ICON_SIZE)
+    assert w.geometry() == QRect(QPoint(410, 222), CELL)
     assert w.fold_style() == nf.FOLD_ICON
     w.show()
     w.unfold()
@@ -320,7 +374,7 @@ def test_folder_icon_widget_signals(qapp):
     moved: list[tuple] = []
     icon.toggled.connect(toggled.append)
     icon.moved.connect(lambda *a: moved.append(a))
-    assert icon.size() == nf.ICON_SIZE and icon.toolTip() == "업무"
+    assert icon.size() == CELL and icon.toolTip() == "업무"
     QTest.mouseClick(icon, Qt.LeftButton, Qt.NoModifier, QPoint(40, 30))
     assert toggled == []                      # 한 번 눌러서는 열리지 않는다.
     _dclick(icon, QPoint(40, 30))
@@ -337,8 +391,7 @@ def test_folder_icon_widget_signals(qapp):
     QTest.mouseRelease(icon, Qt.LeftButton, Qt.NoModifier, QPoint(40, 30))
     assert moved and moved[-1][0] == "f1"
     avail = QGuiApplication.primaryScreen().availableGeometry()
-    assert (moved[-1][1] - avail.left() - nf.ICON_GRID_ORIGIN.x()) \
-        % nf.ICON_GRID.width() == 0
+    assert _on_grid(QPoint(moved[-1][1], moved[-1][2]), avail)
     icon.close()
 
 

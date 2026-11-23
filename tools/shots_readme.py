@@ -288,8 +288,9 @@ def _links(window, harness) -> None:
     menu = grab_popup(info._show_attach_menu, harness)
     info._commit_and_release()
     note_pix = grab(info, harness)
-    href = fl.path_to_href("\\\\NAS\\업무\\연락망.xlsx")
-    dlg = LinkDialog(text="비상 연락망", href=href, editing=True)
+    sample_path, sample_text, _is_dir = harness.TEXT["info"]["links"][1]
+    href = fl.path_to_href(sample_path)
+    dlg = LinkDialog(text=sample_text, href=href, editing=True)
     dlg.show()
     harness.settle(150)
     dialog = framed(grab(dlg, harness), _t("link_dialog"))
@@ -307,7 +308,7 @@ def _icons(window, harness) -> None:
     """접힌 메모와 폴더가 바탕 화면에 놓이는 모양을 크게 보여 준다."""
     font = QApplication.font()
     scale = 2.0
-    cell_w, cell_h = nf.ICON_SIZE.width(), nf.ICON_SIZE.height()
+    cell_w, cell_h = nf.ICON_CELL_DEFAULT.width(), nf.ICON_CELL_DEFAULT.height()
     items = (
         ("face_slip", "slip"), ("face_icon", "icon"),
         ("face_folder_closed", "closed"), ("face_folder_open", "open"),
@@ -327,19 +328,20 @@ def _icons(window, harness) -> None:
         if kind == "slip":
             w = 96.0
             nf.paint_slip(c.p, QRectF(-w / 2, 28, w, nf.SLIP_SIZE.height()),
-                          "#FFE066", "주간 회의", font=font)
+                          "#FFE066", harness.TEXT["faces"][0], font=font)
         elif kind == "tab":
             w = 74.0
             nf.paint_slip(c.p, QRectF(-w / 2, 28, w, nf.TAB_SIZE.height()),
-                          "#FFB3BA", "할 일", dock=nf.DOCK_LEFT, hover=True,
+                          "#FFB3BA", harness.TEXT["faces"][1], dock=nf.DOCK_LEFT, hover=True,
                           font=font)
         elif kind == "icon":
             nf.paint_icon(c.p, QRectF(-cell_w / 2, 0, cell_w, cell_h),
-                          "#FFD9A6", "점심 주문 받아요", font=font)
+                          "#FFD9A6", harness.TEXT["faces"][2], font=font)
         else:
             nf.paint_folder_icon(
                 c.p, QRectF(-cell_w / 2, 0, cell_w, cell_h), "#BAE1FF",
-                "업무", opened=(kind == "open"), count=4, font=font)
+                harness.TEXT["folders"][0], opened=(kind == "open"), count=4,
+                font=font)
         c.p.restore()
     harness.save(c.finish(), "icons")
 
@@ -543,7 +545,7 @@ def _editing(window, harness) -> None:
 
 def _together(window, harness) -> None:
     locked = window._stickies["n_lunch"]
-    locked.set_lock_holder("하준")
+    locked.set_lock_holder(harness.USER_A)
     locked_pix = grab(locked, harness)
     locked.set_lock_holder(None)
 
@@ -570,7 +572,7 @@ def _together(window, harness) -> None:
 def shoot(window, harness) -> None:
     animate = window._settings.fold_animation
     window._settings.fold_animation = False
-    window._users = [harness.HOST, "하준", "서연"]
+    window._users = [harness.HOST, harness.USER_A, harness.USER_B]
     window._refresh_status_text()
     try:
         _hero(window, harness)

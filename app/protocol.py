@@ -27,6 +27,8 @@ MSG_UPDATE_FOLDER = "update_folder"
 MSG_DELETE_FOLDER = "delete_folder"
 MSG_PONG = "pong"
 MSG_GET_HISTORY = "get_history"
+# 암호가 걸린 공유에 참여할 때, 암호를 안다는 증명(app/share_auth.py).
+MSG_AUTH = "auth"
 
 # 서버 → 클라이언트
 MSG_WELCOME = "welcome"
@@ -46,6 +48,9 @@ MSG_USER_JOINED = "user_joined"
 MSG_USER_LEFT = "user_left"
 MSG_PING = "ping"
 MSG_ERROR = "error"
+# 암호가 걸린 공유다. 인사(hello)에 이것으로 답하고, 증명이 맞으면 welcome 을 보낸다.
+MSG_AUTH_REQUIRED = "auth_required"
+MSG_AUTH_FAILED = "auth_failed"
 
 
 @dataclass

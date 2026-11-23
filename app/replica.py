@@ -327,6 +327,8 @@ def build_host_database(copy_path: Path | str, db_path: Path | str,
             note.created_by = note.created_by or nickname
             note.updated_by = note.updated_by or note.created_by
             repo.insert_note(note)
+        # 그 공유에 참여하던 다른 PC 가 이 PC 를 찾았을 때 알아보게 한다.
+        repo.set_took_over_from(meta.get("host_id", ""))
     finally:
         repo.close()
     kept = set_aside(db_path, "before-takeover")
@@ -469,9 +471,13 @@ class ReplicaStore:
     def _is_other_dataset(self, host_id: str, incoming: set[str]) -> bool:
         """받은 첫 상태가 지금 사본과 다른 메모 묶음의 것인가."""
         mine = self.note_ids()
-        if not mine:
-            return False        # 잃을 것이 없다
         known = self.meta().get("host_id", "")
+        if not mine:
+            # 잃을 것은 없다. 다만 이 공유 PC 에서 받아 옮겨 둔 사본이 있으면 그것을
+            # 도로 가져와 이어 쓴다. 빈 사본에 새로 받아 적으면 옮겨 둔 것과 두
+            # 벌이 되고, 메모가 없는 공유 PC 를 오갈 때마다 한 벌씩 는다.
+            return bool(host_id and known != host_id
+                        and self._archive_of(host_id) is not None)
         if known and host_id:
             return known != host_id
         # 식별값을 모른다(옛 버전 호스트). 겹치는 메모가 하나도 없으면 다른 묶음이다.
@@ -591,6 +597,11 @@ class ReplicaSync(QObject):
             self._store = None
 
     def _on_welcomed(self, data: dict) -> None:
+        # 붙은 주소는 도중에 바뀔 수 있다(주소가 바뀐 공유 PC 를 찾아갔다).
+        host, port = self._client.address()
+        if host:
+            self._address = f"{host}:{port}"
+
         def apply(store: ReplicaStore) -> None:
             store.apply_snapshot(
                 list(data.get("notes") or []), list(data.get("folders") or []),

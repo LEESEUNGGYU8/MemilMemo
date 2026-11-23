@@ -73,6 +73,20 @@ def test_going_back_and_forth_keeps_one_copy_per_host(store):
         assert len(store.archives()) == 1        # 둘째 공유 PC 의 사본 한 벌
 
 
+def test_visiting_a_host_with_no_notes_does_not_pile_up_copies(store):
+    """메모가 없는 공유 PC 를 오갈 때마다 원래 공유 PC 의 사본이 한 벌씩 늘었다."""
+    first = [note("a"), note("b")]
+    store.apply_snapshot(first, [], host_id="H1", host=OTHER, address=A, nickname=ME)
+    for _ in range(3):
+        store.apply_snapshot([], [], host_id="H2", host="서연", address=B, nickname=ME)
+        assert ids(store) == set() and store.meta()["host_id"] == "H2"
+        assert [ids_of(p) for p in store.archives()] == [{"a", "b"}]
+        store.apply_snapshot(first, [], host_id="H1", host=OTHER, address=A,
+                             nickname=ME)
+        assert ids(store) == {"a", "b"} and store.meta()["host_id"] == "H1"
+        assert [ids_of(p) for p in store.archives()] == [set()]
+
+
 def test_copy_brought_back_follows_what_the_host_has_now(store):
     """돌아와 보니 그 사이 공유 PC 에서 메모가 지워지고 새로 생겼다."""
     store.apply_snapshot([note("a"), note("b")], [], host_id="H1")

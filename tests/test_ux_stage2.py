@@ -94,7 +94,8 @@ def _start_editing(win, text: str) -> StickyNoteWidget:
 
 # ── 상태 표시 ───────────────────────────────────────────────────────────
 
-def test_note_shows_offline_and_refuses_to_start_editing(guest):
+def test_note_shows_offline_and_cannot_edit_with_nowhere_to_keep_it(guest):
+    """끊긴 동안 쓴 글을 적어 둘 곳을 열지 못한 PC(이 창에는 주지 않았다)."""
     client = guest._client
     client.connectionChanged.emit(True)
     _welcome(client, _note())
@@ -106,8 +107,8 @@ def test_note_shows_offline_and_refuses_to_start_editing(guest):
     client.calls.clear()
     sticky._request_edit()
     assert client.of("lock") == []                    # 닿지 않을 요청은 보내지 않는다
-    assert sticky._overlay.isVisible()                # 까닭을 알린다
-    assert "끊겨" in sticky._overlay.text()
+    assert not sticky._edit_mode and not sticky._pending_lock
+    assert "끊겨" in guest._status.currentMessage()    # 까닭을 알린다
 
     client.connectionChanged.emit(True)
     assert sticky._lock_label.text() == ""

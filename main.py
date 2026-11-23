@@ -16,15 +16,19 @@ from app.backup import (
 from app.database import SqliteRepository, check_database
 from app.datetime_fmt import fmt_relative
 from app.ipc import (
-    CMD_NEW_NOTE_HERE, IpcReceiver, claim_boot, forward_command,
-    forward_when_ready, link_note_command, link_note_paths, new_note_command,
+    CMD_NEW_NOTE_HERE, CMD_SHOW, IpcReceiver, claim_boot, forward_command,
+    forward_when_ready, link_note_command, link_note_paths, new_folder_command,
+    new_note_command,
 )
 from app.local_state import LocalStateStore
+from app.network.discovery import Responder
 from app.network.guest_client import GuestClient
 from app.network.host_client import HostLocalClient
 from app.network.host_server import HostServer
+from app.offline_drafts import DraftStore
 from app.replica import ReplicaStore, ReplicaSync, build_host_database
 from app.settings import AppSettings, get_windows_autostart, set_windows_autostart
+from app.share_auth import ShareAuth
 from app.sync.history_tracker import HistoryTracker
 from app.sync.lock_manager import LockManager
 from app.ui import confirm, theme
@@ -96,6 +100,17 @@ def _persist_choice(local_store: LocalStateStore,
                     choice: ConnectionChoice) -> None:
     """현재 접속 정보를 저장한다. 다음 실행 때 자동 재접속에 쓰인다."""
     ls = local_store.state
+    if choice.mode == "host":
+        if choice.password is not None:
+            # 접속 창에서 정했다. 비워 두었으면 비밀번호 없이 공유한다. 글자는
+            # 적지 않고 거기서 만든 열쇠만 적어 둔다.
+            auth = ShareAuth.from_password(choice.password)
+            ls.share_auth = auth.to_dict() if auth is not None else None
+    elif (ls.last_mode != "guest" or ls.last_host_ip != choice.host_ip
+          or ls.last_host_port != choice.port):
+        # 다른 공유 PC 에 참여한다. 전에 붙던 PC 의 열쇠(또는 이 PC 가 공유하며
+        # 쓰던 것)는 그 PC 의 것이 아니다.
+        ls.share_auth = None
     ls.last_mode = choice.mode
     ls.nickname = choice.nickname
     ls.last_host_port = choice.port
@@ -169,6 +184,8 @@ def _recover_database(db_path: Path,
 
 
 WAIT_PID_FLAG = "--wait-pid"
+# '새 메모'로 켜졌을 때 공유 PC 에 붙기를 기다리는 시간(ms). 넘으면 이 PC 에만 만든다.
+NEW_NOTE_HOST_WAIT_MS = 4000
 
 
 def _wait_for_previous_instance(argv: list[str]) -> None:
@@ -190,6 +207,25 @@ def _wait_for_previous_instance(argv: list[str]) -> None:
         pass
 
 
+def _already_running(argv: list[str], has_command: bool) -> bool:
+    """그냥 켰는데(바로가기를 한 번 더 눌렀다) 앱이 이미 떠 있는가. 그렇다면 떠
+    있는 메인 창을 앞으로 부르고 True 를 돌려준다(이 실행은 끝난다).
+
+    하나 더 뜨면 같은 닉네임으로 두 번 접속해 메모 창이 겹쳐 뜨고, 두 실행이 같은
+    창 배치 파일을 번갈아 덮어쓴다. 공유 PC 라면 포트를 열지 못해 저장해 둔 접속
+    정보까지 지운다. 역할을 바꿔 스스로 다시 켠 경우(--wait-pid)와 '새 메모' 같은
+    명령으로 켜진 경우는 여기서 다루지 않는다."""
+    if has_command or WAIT_PID_FLAG in argv:
+        return False
+    if forward_command(CMD_SHOW):
+        return True
+    if not claim_boot():
+        # 다른 실행이 지금 켜지는 중이다. 뜨기를 기다렸다가 그 창을 부른다.
+        forward_when_ready(CMD_SHOW)
+        return True
+    return False
+
+
 def _restart_app(window: MainWindow) -> None:
     """프로그램을 끄고 같은 방식으로 다시 켠다(역할을 바꾼 뒤)."""
     import os
@@ -208,6 +244,15 @@ def _open_replica() -> ReplicaStore | None:
     """이 PC 에 두는 메모 사본. 열지 못해도 앱은 그대로 쓴다(사본만 없다)."""
     try:
         return ReplicaStore(config.default_replica_path())
+    except (OSError, sqlite3.Error):
+        return None
+
+
+def _open_drafts() -> DraftStore | None:
+    """끊긴 동안 쓴 메모를 적어 두는 곳. 열지 못해도 앱은 그대로 쓴다(끊긴
+    동안에는 전처럼 읽기만 한다)."""
+    try:
+        return DraftStore(config.default_drafts_path())
     except (OSError, sqlite3.Error):
         return None
 
@@ -267,6 +312,13 @@ def main() -> int:
     link_paths = link_note_paths(sys.argv)
     if link_paths and forward_command(link_note_command(link_paths)):
         return 0
+    # 바탕 화면 우클릭 메뉴의 '새 메모 폴더 추가'로 실행됐는가.
+    new_folder_cmd = new_folder_command(sys.argv)
+    if new_folder_cmd and forward_command(new_folder_cmd):
+        return 0
+    if _already_running(sys.argv,
+                        bool(new_note_cmd or link_paths or new_folder_cmd)):
+        return 0
     # 여기부터는 앱을 켠다. 파일을 여럿 골랐으면 같은 실행이 동시에 여러 개
     # 뜨므로 하나만 켜고, 나머지는 그쪽이 뜨기를 기다렸다가 넘기고 끝난다.
     if not claim_boot() and link_paths:
@@ -287,7 +339,8 @@ def main() -> int:
     # 우클릭 메뉴로 켜진 경우 메모를 띄울 자리. 접속을 마칠 때쯤에는 마우스가
     # 다른 데 가 있으므로 지금 적어 둔다.
     new_note_spot = (QCursor.pos()
-                     if new_note_cmd == CMD_NEW_NOTE_HERE or link_paths
+                     if (new_note_cmd == CMD_NEW_NOTE_HERE or link_paths
+                         or new_folder_cmd)
                      else None)
 
     # 스토어판을 처음 켰으면 설치판이 쓰던 메모와 설정을 가져온다(설정을 읽기
@@ -312,8 +365,9 @@ def main() -> int:
     _sync_autostart(settings)
     settings.save()
     # 바탕 화면 우클릭 메뉴를 넣어 둔 경우 실행 파일 경로와 글자를 지금 것으로 맞춘다.
-    shell_menu.refresh(i18n.t("jumplist.new_note_title"),
-                       i18n.t("shell.link_note_title"))
+    shell_menu.refresh(i18n.t("shell.new_note_title"),
+                       i18n.t("shell.link_note_title"),
+                       i18n.t("shell.new_folder_title"))
 
     local_store = LocalStateStore()
 
@@ -336,10 +390,18 @@ def main() -> int:
                 return 0
             locks = LockManager(idle_timeout_ms=config.LOCK_IDLE_TIMEOUT_MS)
             history = HistoryTracker(repo)
+            if choice.password is not None:
+                # 포트를 열기 전에 정해 둔다(저장은 아래 _persist_choice 가 한다).
+                picked = ShareAuth.from_password(choice.password)
+                local_store.state.share_auth = (
+                    picked.to_dict() if picked is not None else None)
+                choice.password = None
             server = HostServer(
                 repo=repo, lock_manager=locks, history_tracker=history,
                 host_nickname=choice.nickname, heartbeat_ms=choice.heartbeat_ms,
+                auth=ShareAuth.from_dict(local_store.state.share_auth),
             )
+            server.old_version_message = i18n.t("auth.old_version")
             if not server.start(choice.port):
                 repo.close()
                 confirm.notify(
@@ -351,11 +413,22 @@ def main() -> int:
                 local_store.save()
                 continue
             _persist_choice(local_store, choice)
+            # 내부망에서 공유 PC 를 찾는 신호에 답한다. 포트를 열지 못해도 공유는 된다.
+            beacon = None
+            if config.discovery_port() is not None:
+                beacon = Responder(lambda: server.beacon(choice.port),
+                                   config.discovery_port(), parent=app)
+                beacon.start()
             client = HostLocalClient(server=server, nickname=choice.nickname)
             # 중요: client.start() 이전에 MainWindow를 먼저 만들어야 한다.
             # 그래야 초기 welcome(저장된 메모 포함)이 도착할 때 시그널 구독이 이미 연결돼 있다.
+            # 참여하던 PC 가 사본으로 공유를 이어받았으면 끊긴 동안 쓴 메모가 남아
+            # 있을 수 있다. 그때만 열어, 공유 PC 가 된 뒤에 올릴지 묻는다.
+            host_drafts = (_open_drafts()
+                           if config.default_drafts_path().exists() else None)
             window = MainWindow(client=client, local_state=local_store,
-                                role="host", settings=settings, app_icon=app_icon)
+                                role="host", settings=settings, app_icon=app_icon,
+                                drafts=host_drafts)
             client.start()
             backup_manager = BackupManager(db_path=db_path, settings=settings)
 
@@ -442,8 +515,12 @@ def main() -> int:
                     pass
                 if backup_manager is not None:
                     backup_manager.stop()
+                if beacon is not None:
+                    beacon.stop()
                 server.stop()
                 repo.close()
+                if host_drafts is not None:
+                    host_drafts.close()
                 local_store.save()
                 settings.save()
 
@@ -452,12 +529,16 @@ def main() -> int:
         else:  # guest
             _persist_choice(local_store, choice)
             client = GuestClient(choice.host_ip, choice.port, choice.nickname)
+            # 붙던 공유 PC 의 비밀번호 열쇠. 있으면 묻지 않고 들어간다.
+            client.set_auth(ShareAuth.from_dict(local_store.state.share_auth))
             # 받은 메모를 이 PC 에도 적어 둔다. 호스트가 꺼져 있으면 이것을 보여 준다.
             replica = _open_replica()
+            # 끊긴 동안 이 PC 에서 쓴 메모. 다시 붙으면 올릴지 묻는다.
+            drafts = _open_drafts()
             # 호스트와 같은 이유로 MainWindow를 먼저 만들어 시그널을 구독한 뒤 client.start()를 호출한다.
             window = MainWindow(client=client, local_state=local_store,
                                 role="guest", settings=settings, app_icon=app_icon,
-                                replica=replica)
+                                replica=replica, drafts=drafts)
             if replica is not None:
                 # app 에 매달아 둔다(창보다 오래 살아 마지막 변경까지 적는다).
                 ReplicaSync(replica, client,
@@ -500,6 +581,8 @@ def main() -> int:
                 client.stop()
                 if replica is not None:
                     replica.close()
+                if drafts is not None:
+                    drafts.close()
                 local_store.save()
                 settings.save()
 
@@ -537,6 +620,24 @@ def main() -> int:
                 QTimer.singleShot(
                     0, lambda: window.handle_new_note_request(new_note_spot))
         client.welcomed.connect(_create_after_welcome)
+
+        def _create_without_host():
+            # 공유 PC 가 꺼져 있으면 welcome 이 오지 않는다. 잠깐 기다려 보고도
+            # 붙지 못했으면 이 PC 에만 만든다(다시 붙으면 올릴지 묻는다).
+            if not window._connected:
+                _create_after_welcome()
+        QTimer.singleShot(NEW_NOTE_HOST_WAIT_MS, _create_without_host)
+
+    if new_folder_cmd:
+        # '새 메모 폴더 추가'로 켜졌다. 폴더는 공유 PC 에 만들므로 붙은 뒤에 만든다.
+        def _folder_after_welcome(_data=None):
+            try:
+                client.welcomed.disconnect(_folder_after_welcome)
+            except (RuntimeError, TypeError):
+                pass
+            QTimer.singleShot(
+                0, lambda: window.handle_new_folder_request(new_note_spot))
+        client.welcomed.connect(_folder_after_welcome)
 
     # 자동 업데이트 확인은 시작 5초 후에 동작한다.
     # welcome 핸드셰이크와 UI가 안정된 뒤에 수행하려는 목적이다.

@@ -33,6 +33,18 @@ class ClientBase(QObject):
     historyList = Signal(str, list)          # note_id 또는 '', [entries]
     connectionChanged = Signal(bool)
     errorOccurred = Signal(str)
+    # 암호가 걸린 공유다. 사용자에게 암호를 물어야 한다({"wrong": 방금 넣은 암호가
+    # 틀렸는가, "wait": 너무 틀려 기다려야 하는 초}).
+    passwordRequired = Signal(dict)
+    # 암호가 맞았다. 다음부터 묻지 않게 적어 둘 열쇠(ShareAuth.to_dict).
+    passwordAccepted = Signal(dict)
+    # 암호를 걸어 두었던 공유 PC 가 암호 없이 답했다. 붙지 않고 기다린다.
+    hostOpen = Signal()
+    # 암호를 아는 척했지만 모르는 상대다. 붙지 않는다.
+    hostUnverified = Signal()
+    # 찾아낸 새 주소가 붙던 공유 PC 로 확인돼 옮겼다 / 아니어서 돌아왔다.
+    followed = Signal(str, int)
+    followFailed = Signal(str, int)
 
     def __init__(self, nickname: str, parent: QObject | None = None):
         super().__init__(parent)
@@ -43,6 +55,15 @@ class ClientBase(QObject):
 
     def start(self) -> None: ...
     def stop(self) -> None: ...
+
+    # 참여하는 PC 만 쓰는 것들(공유 PC 자신은 암호도 주소도 없다).
+    def set_auth(self, auth) -> None: ...
+    def submit_password(self, password: str) -> None: ...
+    def pause(self) -> None: ...
+    def resume(self) -> None: ...
+    def address(self) -> tuple[str, int]: return "", 0
+    def set_address(self, host: str, port: int) -> None: ...
+    def follow(self, host: str, port: int) -> None: ...
 
     def acquire_lock(self, note_id: str) -> None: ...
     def release_lock(self, note_id: str) -> None: ...

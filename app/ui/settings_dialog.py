@@ -470,7 +470,12 @@ class SettingsDialog(QDialog):
         self._desktop_menu = self._switch(self._desktop_menu_was)
         self._desktop_menu.setEnabled(shell_menu.is_supported())
         # 스토어판의 메뉴는 Windows 11 의 첫 화면 메뉴에 나오므로 덧붙일 말이 없다.
-        page.add_row(i18n.t("settings.check_desktop_menu"), self._desktop_menu,
+        # 스토어판의 바탕화면 항목은 Windows 11 22H2 부터 나온다. 그보다 옛
+        # Windows 에서는 나오지 않는 것을 켠다고 적지 않는다.
+        label = (i18n.t("settings.check_desktop_menu")
+                 if shell_menu.desktop_item_available()
+                 else i18n.t("settings.check_file_menu"))
+        page.add_row(label, self._desktop_menu,
                      "" if store else i18n.t("settings.note_desktop_menu"))
         page.add_stretch()
         return page
@@ -753,8 +758,9 @@ class SettingsDialog(QDialog):
         want_menu = self._desktop_menu.isChecked()
         if self._desktop_menu.isEnabled() and want_menu != self._desktop_menu_was:
             shell_menu.set_registered(
-                want_menu, i18n.t("jumplist.new_note_title"),
-                i18n.t("shell.link_note_title"))
+                want_menu, i18n.t("shell.new_note_title"),
+                i18n.t("shell.link_note_title"),
+                i18n.t("shell.new_folder_title"))
 
         s.new_note_private = bool(self._new_note_scope.currentData())
         s.notify_new_note = self._notify_new_note.isChecked()

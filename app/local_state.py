@@ -120,6 +120,18 @@ class LocalState:
     notes: dict[str, NoteLocalState] = field(default_factory=dict)
     users: dict[str, UserRecord] = field(default_factory=dict)
     folder_icons: dict[str, FolderIconState] = field(default_factory=dict)
+    # 이 PC 가 처음 받는 남의 메모를 숨김으로 두기 시작했는가. 그 규칙이 없던
+    # 버전은 받은 메모를 모두 띄웠고 자리 기록(notes)을 그때 바로 적지 않았다.
+    # 그래서 그런 버전에서 올라온 PC 는 기록이 없다는 것만으로 처음 받는 메모라
+    # 할 수 없다. 공유 PC 에서 메모를 한 번 받고 나서 켠다.
+    hides_new: bool = False
+    # 공유에 거는 암호의 열쇠(app/share_auth.py 의 ShareAuth.to_dict). 공유 PC 는 제
+    # 것을, 참여하는 PC 는 붙던 공유 PC 의 것을 적어 둔다. 암호가 없으면 None.
+    share_auth: dict | None = None
+    # 아이콘을 마지막으로 맞춰 놓은 바탕화면 격자(작업 영역 "x,y,w,h" →
+    # [칸 폭, 칸 높이, 첫 칸의 x, 첫 칸의 y]). 앱이 꺼져 있는 동안 바탕화면
+    # 아이콘의 크기가 바뀌었으면, 켤 때 아이콘들을 같은 칸으로 옮기는 데 쓴다.
+    icon_grids: dict[str, list] = field(default_factory=dict)
 
     def get_note_state(self, note_id: str) -> NoteLocalState:
         if note_id not in self.notes:
@@ -197,6 +209,19 @@ class LocalState:
         return rec
 
 
+def _icon_grids_from_raw(raw: Any) -> dict[str, list]:
+    out: dict[str, list] = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, value in raw.items():
+        if (isinstance(key, str) and isinstance(value, list) and len(value) == 4
+                and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                        for v in value)
+                and value[0] > 0 and value[1] > 0):
+            out[key] = [float(v) for v in value]
+    return out
+
+
 class LocalStateStore:
     def __init__(self, path: Path | None = None):
         self.path = path or config.default_local_state_path()
@@ -204,7 +229,8 @@ class LocalStateStore:
 
     def _load(self) -> LocalState:
         if not self.path.exists():
-            return LocalState()
+            # 새로 설치한 PC 다. 받아 본 메모가 없으니 처음부터 가린다.
+            return LocalState(hides_new=True)
         try:
             raw: dict[str, Any] = json.loads(self.path.read_text(encoding="utf-8"))
             folds = raw.get("note_folds", {})
@@ -234,6 +260,10 @@ class LocalStateStore:
                 notes=notes,
                 users=users,
                 folder_icons=_folder_icons_from_raw(raw.get("folder_icons")),
+                hides_new=bool(raw.get("hides_new", False)),
+                share_auth=(raw.get("share_auth")
+                            if isinstance(raw.get("share_auth"), dict) else None),
+                icon_grids=_icon_grids_from_raw(raw.get("icon_grids")),
             )
         except (json.JSONDecodeError, TypeError, ValueError):
             return LocalState()
@@ -258,6 +288,11 @@ class LocalStateStore:
                 fid: asdict(v) for fid, v in self.state.folder_icons.items()
             },
             "users": {n: asdict(v) for n, v in self.state.users.items()},
+            "hides_new": self.state.hides_new,
         }
+        if self.state.share_auth:
+            data["share_auth"] = self.state.share_auth
+        if self.state.icon_grids:
+            data["icon_grids"] = self.state.icon_grids
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")

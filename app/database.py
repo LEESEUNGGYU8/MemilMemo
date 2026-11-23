@@ -97,8 +97,10 @@ def _open_readonly(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def check_database(path: Path | str) -> str:
-    """메모 파일(또는 그 백업)이 온전한지 본다. 온전하면 빈 문자열, 아니면 까닭."""
+def check_database(path: Path | str, table: str = "notes") -> str:
+    """메모 파일(또는 그 백업)이 온전한지 본다. 온전하면 빈 문자열, 아니면 까닭.
+
+    ``table`` 은 그 파일에 꼭 있어야 하는 표다."""
     path = Path(path)
     try:
         conn = _open_readonly(path)
@@ -109,9 +111,9 @@ def check_database(path: Path | str) -> str:
         result = "; ".join(str(r[0]) for r in rows)
         if result != "ok":
             return result or "quick_check failed"
-        if "notes" not in {r[0] for r in conn.execute(
+        if table not in {r[0] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'")}:
-            return "no notes table"
+            return f"no {table} table"
         return ""
     except sqlite3.Error as e:
         return str(e) or type(e).__name__
@@ -197,6 +199,21 @@ class SqliteRepository:
             (value,))
         self._conn.commit()
         return value
+
+    def took_over_from(self) -> str:
+        """이 메모 묶음이 이어받은 공유의 식별값(사본으로 공유를 이어받았을 때).
+
+        그 공유에 참여하던 PC 가 이 PC 를 찾았을 때 '공유를 이어받은 PC'임을
+        알아본다. 이어받은 것이 아니면 빈 글."""
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'took_over_from'").fetchone()
+        return str(row[0]) if row and row[0] else ""
+
+    def set_took_over_from(self, host_id: str) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('took_over_from', ?)",
+            (str(host_id or ""),))
+        self._conn.commit()
 
     def restore_from(self, source: Path | str) -> None:
         """백업 파일의 내용으로 통째로 바꾼다(열려 있는 연결 그대로).
@@ -372,6 +389,19 @@ class SqliteRepository:
         )
         self._conn.commit()
         return self.get_folder(folder_id)
+
+    def keep_deleted_notes_private(self, folder_id: str, owner: str) -> None:
+        """나만 보던 폴더에서 지운 메모에 그 주인을 적어 둔다.
+
+        그런 메모는 폴더에 기대어 비공개였다. 폴더가 지워지거나 공개되면 기댈
+        곳이 없어지고, 주인이 적혀 있지 않으면 지운 글 전체가 담긴 이력을 누구나
+        받아 볼 수 있게 된다."""
+        self._conn.execute(
+            "UPDATE notes SET private_owner = ? WHERE folder_id = ?"
+            " AND deleted = 1 AND (private_owner IS NULL OR private_owner = '')",
+            (owner, folder_id),
+        )
+        self._conn.commit()
 
     def list_notes_in_folder(self, folder_id: str) -> list[Note]:
         rows = self._conn.execute(

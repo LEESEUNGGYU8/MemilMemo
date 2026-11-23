@@ -3,12 +3,13 @@ from __future__ import annotations
 import getpass
 from dataclasses import dataclass
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
+    QHBoxLayout,
     QLabel,
     QLayout,
     QLineEdit,
@@ -20,7 +21,14 @@ from PySide6.QtWidgets import (
 )
 
 from .. import config, i18n
-from .theme import COLOR_FOCUS, refresh_style
+from ..network.discovery import Searcher
+from ..share_auth import clean_password
+from .icons import svg_icon
+from .password_dialog import password_field
+from .theme import COLOR_FOCUS, COLOR_TEXT_SUBTLE, refresh_style
+
+# 찾은 공유 PC 는 이만큼까지만 보인다(창이 길어지지 않게).
+MAX_FOUND_ROWS = 5
 
 
 @dataclass
@@ -30,6 +38,9 @@ class ConnectionChoice:
     port: int
     host_ip: str = ""
     heartbeat_ms: int = config.DEFAULT_HEARTBEAT_MS
+    # 공유에 걸 비밀번호(공유 시작일 때). 빈 글이면 걸지 않는다. None 은 접속
+    # 창을 거치지 않았다는 뜻이다: 적어 둔 것을 그대로 쓴다.
+    password: str | None = None
 
 
 def default_nickname() -> str:
@@ -75,6 +86,52 @@ class _RoleButton(QPushButton):
             }}
         """)
         self.setText(f"{title}\n{subtitle}")
+
+
+class _FoundRow(QPushButton):
+    """내부망에서 찾은 공유 PC 한 줄: 이름, 비밀번호가 걸렸으면 자물쇠, 주소.
+    누르면 주소 칸에 들어간다."""
+
+    picked = Signal(dict)
+
+    def __init__(self, found: dict):
+        super().__init__()
+        self._found = found
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(30)
+        where = found["address"]
+        if found["port"] != config.DEFAULT_PORT:
+            where += f":{found['port']}"
+        self.setAccessibleName(f"{found['host']}, {where}")
+        self.setStyleSheet(f"""
+            QPushButton {{ background: transparent; border: none;
+                           border-radius: 6px; padding: 0; }}
+            QPushButton:hover {{ background: #F2F2F2; }}
+            QPushButton:checked {{ background: #E9E9E9; }}
+            QPushButton[kbFocus="true"] {{ border: 1px solid {COLOR_FOCUS}; }}
+        """)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(8, 0, 8, 0)
+        row.setSpacing(6)
+        name = QLabel(found["host"])
+        name.setTextFormat(Qt.PlainText)            # 남이 보낸 이름이다
+        name.setStyleSheet("font-weight: 600; color: #1F1F1F; background: transparent;")
+        row.addWidget(name)
+        if found.get("locked"):
+            lock = QLabel()
+            lock.setPixmap(svg_icon("lock", 13, "#6B7280").pixmap(13, 13))
+            lock.setStyleSheet("background: transparent;")
+            row.addWidget(lock)
+        row.addStretch(1)
+        address = QLabel(where)
+        address.setTextFormat(Qt.PlainText)
+        address.setStyleSheet(
+            f"font-size: 12px; color: {COLOR_TEXT_SUBTLE}; background: transparent;")
+        row.addWidget(address)
+        for label in self.findChildren(QLabel):
+            label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.clicked.connect(lambda: self.picked.emit(self._found))
 
 
 class ConnectDialog(QDialog):
@@ -144,6 +201,9 @@ class ConnectDialog(QDialog):
 
         self._choice: ConnectionChoice | None = None
         self._set_advanced(False)
+        # 내부망에서 공유 중인 PC 를 찾는다(참여를 골랐을 때).
+        self._searcher = Searcher(parent=self)
+        self._searcher.finished.connect(self._show_found)
 
     def _set_mode(self, idx: int) -> None:
         self._mode = idx
@@ -151,6 +211,37 @@ class ConnectDialog(QDialog):
         self._btn_guest.setChecked(idx == 1)
         self._host_form.setVisible(idx == 0)
         self._guest_form.setVisible(idx == 1)
+        if idx == 1:
+            self._searcher.search()
+
+    def _show_found(self, found: list) -> None:
+        """찾은 공유 PC 를 주소 칸 아래에 늘어놓는다. 없으면 줄도 없다."""
+        for row in self._found_rows:
+            row.setParent(None)
+            row.deleteLater()
+        self._found_rows = []
+        for item in found[:MAX_FOUND_ROWS]:
+            row = _FoundRow(item)
+            row.picked.connect(self._pick_found)
+            self._found_layout.addWidget(row)
+            self._found_rows.append(row)
+        self._guest_layout.setRowVisible(self._found_box, bool(self._found_rows))
+        # 하나뿐이고 주소를 아직 넣지 않았으면 그 PC 를 넣어 둔다.
+        untouched = (not self._guest_ip.isModified()
+                     and self._guest_ip.text().strip() in ("", "127.0.0.1"))
+        if len(self._found_rows) == 1 and untouched:
+            self._pick_found(found[0])
+
+    def _pick_found(self, found: dict) -> None:
+        self._guest_ip.setText(found["address"])
+        self._guest_port.setValue(int(found["port"]))
+        # 신호로 건너온 것은 사본이다. 주소로 견준다.
+        picked = (found["address"], found["port"])
+        for row in self._found_rows:
+            row.setChecked((row._found["address"], row._found["port"]) == picked)
+
+    def found(self) -> list[dict]:
+        return [row._found for row in self._found_rows]
 
     def _set_advanced(self, shown: bool) -> None:
         self._advanced_btn.setArrowType(Qt.DownArrow if shown else Qt.RightArrow)
@@ -172,6 +263,7 @@ class ConnectDialog(QDialog):
         w = QWidget()
         form = self._form(w)
         self._host_nickname = QLineEdit(nickname)
+        self._host_nickname.setMaxLength(config.MAX_NICKNAME_LENGTH)
         self._host_port = QSpinBox()
         self._host_port.setRange(1, 65535)
         self._host_port.setValue(config.DEFAULT_PORT)
@@ -183,6 +275,9 @@ class ConnectDialog(QDialog):
         self._host_heartbeat.setSuffix(i18n.t("connect.unit_seconds"))
         self._host_heartbeat.setValue(config.DEFAULT_HEARTBEAT_MS / 1000)
         form.addRow(i18n.t("connect.field_nickname"), self._host_nickname)
+        # 비워 두면 비밀번호 없이 공유한다.
+        self._host_password = password_field(i18n.t("connect.password_placeholder"))
+        form.addRow(i18n.t("connect.field_password"), self._host_password)
         self._add_advanced(form, i18n.t("connect.field_port"), self._host_port)
         self._add_advanced(form, i18n.t("connect.field_heartbeat"),
                            self._host_heartbeat)
@@ -193,6 +288,7 @@ class ConnectDialog(QDialog):
         w = QWidget()
         form = self._form(w)
         self._guest_nickname = QLineEdit(nickname)
+        self._guest_nickname.setMaxLength(config.MAX_NICKNAME_LENGTH)
         self._guest_ip = QLineEdit(last_ip)
         self._guest_ip.setPlaceholderText(i18n.t("connect.host_ip_placeholder"))
         self._guest_port = QSpinBox()
@@ -204,6 +300,14 @@ class ConnectDialog(QDialog):
         hint.setProperty("role", "subtle")
         hint.setWordWrap(True)
         form.addRow("", hint)
+        self._found_box = QWidget()
+        self._found_layout = QVBoxLayout(self._found_box)
+        self._found_layout.setContentsMargins(0, 0, 0, 0)
+        self._found_layout.setSpacing(2)
+        self._found_rows: list[_FoundRow] = []
+        form.addRow(i18n.t("connect.found"), self._found_box)
+        form.setRowVisible(self._found_box, False)
+        self._guest_layout = form
         self._add_advanced(form, i18n.t("connect.field_port"), self._guest_port)
         return w
 
@@ -215,6 +319,7 @@ class ConnectDialog(QDialog):
                 mode="host", nickname=nick,
                 port=self._host_port.value(),
                 heartbeat_ms=int(round(self._host_heartbeat.value() * 1000)),
+                password=clean_password(self._host_password.text()),
             )
         else:
             nick = (self._guest_nickname.text().strip() or default_nickname()

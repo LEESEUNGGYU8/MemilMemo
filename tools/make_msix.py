@@ -47,6 +47,7 @@ MENU_DLL = "MemilMenu.dll"
 MENU_DLL_SOURCE = ROOT / "build" / "shellext" / MENU_DLL
 CLSID_NEW_NOTE = "75353010-835E-4152-9B9C-4985F6DD6C77"
 CLSID_LINK_NOTE = "82DA3587-DE72-4930-8943-9AD6AADB32C3"
+CLSID_NEW_FOLDER = "C3A1F6B2-5D0E-4B7A-9E64-2F81D7C05A39"
 # 로고: 매니페스트에 적는 이름 → (배율 100% 일 때의 한 변, 그림이 차지하는 비율).
 # 타일(150)은 아이콘 둘레를 비워 둔다. 꽉 채우면 시작 화면에서 혼자 크게 보인다.
 LOGOS = {
@@ -112,6 +113,7 @@ MANIFEST = """<?xml version="1.0" encoding="utf-8"?>
             <com:SurrogateServer DisplayName="MemilMemo menu">
               <com:Class Id="{clsid_new}" Path="{menu_dll}" ThreadingModel="STA" />
               <com:Class Id="{clsid_link}" Path="{menu_dll}" ThreadingModel="STA" />
+              <com:Class Id="{clsid_folder}" Path="{menu_dll}" ThreadingModel="STA" />
             </com:SurrogateServer>
           </com:ComServer>
         </com:Extension>
@@ -125,6 +127,7 @@ MANIFEST = """<?xml version="1.0" encoding="utf-8"?>
             </desktop5:ItemType>
             <desktop10:ItemType Type="DesktopBackground">
               <desktop10:Verb Id="MemilNewNote" Clsid="{clsid_new}" />
+              <desktop10:Verb Id="MemilNewNoteFolder" Clsid="{clsid_folder}" />
             </desktop10:ItemType>
           </desktop4:FileExplorerContextMenus>
         </desktop4:Extension>
@@ -139,6 +142,8 @@ MANIFEST = """<?xml version="1.0" encoding="utf-8"?>
       <desktop2:FirewallRules Executable="{exe}">
         <desktop2:Rule Direction="in" IPProtocol="TCP" LocalPortMin="{port}" LocalPortMax="{port}" Profile="private" />
         <desktop2:Rule Direction="in" IPProtocol="TCP" LocalPortMin="{port}" LocalPortMax="{port}" Profile="domain" />
+        <desktop2:Rule Direction="in" IPProtocol="UDP" LocalPortMin="{find_port}" LocalPortMax="{find_port}" Profile="private" />
+        <desktop2:Rule Direction="in" IPProtocol="UDP" LocalPortMin="{find_port}" LocalPortMax="{find_port}" Profile="domain" />
       </desktop2:FirewallRules>
     </desktop2:Extension>
   </Extensions>
@@ -286,7 +291,10 @@ def main() -> int:
         languages="\n".join(f'    <Resource Language="{code}" />'
                             for code in STRINGS),
         exe=EXE_NAME, task=STARTUP_TASK_ID, alias=ALIAS, port=args.port,
+        # 내부망에서 공유 PC 를 찾는 신호를 받는 포트(app/network/discovery.py).
+        find_port=config.DISCOVERY_PORT,
         menu_dll=MENU_DLL, clsid_new=CLSID_NEW_NOTE, clsid_link=CLSID_LINK_NOTE,
+        clsid_folder=CLSID_NEW_FOLDER,
     ), encoding="utf-8")
 
     pri = make_pri(work, manifest, logo_names)

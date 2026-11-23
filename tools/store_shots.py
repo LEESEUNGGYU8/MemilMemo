@@ -7,7 +7,8 @@
 장면(capture_screenshots.py 의 readme 묶음)을 1920x1080 바탕에 제목과 함께 올린다.
 실제 화면은 찍지 않는다.
 
-``--icon`` 을 주면 300x300 앱 아이콘도 함께 만든다."""
+``--icon`` 을 주면 아이콘도 함께 만든다: 300x300(1:1 앱 타일 아이콘 칸)과
+1080x1080, 2160x2160(1:1 박스 아트 칸. 둘 중 하나만 올린다)."""
 from __future__ import annotations
 
 import argparse
@@ -137,6 +138,23 @@ def write_icon(path: Path, side: int = 300) -> None:
                   Qt.SmoothTransformation).save(str(path), "PNG")
 
 
+# 스토어의 1:1 박스 아트 칸이 받는 크기.
+BOX_ART_SIDES = (1080, 2160)
+
+
+def write_box_art(folder: Path) -> list[Path]:
+    """1:1 박스 아트. 아이콘 그림(1024)보다 크므로 늘리지 않고 벡터에서 바로 그린다."""
+    import make_icon                    # tools/make_icon.py (이 파일과 같은 폴더)
+
+    written = []
+    for side in BOX_ART_SIDES:
+        path = folder / f"icon-{side}.png"
+        if not make_icon.frame(side).save(str(path), "PNG"):
+            raise SystemExit(f"쓰지 못했습니다: {path}")
+        written.append(path)
+    return written
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--lang", default="ko", choices=sorted(SCENES))
@@ -144,7 +162,7 @@ def main() -> int:
                     help="capture_screenshots.py --set readme 로 찍은 폴더")
     ap.add_argument("--out", required=True)
     ap.add_argument("--icon", action="store_true",
-                    help="300x300 앱 아이콘도 만든다")
+                    help="앱 아이콘(300)과 박스 아트(1080, 2160)도 만든다")
     args = ap.parse_args()
 
     app = QGuiApplication.instance() or QGuiApplication([])
@@ -163,6 +181,8 @@ def main() -> int:
         icon = out / "icon-300.png"
         write_icon(icon)
         print(icon)
+        for path in write_box_art(out):
+            print(path)
     del app
     return 0
 

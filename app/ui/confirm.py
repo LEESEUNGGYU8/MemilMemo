@@ -21,6 +21,7 @@ from .theme import refresh_style
 MAX_LINE_WIDTH = 400
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+|(?<=[。！？])\s*")
 _CLAUSE_END = re.compile(r"(?<=[、，])")
+_KANA = re.compile("[\u3040-\u30ff]")
 
 
 def _fit(parts: list[str], joiner: str, fm: QFontMetrics, width: int) -> list[str]:
@@ -37,17 +38,19 @@ def _fit(parts: list[str], joiner: str, fm: QFontMetrics, width: int) -> list[st
 def _units(text: str) -> tuple[list[str], str]:
     """한 문장을 나눠도 되는 조각들과, 조각을 다시 이을 때 넣는 글자.
 
-    띄어쓰기가 있으면 낱말(한글은 그대로 두면 낱말 가운데서 끊긴다), 없으면
-    쉼표로 끝나는 마디(일본어). 나눌 곳이 없으면 빈 목록."""
+    띄어 쓰는 글이면 낱말(한글은 그대로 두면 낱말 가운데서 끊긴다). 일본어는
+    띄어 쓰지 않으므로('共有 PC' 같은 빈칸이 있어도) 쉼표로 끝나는 마디로 본다.
+    나눌 곳이 없으면 빈 목록."""
     words = text.split(" ")
-    if len(words) > 1:
+    if len(words) > 1 and not _KANA.search(text):
         return words, " "
     clauses = [c for c in _CLAUSE_END.split(text) if c]
     return (clauses, "") if len(clauses) > 1 else ([], "")
 
 
 def _anywhere(text: str, font: QFont, width: int) -> list[str]:
-    """나눌 곳이 없는 글(파일 경로)을 Qt 의 규칙으로 나눈다."""
+    """나눌 조각이 없거나 조각 하나가 폭보다 긴 글(일본어 문장, 파일 경로)을
+    Qt 의 규칙으로 나눈다."""
     layout = QTextLayout(text, font)
     option = QTextOption()
     option.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
@@ -64,6 +67,19 @@ def _anywhere(text: str, font: QFont, width: int) -> list[str]:
     return [ln for ln in lines if ln] or [text]
 
 
+def _narrowest(lines_at, low: int, width: int) -> list[str]:
+    """줄 수가 늘지 않는 가장 좁은 폭에서 나눈 줄들(줄 길이가 고르게 된다)."""
+    count = len(lines_at(width))
+    high = width
+    while low < high:
+        mid = (low + high) // 2
+        if len(lines_at(mid)) <= count:
+            high = mid
+        else:
+            low = mid + 1
+    return lines_at(high)
+
+
 def _balance(text: str, font: QFont, width: int) -> list[str]:
     """한 줄보다 긴 문장을 나눈다. 줄 수는 가장 적게, 줄 길이는 고르게 한다
     (마지막 줄에 낱말 하나만 남지 않게)."""
@@ -71,16 +87,8 @@ def _balance(text: str, font: QFont, width: int) -> list[str]:
     parts, joiner = _units(text)
     widest = max((fm.horizontalAdvance(p) for p in parts), default=width + 1)
     if widest > width:
-        return _anywhere(text, font, width)
-    count = len(_fit(parts, joiner, fm, width))
-    low, high = widest, width
-    while low < high:
-        mid = (low + high) // 2
-        if len(_fit(parts, joiner, fm, mid)) <= count:
-            high = mid
-        else:
-            low = mid + 1
-    return _fit(parts, joiner, fm, high)
+        return _narrowest(lambda w: _anywhere(text, font, w), 40, width)
+    return _narrowest(lambda w: _fit(parts, joiner, fm, w), widest, width)
 
 
 def break_lines(text: str, font: QFont, width: int = MAX_LINE_WIDTH) -> str:

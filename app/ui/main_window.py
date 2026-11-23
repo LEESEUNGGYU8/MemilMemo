@@ -30,12 +30,14 @@ from PySide6.QtWidgets import (
 
 from .. import config, html_guard, i18n
 from ..ipc import (
-    CMD_LINK_NOTE, CMD_NEW_NOTE, CMD_NEW_NOTE_HERE, CMD_SHOW, split_command,
+    CMD_LINK_NOTE, CMD_NEW_FOLDER_HERE, CMD_NEW_NOTE, CMD_NEW_NOTE_HERE,
+    CMD_SHOW, split_command,
 )
 from ..datetime_fmt import fmt_relative
 from ..local_state import FolderIconState, LocalStateStore
 from ..network.client_base import ClientBase
 from ..models import new_id
+from ..offline_drafts import KIND_EDIT, KIND_NEW, Draft, DraftStore
 from ..replica import ReplicaStore, copy_to_show, list_copies, read_copy
 from ..settings import (
     VIEW_COMPACT,
@@ -45,7 +47,8 @@ from ..settings import (
     VIEW_STANDARD,
     AppSettings,
 )
-from . import confirm, theme
+from . import confirm, drafts_dialog, password_dialog, theme
+from ..network.discovery import Searcher
 from .copies_dialog import CopiesDialog
 from .folder_dialog import FolderEditDialog
 from .folder_icon import FolderIconWidget
@@ -53,12 +56,15 @@ from .history_viewer import HistoryViewer
 from .icons import color_swatch_icon, svg_icon
 from .menu_item import add_centered_menu_action
 from .note_card import GRID_MIN_COLUMN, CardFlowLayout, NoteCard
-from .note_fold import FOLD_ICON, ICON_GRID, free_dock_slot, snap_icon_pos
+from . import note_fold as nf
+from .icon_grid import DesktopGrid
+from .note_fold import FOLD_ICON, free_dock_slot, snap_icon_pos
 from .rich_text import has_non_checkbox_image, html_to_plain
 from .sessions_dialog import SessionsDialog
 from .settings_dialog import SettingsDialog
 from .sticky_note import StickyNoteWidget
 from .theme import RoundedScrollBar
+from . import toast
 from .toast import ToastManager
 
 
@@ -84,6 +90,21 @@ NEW_NOTE_CURSOR_INSET = QPoint(24, 16)
 # 밖에서 온 '새 메모' 요청의 자리를 기억해 두는 시간(초). 그 안에 메모가
 # 만들어지지 않았으면 잊는다. 뒤늦게 만든 다른 메모가 그 자리로 가면 안 된다.
 NEW_NOTE_SPOT_TTL = 10.0
+# 공유 PC 에 올라가지 않은 메모에 붙이는 표시(메모 dict 의 키). 값은 KIND_NEW
+# (끊긴 동안 만든 메모) 또는 KIND_EDIT(사본의 메모를 끊긴 동안 고친 것)다.
+LOCAL_MARK = "offline"
+# 다시 붙은 뒤 끊긴 동안 쓴 메모를 어떻게 할지 묻기까지의 틈(ms). 화면이 공유
+# PC 의 내용으로 바뀐 뒤에 묻는다.
+DRAFTS_ASK_MS = 600
+# 전체 화면 중이라 묻지 못했을 때 다시 살펴보기까지의 틈(ms).
+DRAFTS_BUSY_RETRY_MS = 20000
+# 공유 PC 에 잇달아 이만큼 붙지 못하면 내부망에서 다시 찾아본다. 그 뒤로는 이 간격으로.
+FIND_AFTER_FAILS = 3
+FIND_EVERY_SECONDS = 30
+# 고친 메모를 새 메모로 올릴 때 원래 메모에서 비켜 놓는 거리(px).
+DRAFT_OFFSET = 28
+# 사라진 메모의 자리와 접힘을 들고 있는 시간(초). 같은 메모가 이 안에 다시 오면 되살린다.
+GONE_STATE_TTL = 5.0
 
 
 def _local_lan_ip() -> str:
@@ -171,7 +192,8 @@ class MainWindow(QMainWindow):
     def __init__(self, client: ClientBase, local_state: LocalStateStore,
                  role: str, settings: AppSettings | None = None,
                  app_icon: QIcon | None = None, parent=None,
-                 replica: ReplicaStore | None = None):
+                 replica: ReplicaStore | None = None,
+                 drafts: DraftStore | None = None):
         super().__init__(parent)
         self.setWindowTitle(i18n.t("app.name"))
         self.resize(380, 600)
@@ -241,6 +263,45 @@ class MainWindow(QMainWindow):
         self._replica = replica
         self._replica_shown = False
         self._replica_synced_at = 0
+        # 끊긴 동안 이 PC 에서 쓴 메모. 다시 붙으면 올릴지 묻는다. 참여하던 PC 가
+        # 사본으로 공유를 이어받으면 공유 PC 가 된 뒤에 묻는다.
+        self._drafts = drafts
+        # 끊긴 동안 편집을 시작한 사본의 메모(공유 PC 의 잠금 없이 이 PC 에서만 고친다).
+        self._offline_edit_ids: set[str] = set()
+        # 내가 지우는 중인 끊긴 동안의 메모(쓰던 글을 새 메모로 남기지 않는다).
+        self._discarding: set[str] = set()
+        # 방금 사라진 메모의 자리와 접힘(메모 id → (상태, 사라진 때)).
+        self._gone_states: dict[str, tuple[Any, float]] = {}
+        # 올리는 중인 것: 공유 PC 의 메모 id → 끊긴 동안 쓴 글의 키.
+        self._draft_uploads: dict[str, str] = {}
+        self._drafts_in_flight: set[str] = set()
+        # 마지막으로 붙은 뒤에 '보내지 못한 글'을 적어 둔 메모. 그 전부터 적혀 있던
+        # 글(다시 붙었을 때 보류한 것)과 가린다.
+        self._kept_since_welcome: set[str] = set()
+        # 이번 실행에서 '나중에'를 골랐는가. 그러면 다시 붙어도 묻지 않고 알림 줄만 둔다.
+        self._drafts_postponed = False
+        self._drafts_asking = False
+        # 목록 위 알림 줄이 지금 무엇을 알리는가("copy", "drafts", "gate", 없으면 빈 글).
+        self._notice_mode = ""
+        # 공유 PC 에 닿았는데 들어가지 못하고 사용자를 기다리는 까닭.
+        # "password": 비밀번호를 넣어야 한다, "open": 비밀번호를 걸어 두었던 공유
+        # PC 가 비밀번호 없이 답했다, "unverified": 비밀번호를 모르는 상대다.
+        self._gate = ""
+        self._gate_info: dict = {}
+        self._gate_asking = False
+        # 창에 매단 타이머로 묻는다. 창이 닫힌 뒤에 묻는 창이 뜨지 않는다.
+        self._gate_timer = QTimer(self)
+        self._gate_timer.setSingleShot(True)
+        self._gate_timer.timeout.connect(self._open_gate_when_free)
+        # 붙던 공유 PC 의 메모 묶음 식별값. 주소가 바뀐 그 PC 를 알아보는 데 쓴다.
+        self._host_id = ""
+        # 지금 붙은 공유에 비밀번호가 걸려 있는가(참가자 창에 보인다).
+        self._locked = False
+        self._fail_streak = 0
+        self._finder: Searcher | None = None
+        self._last_search = 0.0
+        # 이번 실행에서 붙지 않기로 한(또는 붙어 봤는데 아니던) 주소.
+        self._passed_hosts: set[tuple[str, int]] = set()
         # 알릴 새 메모(만든 사람 → 개수). 잠깐 모았다가 한 번에 알린다.
         self._announce: dict[str, int] = {}
         # 알릴 공개 전환(바꾼 사람 → 개수).
@@ -262,10 +323,25 @@ class MainWindow(QMainWindow):
         self._announce_timer.setInterval(self._ANNOUNCE_MS)
         self._announce_timer.timeout.connect(self._flush_announcements)
 
+        # 접힌 메모와 메모 폴더의 아이콘은 진짜 바탕화면 아이콘과 같은 칸에 같은
+        # 크기로 놓인다. 사용자가 바탕화면 아이콘의 크기를 바꾸면 따라 바뀐다.
+        self._desktop_grid = DesktopGrid(self)
+        nf.set_icon_grid_source(self._desktop_grid.grid_for)
+        # 아이콘들을 마지막으로 맞춰 놓은 격자(작업 영역 → 격자).
+        self._grids_used: dict[tuple, nf.IconGrid] = {}
+        # 우클릭 메뉴의 '새 메모 폴더 추가'로 만든 폴더(id → 놓을 자리).
+        # 공유 PC 가 만들었다고 답하면 그 자리에 아이콘을 두고 이름을 받는다.
+        self._new_folder_spots: dict[str, tuple[float, QPoint | None]] = {}
+        # 메모와 폴더를 한 번이라도 불러왔는가. 그 전에는 맞출 아이콘이 없다.
+        self._icons_loaded = False
+        self._desktop_grid.changed.connect(self._align_icons)
+        self._desktop_grid.start()
+
         self._build_ui()
         self._wire_client()
         self._build_tray()
         self._show_replica()
+        self._show_drafts()
 
     def _build_ui(self) -> None:
         root = QWidget(self)
@@ -480,29 +556,34 @@ class MainWindow(QMainWindow):
         self._cards_layout.setSpacing(8)
 
         self._scroll.setWidget(self._cards_container)
-        # 호스트에 붙지 못해 이 PC 의 사본을 보여 주는 동안 그 사실을 적어 둔다.
-        # 옆의 단추로 사본 창을 연다(공유 PC 를 다시 쓸 수 없을 때 이어받는 길).
-        self._replica_banner = QFrame()
-        self._replica_banner.setObjectName("ReplicaBanner")
-        self._replica_banner.setStyleSheet(
-            "QFrame#ReplicaBanner { background: #FFF7D6; "
-            "border: 1px solid #F1DE9A; border-radius: 10px; }"
-            "QFrame#ReplicaBanner QLabel { color: #5C4A00; font-size: 12px; "
-            "font-weight: 600; background: transparent; }"
-            "QFrame#ReplicaBanner QPushButton { background: #FFFFFF; "
-            "color: #5C4A00; border: 1px solid #E3CC7A; border-radius: 7px; "
-            "padding: 3px 10px; font-size: 11.5px; font-weight: 700; }"
-            "QFrame#ReplicaBanner QPushButton:hover { background: #FFFBEA; }")
+        # 목록 위의 한 줄 알림. 이 PC 의 사본을 보여 주는 중이거나, 끊긴 동안 쓴
+        # 메모를 아직 올리지 않았을 때 나온다. 상자나 바탕색 없이 글로만 두고,
+        # 상태줄의 연결 표시와 같은 색 점을 앞에 둔다. 오른쪽 글자를 누르면 사본
+        # 창(또는 올릴지 묻는 창)이 열린다.
+        self._replica_banner = QWidget()
+        self._replica_banner.setObjectName("ListNotice")
         banner_row = QHBoxLayout(self._replica_banner)
-        banner_row.setContentsMargins(12, 6, 8, 6)
-        banner_row.setSpacing(8)
+        banner_row.setContentsMargins(4, 2, 2, 8)
+        banner_row.setSpacing(7)
+        self._notice_dot = QFrame()
+        self._notice_dot.setFixedSize(6, 6)
+        banner_row.addWidget(self._notice_dot, 0, Qt.AlignVCenter)
         self._replica_text = QLabel("")
-        self._replica_text.setTextFormat(Qt.PlainText)   # 공유 PC 의 닉네임
-        self._replica_text.setWordWrap(True)
-        banner_row.addWidget(self._replica_text, 1)
+        self._replica_text.setTextFormat(Qt.PlainText)
+        self._replica_text.setStyleSheet(
+            "color: #374151; font-size: 12px; font-weight: 600; "
+            "background: transparent;")
+        banner_row.addWidget(self._replica_text, 1, Qt.AlignVCenter)
         self._copies_btn = QPushButton(i18n.t("main.replica_banner_btn"))
         self._copies_btn.setCursor(Qt.PointingHandCursor)
-        self._copies_btn.clicked.connect(self.open_copies)
+        self._copies_btn.setFlat(True)
+        self._copies_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: none; "
+            f"padding: 0 2px; color: {theme.COLOR_FOCUS}; font-size: 12px; "
+            "font-weight: 700; min-width: 0; min-height: 0; }"
+            "QPushButton:hover { color: #1D4ED8; text-decoration: underline; }"
+            "QPushButton:focus { text-decoration: underline; }")
+        self._copies_btn.clicked.connect(self._on_notice_action)
         banner_row.addWidget(self._copies_btn, 0, Qt.AlignVCenter)
         self._replica_banner.hide()
         scroll_wrap_v.addWidget(self._replica_banner)
@@ -717,20 +798,29 @@ class MainWindow(QMainWindow):
         c.historyList.connect(self._on_history_list)
         c.connectionChanged.connect(self._on_connection_changed)
         c.errorOccurred.connect(self._on_error)
+        c.passwordRequired.connect(self._on_password_required)
+        c.passwordAccepted.connect(self._on_password_accepted)
+        c.hostOpen.connect(lambda: self._hold_at_gate("open"))
+        c.hostUnverified.connect(lambda: self._hold_at_gate("unverified"))
+        c.followed.connect(self._on_followed)
 
     def _create_note(self, color: str, *, private: bool | None = None) -> None:
         """새 메모를 만든다. ``private`` 를 주지 않으면 설정의 기본 공개 범위를 따른다."""
-        if not self._connected:
-            # 끊긴 동안 보낸 요청은 그대로 사라진다. 아무 일도 안 일어난 것처럼
-            # 두지 않고 까닭을 알린다.
-            self._status.showMessage(
-                i18n.t("main.status_offline_no_create"), 5000)
-            return
         # 전체 / 미분류 뷰에서는 폴더 없음으로, 그 외엔 현재 폴더에 넣는다.
         folder_id = (self._current_folder
                      if self._current_folder not in
                      (FOLDER_ALL, FOLDER_NONE)
                      else None)
+        if not self._connected:
+            if self._can_work_offline():
+                # 끊긴 동안에는 이 PC 에만 만든다. 다시 붙으면 올릴지 묻는다.
+                self._create_offline_note(color, folder_id)
+                return
+            # 끊긴 동안 보낸 요청은 그대로 사라진다. 아무 일도 안 일어난 것처럼
+            # 두지 않고 까닭을 알린다.
+            self._status.showMessage(
+                i18n.t("main.status_offline_no_create"), 5000)
+            return
         if private is None:
             private = bool(self._settings.new_note_private)
         self._client.create_note(
@@ -766,6 +856,8 @@ class MainWindow(QMainWindow):
         elif cmd == CMD_NEW_NOTE_HERE:
             # 바탕 화면 우클릭 메뉴에서 왔다. 마우스가 있는 자리에 띄운다.
             self.handle_new_note_request(QCursor.pos())
+        elif cmd == CMD_NEW_FOLDER_HERE:
+            self.handle_new_folder_request(QCursor.pos())
         elif cmd == CMD_LINK_NOTE:
             if arg:
                 self._queue_link_path(arg)
@@ -802,7 +894,7 @@ class MainWindow(QMainWindow):
         paths = [p for p in paths if p]
         if not paths:
             return
-        if not self._connected:
+        if not self._connected and not self._can_work_offline():
             self._show_main_window()
             return
         self._link_note_queue.append(paths)
@@ -814,13 +906,37 @@ class MainWindow(QMainWindow):
 
         메인 창은 건드리지 않는다. 만들어진 메모만 다른 창들 위로 올라온다
         (_on_note_created). ``at`` 을 주면 그 자리에 띄운다."""
-        if not self._connected:
-            # 끊긴 동안에는 만들 수 없다. 아무 일도 안 일어난 것처럼 보이지
-            # 않도록, 까닭(연결 상태)이 보이는 메인 창을 띄운다.
+        if not self._connected and not self._can_work_offline():
+            # 만들 수 없다. 아무 일도 안 일어난 것처럼 보이지 않도록, 까닭(연결
+            # 상태)이 보이는 메인 창을 띄운다.
             self._show_main_window()
             return
         self._new_note_spots.append((time.monotonic(), at))
         self._create_note(self._settings.default_note_color)
+
+    def handle_new_folder_request(self, at: QPoint | None = None) -> None:
+        """바탕 화면 우클릭 메뉴의 '새 메모 폴더 추가'. 폴더를 만들어 그 자리에
+        아이콘으로 두고, 바탕화면에서 새 폴더를 만들 때처럼 곧바로 이름을 받는다."""
+        if not self._connected:
+            # 폴더는 공유 PC 에 만든다. 끊겨 있으면 까닭이 보이는 메인 창을 띄운다.
+            self._show_main_window()
+            self._require_online()
+            return
+        folder_id = new_id()
+        self._new_folder_spots[folder_id] = (time.monotonic(), at)
+        self._client.create_folder(
+            self._free_folder_name(i18n.t("main.folder_new_default_name")),
+            config.DEFAULT_COLOR, False, folder_id=folder_id)
+
+    def _free_folder_name(self, base: str) -> str:
+        """이미 있는 폴더와 겹치지 않는 이름: 새 폴더, 새 폴더 (2), ..."""
+        names = {str(f.get("name") or "") for f in self._folders.values()}
+        if base not in names:
+            return base
+        number = 2
+        while f"{base} ({number})" in names:
+            number += 1
+        return f"{base} ({number})"
 
     def _take_new_note_spot(self) -> QPoint | None:
         """방금 만들어진 메모에 해당하는 요청 자리를 꺼낸다."""
@@ -892,9 +1008,10 @@ class MainWindow(QMainWindow):
         dlg.copiesRequested.connect(self.open_copies)
         dlg.exec()
         self._apply_tray_visibility()
-        # '붙인 메모를 다른 창 위에' 설정은 떠 있는 메모에 바로 반영한다.
+        # '붙인 메모를 다른 창 위에'와 접힌 모양은 떠 있는 메모에 바로 반영한다.
         for w in self._stickies.values():
             w.refresh_dock_layer()
+            w.refresh_fold_face()
 
     def open_copies(self) -> None:
         """이 PC 에 받아 둔 사본을 열어 본다. 빠진 메모를 가져오거나, 공유 PC 를
@@ -992,10 +1109,16 @@ class MainWindow(QMainWindow):
             connected=self._connected,
             heartbeat_ms=self._heartbeat_ms,
             peer_address=peer_address,
+            locked=self._locked and self._connected,
         )
 
     def _on_connection_changed(self, connected: bool) -> None:
         self._connected = connected
+        if connected:
+            self._gate, self._gate_info = "", {}
+            self._fail_streak = 0
+        else:
+            self._fail_streak += 1
         if connected:
             self._was_connected = True
             self._connect_failures = 0
@@ -1005,13 +1128,136 @@ class MainWindow(QMainWindow):
             self._status.showMessage(i18n.t("main.status_disconnected"), 6000)
         else:
             self._connect_failures += 1
-        # 끊긴 동안에는 메모에 '오프라인'을 적고 새 편집을 막는다.
+        # 끊긴 동안에는 메모에 '오프라인'을 적는다.
         for w in self._stickies.values():
             w.set_offline(not connected)
+        if not connected:
+            self._enter_offline()
+            self._find_host_again()
         self._refresh_status_text()
         self._refresh_count()
         self._refresh_sessions_dialog()
         self._refresh_replica_banner()
+
+    # ── 비밀번호가 걸린 공유 ──
+
+    def _on_password_required(self, info: dict) -> None:
+        self._gate_info = dict(info or {})
+        self._hold_at_gate("password")
+
+    def _on_password_accepted(self, auth: dict) -> None:
+        # 다음부터 묻지 않게 열쇠를 적어 둔다(비밀번호 글자는 적지 않는다).
+        self._local.state.share_auth = dict(auth)
+        self._local.save()
+
+    def _hold_at_gate(self, gate: str) -> None:
+        self._gate = gate
+        self._refresh_status_text()
+        self._refresh_replica_banner()
+        self._gate_timer.start(0)
+
+    def _open_gate_when_free(self) -> None:
+        """스스로 묻는 경우. 전체 화면으로 발표하는 중이면 창을 띄우지 않고
+        기다린다(목록 위의 알림은 그대로 있다)."""
+        if (not self._gate or self._gate_asking or self._connected
+                or self._force_quit):
+            return
+        if toast.user_is_busy():
+            self._gate_timer.start(DRAFTS_BUSY_RETRY_MS)
+            return
+        self._open_gate()
+
+    def _open_gate(self) -> None:
+        """들어가지 못하고 기다리는 까닭을 사용자와 푼다."""
+        if self._gate_asking or not self._gate:
+            return
+        self._gate_asking = True
+        try:
+            if self._gate == "password":
+                info, self._gate_info = self._gate_info, {}
+                text = self._ask_password(bool(info.get("wrong")),
+                                          int(info.get("wait") or 0))
+                if text:
+                    self._client.submit_password(text)
+                else:
+                    self._client.pause()        # 알림 줄에서 다시 넣을 수 있다
+            elif self._gate == "open":
+                if confirm.ask(self, i18n.t("auth.window_title"),
+                               i18n.t("auth.open_body"),
+                               action=i18n.t("auth.btn_connect")):
+                    self._local.state.share_auth = None
+                    self._local.save()
+                    self._client.set_auth(None)
+                    self._gate = ""
+                    self._client.resume()
+            else:
+                confirm.notify(self, i18n.t("auth.window_title"),
+                               i18n.t("auth.unverified_body"),
+                               icon=QMessageBox.Warning)
+        finally:
+            self._gate_asking = False
+        self._refresh_status_text()
+        self._refresh_replica_banner()
+
+    def _ask_password(self, wrong: bool, wait: int) -> str | None:
+        return password_dialog.ask(self, wrong=wrong, wait=wait)
+
+    # ── 공유 PC 다시 찾기 ──
+
+    def _find_host_again(self) -> None:
+        """붙던 공유 PC 에 거듭 붙지 못하면 내부망에서 찾아본다. 주소가 바뀌었거나
+        다른 PC 가 공유를 이어받았을 수 있다."""
+        if (self._role != "guest" or self._connected or self._gate
+                or not self._host_id or self._fail_streak < FIND_AFTER_FAILS):
+            return
+        now = time.monotonic()
+        if self._last_search and now - self._last_search < FIND_EVERY_SECONDS:
+            return
+        self._last_search = now
+        if self._finder is None:
+            self._finder = Searcher(parent=self)
+            self._finder.finished.connect(self._on_hosts_found)
+        self._finder.search()
+
+    def _on_hosts_found(self, found: list) -> None:
+        if self._connected or self._gate or self._force_quit:
+            return
+        current = self._client.address()
+        known = bool(self._local.state.share_auth)
+        for item in found:
+            where = (item["address"], item["port"])
+            if where == current or where in self._passed_hosts:
+                continue
+            if item["host_id"] == self._host_id:
+                if item["locked"] and known:
+                    # 비밀번호로 서로를 확인할 수 있다. 붙어 봐서 맞으면 옮기고,
+                    # 아니면 묻지 않고 돌아온다. 같은 곳을 거듭 찔러 보지는 않는다.
+                    self._passed_hosts.add(where)
+                    self._client.follow(*where)
+                    return
+                body = i18n.t("discover.moved_body")
+            elif item["took_over_from"] == self._host_id:
+                body = i18n.t("discover.took_over_body", host=item["host"])
+            else:
+                continue                    # 내가 붙던 공유와 상관없는 PC 다
+            # 확인할 방법이 없다(답은 누구나 꾸밀 수 있다). 사용자가 정한다.
+            if toast.user_is_busy():
+                return                      # 다음에 찾았을 때 묻는다
+            self._passed_hosts.add(where)
+            if confirm.ask(self, i18n.t("discover.title"), body,
+                           detail=item["address"],
+                           action=i18n.t("auth.btn_connect")):
+                self._on_followed(*where, quiet=True)
+                self._client.set_address(*where)
+            return
+
+    def _on_followed(self, host: str, port: int, quiet: bool = False) -> None:
+        """붙을 공유 PC 의 주소가 바뀌었다. 다음에 켤 때도 그 주소로 붙는다."""
+        self._local.state.last_host_ip = host
+        self._local.state.last_host_port = int(port)
+        self._local.save()
+        if not quiet:
+            self._show_notification(i18n.t("discover.followed"))
 
     def _host_unreachable(self) -> bool:
         """게스트가 호스트에 한 번도 붙지 못하고 거듭 실패하는 중인가."""
@@ -1047,6 +1293,19 @@ class MainWindow(QMainWindow):
         holder = self._locks.get(note_id) or ""
         return holder if holder != self._client.nickname() else ""
 
+    def _move_blocked_by(self, note_id: str, folder_id) -> str:
+        """이 폴더로 옮기면 보는 사람이 달라지는데 다른 사람이 편집 중이면 그
+        사람의 닉네임. 옮겨도 되면 빈 문자열."""
+        holder = self._locked_by_other(note_id)
+        note = self._notes.get(note_id)
+        if not holder or note is None or note.get("private_owner"):
+            return ""
+
+        def owner(fid):
+            return (self._folders.get(fid or "") or {}).get("private_owner") or None
+
+        return holder if owner(note.get("folder_id")) != owner(folder_id) else ""
+
     def _tell_locked(self, holder: str) -> None:
         confirm.notify(
             self, i18n.t("main.msg_delete_locked_title"),
@@ -1057,14 +1316,20 @@ class MainWindow(QMainWindow):
     def _on_welcomed(self, data: dict) -> None:
         self._users = list(data.get("users", []))
         self._host_nickname = data.get("host", "") or self._host_nickname
+        self._host_id = str(data.get("host_id") or "") or self._host_id
+        self._locked = data.get("locked") is True
         self._heartbeat_ms = int(data.get("heartbeat_ms", 0)) or self._heartbeat_ms
         # 호스트가 보낸 것으로 바꾼다. 사본을 보여 주던 중이었으면 여기서 끝난다.
         self._replica_shown = False
         self._refresh_replica_banner()
+        # 끊긴 동안 이 PC 에서만 고치던 글은 지금 것까지 적어 둔다(아래에서 묻는다).
+        self._flush_offline_edits()
+        self._kept_since_welcome.clear()
         # 끊긴 동안 쓰던 글은 아래에서 메모 창을 새로 만들면 사라진다. 먼저 챙긴다.
         unsent = {nid: text for nid, w in self._stickies.items()
                   if (text := w.unsent_edit())}
-        seen_versions = {nid: self._stickies[nid].version for nid in unsent}
+        seen_versions = {nid: self._stickies[nid].unsent_base_version()
+                         for nid in unsent}
         # 나만 보던 메모의 글은 되살릴 때도 나만 보게 한다. 폴더가 바뀌기 전에 적어 둔다.
         was_private = {nid: self._note_is_private(self._notes.get(nid))
                        for nid in unsent}
@@ -1079,6 +1344,7 @@ class MainWindow(QMainWindow):
         self._load_snapshot(data.get("notes") or [], data.get("folders") or [],
                             dict(data.get("locks", {})), offline=False)
         self._recover_unsent(unsent, seen_versions, was_private)
+        self._settle_drafts(set(unsent))
 
     def _load_snapshot(self, notes: list, folders: list, locks: dict, *,
                        offline: bool) -> None:
@@ -1113,6 +1379,7 @@ class MainWindow(QMainWindow):
             key=lambda n: n.get("updated_at", 0),
             reverse=True,
         )
+        self._hide_notes_new_to_this_pc(sorted_notes, received=not offline)
         for note in sorted_notes:
             self._notes[note["id"]] = note
             self._append_card(note)
@@ -1123,6 +1390,39 @@ class MainWindow(QMainWindow):
                 # 사본이다. 호스트에 닿을 때까지는 읽기만 한다.
                 self._stickies[note["id"]].set_offline(True)
         self._refresh_folder_icons()
+        # 아이콘으로 접힌 메모와 폴더 아이콘을 바탕화면 아이콘의 칸에 맞춘다
+        # (앱이 꺼져 있는 동안 바탕화면 아이콘의 크기가 바뀌었을 수 있다).
+        self._icons_loaded = True
+        self._align_icons()
+
+    def _hide_notes_new_to_this_pc(self, notes: list, *,
+                                   received: bool) -> None:
+        """이 PC 가 처음 받는 남의 메모는 숨김으로 둔다.
+
+        붙어 있을 때 남이 만든 메모는 숨김으로 들어온다(_on_note_created). 꺼져
+        있거나 끊긴 동안 만들어진 메모도 같게 다룬다. 그러지 않으면 다시 붙었을
+        때 그 메모들이 바탕화면의 같은 자리에 한꺼번에 뜬다.
+
+        ``received`` 는 공유 PC 가 방금 보낸 것인가(사본을 보여 줄 때는 거짓)."""
+        state = self._local.state
+        if not state.hides_new:
+            # 이 규칙이 없던 버전에서 올라온 PC 다. 그 버전은 받은 메모를 모두
+            # 띄웠고 자리 기록을 뒤늦게 적었으므로, 기록이 없는 메모도 바탕화면에
+            # 떠 있었을 수 있다. 지금 받은 것은 모두 본 것으로 적고 다음부터 가린다.
+            if received:
+                for note in notes:
+                    state.get_note_state(note["id"])
+                state.hides_new = True
+                self._local.save()
+            return
+        me = self._client.nickname()
+        known = state.notes
+        fresh = [n["id"] for n in notes
+                 if n["id"] not in known and n.get("created_by") != me]
+        for note_id in fresh:
+            state.get_note_state(note_id).hidden = True
+        if fresh:
+            self._local.save()
 
     def _show_replica(self) -> None:
         """호스트에 붙기 전에 이 PC 의 사본을 먼저 보여 준다(읽기 전용).
@@ -1147,6 +1447,7 @@ class MainWindow(QMainWindow):
                 notes, folders, meta = read_copy(path)
         except Exception:
             return
+        self._host_id = str(meta.get("host_id") or "")
         if not notes:
             return
         try:
@@ -1158,15 +1459,474 @@ class MainWindow(QMainWindow):
         self._refresh_replica_banner()
 
     def _refresh_replica_banner(self) -> None:
-        showing = self._replica_shown and not self._connected
-        if showing:
+        """목록 위 알림 줄을 지금 상황에 맞춘다."""
+        showing_copy = self._replica_shown and not self._connected
+        waiting = len(self._pending_drafts()) if self._connected else 0
+        if self._gate and not self._connected:
+            # 공유 PC 에 닿았는데 들어가지 못했다. 할 일이 있는 쪽을 먼저 알린다.
+            self._notice_mode = "gate"
+            if self._gate == "password":
+                text = i18n.t("auth.notice_password")
+                button = i18n.t("auth.notice_password_btn")
+            elif self._gate == "open":
+                text = i18n.t("auth.notice_open")
+                button = i18n.t("auth.btn_connect")
+            else:
+                text = i18n.t("auth.notice_unverified")
+                button = i18n.t("auth.notice_retry")
+            self._replica_text.setText(text)
+            self._copies_btn.setText(button)
+            color = theme.COLOR_STATE_WAIT
+        elif showing_copy:
+            self._notice_mode = "copy"
             self._replica_text.setText(i18n.t(
                 "main.replica_banner",
                 when=fmt_relative(self._replica_synced_at)))
-        self._replica_banner.setVisible(showing)
-        # 안내와 목록 사이를 띄운다(안내가 없을 때는 틈도 없다).
-        self._replica_banner.setContentsMargins(0, 0, 0, 0)
-        self._scroll.parentWidget().layout().setSpacing(8 if showing else 0)
+            self._copies_btn.setText(i18n.t("main.replica_banner_btn"))
+            # 상태줄의 연결 표시와 같은 색을 쓴다(접속 중이면 주황, 끊겼으면 빨강).
+            color = _ConnectionBadge._COLORS.get(
+                self._conn_badge.state(), theme.COLOR_STATE_WAIT)
+        elif waiting:
+            self._notice_mode = "drafts"
+            self._replica_text.setText(i18n.t("drafts.notice", count=waiting))
+            self._copies_btn.setText(i18n.t("drafts.notice_btn"))
+            color = theme.COLOR_STATE_WAIT
+        else:
+            self._notice_mode = ""
+            color = theme.COLOR_STATE_OFF
+        self._notice_dot.setStyleSheet(
+            f"background: {color}; border-radius: 3px; border: none;")
+        self._replica_banner.setVisible(bool(self._notice_mode))
+        self._scroll.parentWidget().layout().setSpacing(0)
+
+    def _on_notice_action(self) -> None:
+        mode = getattr(self, "_notice_mode", "")
+        if mode == "drafts":
+            self._drafts_postponed = False
+            self._ask_about_drafts()
+        elif mode == "gate":
+            if self._gate in ("password", "open"):
+                self._open_gate()
+            else:
+                self._gate = ""
+                self._client.resume()
+                self._refresh_status_text()
+                self._refresh_replica_banner()
+        else:
+            self.open_copies()
+
+    # ── 끊긴 동안 쓴 메모 ──
+
+    def _address(self) -> str:
+        """붙으려는 공유 PC 의 주소. 끊긴 동안 쓴 글에 함께 적어 둔다."""
+        ls = self._local.state
+        return f"{ls.last_host_ip}:{ls.last_host_port}"
+
+    def _can_work_offline(self) -> bool:
+        """공유 PC 없이 이 PC 에서만 메모를 만들고 고칠 수 있는 때인가."""
+        return self._drafts is not None and not self._connected
+
+    def _is_local_note(self, note_id: str) -> bool:
+        return (self._notes.get(note_id) or {}).get(LOCAL_MARK) == KIND_NEW
+
+    @staticmethod
+    def _blank(content: str) -> bool:
+        return (not html_to_plain(content or "").replace("\ufffc", "").strip()
+                and "<img" not in (content or "").lower())
+
+    def _pending_drafts(self) -> list[Draft]:
+        """내가 끊긴 동안 쓴 것들(올리는 중인 것은 뺀다)."""
+        if self._drafts is None:
+            return []
+        try:
+            found = self._drafts.pending(self._client.nickname())
+        except Exception:
+            return []
+        return [d for d in found if d.key not in self._drafts_in_flight]
+
+    def _create_offline_note(self, color: str, folder_id: str | None) -> None:
+        me = self._client.nickname()
+        now = int(time.time() * 1000)
+        # 원래 메모에 넣지 못해 새 메모로 남기려던 글이 있으면 그 글을 담는다.
+        content = self._orphan_texts.pop(0) if self._orphan_texts else ""
+        note = {
+            "id": new_id(), "content": content, "color": color,
+            "width": config.DEFAULT_NOTE_WIDTH,
+            "height": config.DEFAULT_NOTE_HEIGHT,
+            "created_by": me, "created_at": now,
+            "updated_by": me, "updated_at": now, "version": 1, "deleted": 0,
+            "folder_id": folder_id if folder_id in self._folders else None,
+            # 올릴 때 나만 보기로 들어간다. 그때까지도 그렇게 보여 준다.
+            "private_owner": me, LOCAL_MARK: KIND_NEW,
+        }
+        self._drafts.save_new(self._storable(note), address=self._address(),
+                              nickname=me)
+        self._on_note_created(note)
+        w = self._stickies.get(note["id"])
+        if w is not None:
+            w.set_offline(True)
+
+    @staticmethod
+    def _storable(note: dict) -> dict:
+        return {k: v for k, v in note.items() if k != LOCAL_MARK}
+
+    def _save_offline(self, note_id: str, content: str, color: str,
+                      w: int, h: int) -> None:
+        """끊긴 동안 고친 글을 이 PC 에 적어 둔다."""
+        note = self._notes.get(note_id)
+        if note is None or self._drafts is None:
+            return
+        me = self._client.nickname()
+        changed = dict(note, content=content, color=color, width=w, height=h,
+                       updated_by=me, updated_at=int(time.time() * 1000))
+        if note.get(LOCAL_MARK) == KIND_NEW:
+            changed["version"] = int(note.get("version") or 1) + 1
+            self._drafts.save_new(self._storable(changed),
+                                  address=self._address(), nickname=me)
+            self._on_note_updated(changed)
+            return
+        # 사본의 메모다. 연결돼 있을 때 쓰기 시작한 글은 메모 창이 '보내지 못한
+        # 글'로 쥐고 있다가 다시 붙으면 제자리에 넣는다. 여기에는 앱을 껐다
+        # 켜도 남도록 적어만 둔다.
+        started_online = note_id not in self._offline_edit_ids
+        if started_online:
+            self._set_aside_older_draft(note_id, content)
+        self._drafts.save_edit(
+            note_id, self._storable(changed),
+            base_version=int(note.get("version") or 0),
+            started_online=started_online,
+            address=self._address(), nickname=me)
+        if started_online:
+            return
+        changed[LOCAL_MARK] = KIND_EDIT
+        self._on_note_updated(changed)
+
+    def _set_aside_older_draft(self, note_id: str, content: str) -> None:
+        """이 메모를 고쳐 적어 둔 글이 전부터 있으면 새 메모로 돌려 둔다.
+
+        다시 붙었을 때 보류한 글이다. 그 뒤 붙어 있는 동안 쓰기 시작한 글은
+        공유 PC 의 글에서 시작한 다른 글이라, 같은 자리에 적으면 먼저 쓴 글이
+        묻지도 않고 사라진다. 올리면 어차피 새 메모가 될 글이므로 지금 그렇게
+        적어 둔다."""
+        if self._drafts is None or note_id in self._kept_since_welcome:
+            return
+        self._kept_since_welcome.add(note_id)
+        if note_id in self._draft_uploads:
+            return                          # 제자리에 넣는 중인 같은 줄기의 글이다
+        me = self._client.nickname()
+        earlier = self._drafts.get_edit(note_id, me)
+        if (earlier is None or earlier.content == content
+                or self._blank(earlier.content)):
+            return
+        self._drafts.remove(earlier.key)
+        self._drafts.save_new(dict(earlier.note, id=new_id(), private_owner=me),
+                              address=self._address(), nickname=me)
+        # 끊긴 동안이면 바탕화면과 목록에도 따로 보인다(붙어 있으면 아무 일 없다).
+        QTimer.singleShot(0, self._show_drafts)
+
+    def _keep_text_in_flight(self) -> None:
+        """프로그램을 끝내며 보내는 글을 이 PC 에도 적어 둔다.
+
+        답을 기다리지 않고 끝나므로 그 글이 공유 PC 에 닿았는지 알 수 없다(막
+        끊긴 연결은 보낸 것처럼 보인다). 닿았으면 다음에 붙을 때 같은 글이라
+        조용히 지워지고, 닿지 못했으면 그때 제자리에 넣는다."""
+        if (self._drafts is None or self._role != "guest"
+                or not self._connected):
+            return
+        me = self._client.nickname()
+        try:
+            for note_id, w in list(self._stickies.items()):
+                note = self._notes.get(note_id)
+                if (note is None or note_id in self._offline_edit_ids
+                        or note.get(LOCAL_MARK)):
+                    continue
+                text = w.unsent_edit()
+                if text is None:
+                    continue
+                self._set_aside_older_draft(note_id, text)
+                self._drafts.save_edit(
+                    note_id, self._storable(dict(note, content=text)),
+                    base_version=w.unsent_base_version(), started_online=True,
+                    address=self._address(), nickname=me)
+            self._keep_unanswered_text()
+        except Exception:
+            pass                            # 끝내는 길이다. 적지 못해도 보내기는 한다
+
+    def _delete_local_note(self, note_id: str) -> None:
+        """끊긴 동안 만든 메모를 지운다. 공유 PC 에 없는 메모라 이 PC 에서만 지운다."""
+        note = self._notes.get(note_id)
+        if note is None:
+            return
+        if not confirm.ask(
+                self, i18n.t("main.msg_delete_confirm_title"),
+                i18n.t("main.msg_delete_confirm_body",
+                       title=self._note_title(note, 30)),
+                detail=i18n.t("drafts.delete_detail"),
+                action=i18n.t("common.btn_delete"), danger=True):
+            return
+        if self._drafts is not None:
+            self._drafts.remove(note_id)
+        self._offline_edit_ids.discard(note_id)
+        # 내가 지우는 것이다. 쓰던 글을 새 메모로 남기지 않는다.
+        self._discarding.add(note_id)
+        try:
+            self._on_note_deleted(note_id)
+        finally:
+            self._discarding.discard(note_id)
+
+    def _enter_offline(self) -> None:
+        """공유 PC 와 끊겼다(또는 아직 붙지 못했다)."""
+        me = self._client.nickname()
+        # 누가 편집 중이었는지는 이제 알 수 없다. 남의 잠금 표시를 걷어, 끊긴
+        # 동안에도 메모를 고칠 수 있게 한다.
+        self._locks = {nid: who for nid, who in self._locks.items() if who == me}
+        for w in self._stickies.values():
+            if w.is_locked_by_other():
+                w.set_lock_holder(None)
+        # 보내 놓고 답을 받지 못한 일은 잊는다. 다시 붙었을 때 엉뚱한 메모와
+        # 짝지어지지 않게 한다. 올리던 글은 적어 둔 채이므로 다시 묻게 된다.
+        self._keep_unanswered_text()
+        self._recreate_queue.clear()
+        self._link_note_queue.clear()
+        self._pending_restore.clear()
+        self._draft_uploads.clear()
+        self._drafts_in_flight.clear()
+        if (self._role == "guest" and self._was_connected and self._notes
+                and not self._replica_shown):
+            # 지금 보이는 것은 끊기기 직전에 받은 내용이다. 앱을 켤 때 사본을
+            # 보여 주는 것과 같게 목록 위에 알린다.
+            self._replica_shown = True
+            self._replica_synced_at = int(time.time() * 1000)
+        self._show_drafts()
+
+    def _keep_unanswered_text(self) -> None:
+        """잠금을 청해 놓고 넣지 못한 글과, 새 메모에 담으려던 글을 챙긴다.
+
+        그대로 두면 다시 붙은 뒤 그 메모를 편집하려고 누르는 순간 옛 글이
+        들어가거나, 다음에 만드는 아무 메모에 담긴다. 이 PC 에 적어 두었다가
+        다시 붙었을 때 다룬다(적어 둘 곳이 없으면 새 메모에 담을 글로 남긴다)."""
+        me = self._client.nickname()
+        pending, self._pending_resend = self._pending_resend, {}
+        for note_id, text in pending.items():
+            if note_id in self._draft_uploads:
+                continue                    # 올리던 글이다. 적어 둔 것이 그대로 있다
+            note = self._notes.get(note_id)
+            if self._drafts is None or note is None:
+                self._orphan_texts.append(text)
+                continue
+            self._set_aside_older_draft(note_id, text)
+            self._drafts.save_edit(
+                note_id, self._storable(dict(note, content=text)),
+                base_version=int(note.get("version") or 0), started_online=True,
+                address=self._address(), nickname=me)
+        if self._drafts is None:
+            return
+        orphans, self._orphan_texts = self._orphan_texts, []
+        now = int(time.time() * 1000)
+        for text in orphans:
+            self._drafts.save_new({
+                "id": new_id(), "content": text,
+                "color": self._settings.default_note_color or config.DEFAULT_COLOR,
+                "width": config.DEFAULT_NOTE_WIDTH,
+                "height": config.DEFAULT_NOTE_HEIGHT,
+                "created_by": me, "created_at": now, "updated_by": me,
+                "updated_at": now, "version": 1, "deleted": 0,
+                "folder_id": None, "private_owner": me,
+            }, address=self._address(), nickname=me)
+
+    def _show_drafts(self) -> None:
+        """끊긴 동안 쓴 메모를 목록과 바탕화면에 올려 둔다(붙어 있지 않을 때만)."""
+        if not self._can_work_offline():
+            return
+        me = self._client.nickname()
+        shown = False
+        for d in self._pending_drafts():
+            if d.kind == KIND_NEW:
+                if d.key in self._notes:
+                    continue
+                note = dict(d.note, id=d.key)
+                note[LOCAL_MARK] = KIND_NEW
+            else:
+                base = self._notes.get(d.base_id)
+                if (base is None and d.started_online
+                        and not (self._replica_shown or self._was_connected)):
+                    # 받아 둔 메모를 아직 하나도 보이지 못했다. 원래 메모가 없는
+                    # 것이 아니라 모르는 것이다. 붙어 있을 때 쓰던 글이므로 붙은
+                    # 뒤에 제자리에 넣을 수 있는지 본다.
+                    continue
+                if base is None:
+                    # 원래 메모가 사본에 없다. 끊긴 동안 만든 메모로 다룬다.
+                    note = dict(d.note, id=new_id(), private_owner=me)
+                    self._drafts.remove(d.key)
+                    self._drafts.save_new(note, address=self._address(), nickname=me)
+                    note[LOCAL_MARK] = KIND_NEW
+                else:
+                    held = self._stickies.get(d.base_id)
+                    if held is not None and held.unsent_edit() is not None:
+                        continue        # 메모 창이 그 글을 쥐고 있다
+                    if (base.get(LOCAL_MARK) == KIND_EDIT
+                            and (base.get("content") or "") == d.content):
+                        continue
+                    # 내가 고친 글이다. 고친 사람을 원래 메모의 것으로 두면 그 사람이
+                    # 방금 고친 것처럼 알림이 뜬다.
+                    note = dict(base, content=d.content,
+                                color=d.note.get("color") or base.get("color"),
+                                updated_by=me,
+                                updated_at=d.note.get("updated_at")
+                                or base.get("updated_at"))
+                    note[LOCAL_MARK] = KIND_EDIT
+            if note["id"] in self._notes:
+                self._on_note_updated(note)
+            else:
+                self._notes[note["id"]] = note
+                self._append_card(note)
+                self._ensure_sticky(note)
+            w = self._stickies.get(note["id"])
+            if w is not None:
+                w.set_offline(True)
+            shown = True
+        if shown:
+            self._apply_search_filter()
+            self._refresh_folder_icons()
+            self._invalidate_tray_menu()
+
+    def _flush_offline_edits(self) -> None:
+        """끊긴 동안 시작한 편집을 지금 글까지 적어 둔다. 다시 붙어 화면이 공유
+        PC 의 내용으로 바뀌기 직전에 부른다."""
+        for nid, w in list(self._stickies.items()):
+            if nid in self._offline_edit_ids or self._is_local_note(nid):
+                w.flush_pending_edit()
+        self._offline_edit_ids.clear()
+
+    def _forget_draft(self, draft: Draft) -> None:
+        if self._drafts is None:
+            return
+        self._drafts.remove(draft.key)
+        if draft.kind == KIND_NEW:
+            self._local.state.remove_note(draft.key)
+            self._local.save()
+
+    def _finish_draft(self, key: str) -> None:
+        """끊긴 동안 쓴 글 하나가 공유 PC 에 들어갔다."""
+        self._drafts_in_flight.discard(key)
+        if self._drafts is not None:
+            draft = self._drafts.get(key)
+            if draft is not None:
+                self._forget_draft(draft)
+        self._refresh_replica_banner()
+
+    def _settle_drafts(self, handled: set[str]) -> None:
+        """다시 붙은 뒤, 끊긴 동안 쓴 글을 정리하고 남은 것은 어떻게 할지 묻는다.
+
+        ``handled`` 는 메모 창이 쥐고 있다가 이미 다시 보낸 글의 메모 id 다."""
+        if self._drafts is None:
+            return
+        for d in self._pending_drafts():
+            if d.kind == KIND_EDIT and d.base_id in handled:
+                self._forget_draft(d)           # 방금 그 글을 다뤘다
+                continue
+            if self._blank(d.content):
+                self._forget_draft(d)           # 쓴 것이 없다
+                continue
+            if d.kind != KIND_EDIT:
+                continue
+            note = self._notes.get(d.base_id)
+            if note is not None and (note.get("content") or "") == d.content:
+                self._forget_draft(d)           # 같은 글이 이미 들어가 있다
+                continue
+            if (d.started_online and note is not None
+                    and int(note.get("version") or 0) == d.base_version
+                    and not self._locks.get(d.base_id)):
+                # 연결돼 있을 때 쓰기 시작한 글이고 그 사이 아무도 고치지 않았다.
+                # 잠깐 끊겼다 붙은 것이므로 묻지 않고 제자리에 넣는다.
+                self._drafts_in_flight.add(d.key)
+                self._draft_uploads[d.base_id] = d.key
+                self._pending_resend[d.base_id] = d.content
+                self._client.acquire_lock(d.base_id)
+        self._refresh_replica_banner()
+        if self._pending_drafts() and not self._drafts_postponed:
+            QTimer.singleShot(DRAFTS_ASK_MS, self._ask_about_drafts_when_free)
+
+    def _ask_about_drafts_when_free(self) -> None:
+        """다시 붙은 뒤 스스로 묻는 경우. 전체 화면으로 발표하는 중이면 창을
+        띄우지 않고 기다린다(목록 위의 알림은 그대로 있다)."""
+        if toast.user_is_busy():
+            QTimer.singleShot(DRAFTS_BUSY_RETRY_MS, self._ask_about_drafts_when_free)
+            return
+        if not self._drafts_postponed:
+            self._ask_about_drafts()
+
+    def _ask_about_drafts(self) -> None:
+        """끊긴 동안 쓴 메모를 공유 PC 에 올릴지, 지울지, 나중에 정할지 묻는다."""
+        if self._drafts_asking or not self._connected:
+            return
+        self._drafts_asking = True
+        try:
+            while True:
+                drafts = self._pending_drafts()
+                if not drafts:
+                    break
+                choice = self._choose_for_drafts(drafts)
+                if choice == "keep":
+                    self._upload_drafts(drafts)
+                    break
+                if choice != "discard":
+                    self._drafts_postponed = True
+                    break
+                if confirm.ask(
+                        self, i18n.t("drafts.title"),
+                        i18n.t("drafts.discard_body", count=len(drafts)),
+                        detail=i18n.t("drafts.discard_detail"),
+                        action=i18n.t("common.btn_delete"), danger=True):
+                    for d in drafts:
+                        self._forget_draft(d)
+                    break
+        finally:
+            self._drafts_asking = False
+        self._refresh_replica_banner()
+
+    def _choose_for_drafts(self, drafts: list[Draft]) -> str:
+        """'keep'(저장: 공유 PC 에 올린다), 'discard'(삭제), 'later'(보류)."""
+        rows = [(d.kind, drafts_dialog.first_sentence(d.content)) for d in drafts]
+        return drafts_dialog.ask(self, rows)
+
+    def _upload_drafts(self, drafts: list[Draft]) -> None:
+        """끊긴 동안 쓴 메모를 공유 PC 에 새 메모로 만든다(나만 보기).
+
+        고친 메모도 새 메모가 된다. 원래 메모는 건드리지 않는다."""
+        if not self._require_online():
+            return
+        me = self._client.nickname()
+        for d in drafts:
+            note = d.note
+            color = note.get("color") or config.DEFAULT_COLOR
+            width = int(note.get("width") or config.DEFAULT_NOTE_WIDTH)
+            height = int(note.get("height") or config.DEFAULT_NOTE_HEIGHT)
+            folder_id = (note.get("folder_id")
+                         if note.get("folder_id") in self._folders else None)
+            if d.kind == KIND_NEW:
+                seen = self._local.state.notes.get(d.key)
+                pos = (seen.x, seen.y) if seen is not None else None
+                hidden = seen.hidden if seen is not None else False
+            else:
+                seen = self._local.state.notes.get(d.base_id)
+                pos = ((seen.x + DRAFT_OFFSET, seen.y + DRAFT_OFFSET)
+                       if seen is not None else None)
+                hidden = False
+            if pos is None:
+                at = self._new_note_position(width, height, None)
+                pos = (at.x(), at.y())
+            self._drafts_in_flight.add(d.key)
+            self._recreate_queue.append({
+                "content": d.content, "color": color, "width": width,
+                "height": height, "folder_id": folder_id, "private": True,
+                "pos": pos, "hidden": hidden, "draft": d.key,
+            })
+            self._client.create_note(
+                color, width, height, folder_id=folder_id,
+                private_owner=me, quiet=True)
+        self._status.showMessage(
+            i18n.t("drafts.uploaded", count=len(drafts)), 6000)
 
     def _recover_unsent(self, unsent: dict[str, str],
                         seen_versions: dict[str, int],
@@ -1182,7 +1942,9 @@ class MainWindow(QMainWindow):
                 continue        # 끊기기 직전에 보낸 것이 이미 들어가 있다
             if (note is not None
                     and int(note.get("version", 0)) == seen_versions.get(note_id)
-                    and not self._locks.get(note_id)):
+                    and self._locks.get(note_id) in (None, self._client.nickname())):
+                # 잠깐 끊겼다 붙으면 공유 PC 가 끊긴 연결의 내 잠금을 아직 들고
+                # 있을 수 있다. 그것은 남이 편집 중인 것이 아니다.
                 self._pending_resend[note_id] = text
                 self._client.acquire_lock(note_id)
             else:
@@ -1196,7 +1958,29 @@ class MainWindow(QMainWindow):
         self._create_note(self._settings.default_note_color,
                           private=True if private else None)
 
+    def _take_gone_state(self, note_id: str):
+        """방금 사라졌던 메모의 자리와 접힘. 없거나 오래됐으면 None."""
+        now = time.monotonic()
+        self._gone_states = {nid: kept for nid, kept in self._gone_states.items()
+                             if now - kept[1] < GONE_STATE_TTL}
+        kept = self._gone_states.pop(note_id, None)
+        return kept[0] if kept is not None else None
+
     def _on_note_created(self, note: dict) -> None:
+        back = self._take_gone_state(note["id"])
+        if back is not None:
+            # 새 메모가 아니다. 공개 범위가 바뀌어 지워졌다가 다시 온 같은
+            # 메모다. 두던 자리, 크기, 접힘, 숨김을 그대로 되살린다.
+            self._notes[note["id"]] = note
+            self._local.state.notes[note["id"]] = back
+            self._local.save()
+            self._append_card(note)
+            self._apply_search_filter()
+            self._ensure_sticky(note)
+            self._sync_history_notes()
+            self._refresh_folder_icons()
+            self._invalidate_tray_menu()
+            return
         self._notes[note["id"]] = note
         self._append_card(note)
         self._move_card_to_top(note["id"])
@@ -1211,8 +1995,10 @@ class MainWindow(QMainWindow):
         if restoring is not None:
             st.x, st.y = restoring["pos"]
             st.hidden = restoring["hidden"]
+            if restoring.get("draft"):
+                # 끊긴 동안 쓴 글을 올리는 중이다. 글이 들어가면 적어 둔 것을 지운다.
+                self._draft_uploads[note["id"]] = restoring["draft"]
             self._pending_resend[note["id"]] = restoring["content"]
-            self._client.acquire_lock(note["id"])
         elif is_creator:
             pos = self._new_note_position(
                 int(note.get("width") or config.DEFAULT_NOTE_WIDTH),
@@ -1229,6 +2015,10 @@ class MainWindow(QMainWindow):
         self._sync_history_notes()
         if restoring is not None:
             self._recovery_notes.add(note["id"])   # '보냈습니다' 안내는 띄우지 않는다
+            # 글을 넣으려고 잠금을 청한다. 메모 창을 만든 뒤에 청해야 한다: 공유
+            # PC 에서는 답이 그 자리에서 오므로, 먼저 청하면 글이 들어간 뒤에
+            # 창이 빈 옛 내용으로 만들어져 그 뒤의 편집이 모두 거절된다.
+            self._client.acquire_lock(note["id"])
             self._refresh_folder_icons()
             self._invalidate_tray_menu()
             if restoring.get("front"):
@@ -1293,7 +2083,7 @@ class MainWindow(QMainWindow):
             self._undo_btn.show()
             self._undo_timer.start()
             self._status.showMessage(self._delete_message, self._UNDO_MS)
-        self._notes.pop(note_id, None)
+        gone = self._notes.pop(note_id, None)
         self._edit_handled.pop(note_id, None)
         if note_id in self._selected_notes:
             self._selected_notes.discard(note_id)
@@ -1304,11 +2094,29 @@ class MainWindow(QMainWindow):
             c.deleteLater()
         w = self._stickies.pop(note_id, None)
         if w is not None:
+            # 내가 쓰던 메모가 사라졌다(다른 사람이 나만 보기로 바꾸거나 자기
+            # 폴더로 옮겼다). 보내지 못한 글은 새 메모로 남기고, 쥐고 있던 잠금은
+            # 돌려준다(그러지 않으면 그 사람에게 내가 편집 중이라고 한동안 보인다).
+            unsent = (None if undoable is not None or note_id in self._discarding
+                      else w.unsent_edit())
+            if unsent is not None and not self._blank(unsent):
+                self._keep_as_new_note(unsent, private=True)
+            if (self._locks.get(note_id) == self._client.nickname()
+                    and not (gone or {}).get(LOCAL_MARK)):
+                self._client.release_lock(note_id)
             # closeEvent 의 hideRequested 가 local_state 를 오염시키지 않도록
             # teardown 으로 표시한 뒤 닫는다(_on_welcomed 와 같은 예방책).
             w._teardown = True
             w.close()
             w.deleteLater()
+        self._locks.pop(note_id, None)
+        self._pending_resend.pop(note_id, None)
+        self._pending_restore.pop(note_id, None)
+        # 같은 메모가 곧바로 다시 올 수 있다(공개 범위가 바뀌면 옛 공유 PC 는
+        # 지웠다가 다시 만들어 보낸다). 그때 자리와 접힘을 되살리려고 잠깐 들고 있는다.
+        state = self._local.state.notes.get(note_id)
+        if state is not None and undoable is None:
+            self._gone_states[note_id] = (state, time.monotonic())
         self._local.state.remove_note(note_id)
         self._local.save()
         self._apply_search_filter()
@@ -1322,6 +2130,14 @@ class MainWindow(QMainWindow):
         self._folders[folder["id"]] = folder
         self._refresh_folder_chip()
         self._refresh_card_folder_context()
+        asked = self._new_folder_spots.pop(folder["id"], None)
+        if asked is not None and time.monotonic() - asked[0] <= NEW_NOTE_SPOT_TTL:
+            # 우클릭 메뉴로 만든 폴더다. 그 자리에 아이콘을 두고 이름을 받는다.
+            self._place_folder_icon(folder["id"], at=asked[1], quiet=True)
+            icon = self._folder_icons.get(folder["id"])
+            if icon is not None:
+                icon.begin_rename()
+            return
         self._refresh_folder_icons()
 
     def _on_folder_updated(self, folder: dict) -> None:
@@ -1549,10 +2365,13 @@ class MainWindow(QMainWindow):
                 int(note.get("version", 1)),
             )
             self._client.release_lock(note_id)
+            uploaded = self._draft_uploads.pop(note_id, None)
+            if uploaded is not None:
+                self._finish_draft(uploaded)
             if note_id in self._recovery_notes:
                 # 새 메모로 남겼다는 안내가 이미 떠 있다.
                 self._recovery_notes.discard(note_id)
-            else:
+            elif uploaded is None:
                 self._status.showMessage(
                     i18n.t("main.status_unsent_resent"), 6000)
             return
@@ -1564,6 +2383,9 @@ class MainWindow(QMainWindow):
         # 다시 보내려던 글: 그 사이 다른 사람이 잡았다. 새 메모로 남긴다.
         resend = self._pending_resend.pop(note_id, None)
         if resend is not None:
+            uploaded = self._draft_uploads.pop(note_id, None)
+            if uploaded is not None:
+                self._finish_draft(uploaded)
             self._keep_as_new_note(
                 resend, private=self._note_is_private(self._notes.get(note_id)))
             return
@@ -1629,6 +2451,15 @@ class MainWindow(QMainWindow):
         self._edit_handled.pop(note_id, None)
         w = self._stickies.get(note_id)
         if w is not None:
+            if (w.is_editing() and note_id not in self._offline_edit_ids
+                    and not self._is_local_note(note_id)):
+                # 내가 편집 중인데 잠금이 풀렸다: 오래 손대지 않아 공유 PC 가
+                # 거둔 것이다(내가 끝낸 편집이면 이미 편집 중이 아니다). 편집을
+                # 끝내고, 보내지 못한 글이 있으면 잠금을 다시 받아 보낸다.
+                unsent = w.lock_lost()
+                if unsent is not None:
+                    self._pending_resend[note_id] = unsent
+                    self._client.acquire_lock(note_id)
             w.set_lock_holder(None)
 
     def _on_user_joined(self, nickname: str) -> None:
@@ -1919,10 +2750,17 @@ class MainWindow(QMainWindow):
     def _bulk_apply_folder(self, folder_id) -> None:
         if not self._require_online():
             return
-        ids = list(self._selected_notes)
+        ids = [nid for nid in self._selected_notes if nid in self._notes]
+        locked = [nid for nid in ids
+                  if self._move_blocked_by(nid, folder_id)]
+        if locked:
+            self._show_notification(
+                i18n.t("error.locked",
+                       holder=self._locked_by_other(locked[0])), True)
+            ids = [nid for nid in ids if nid not in locked]
+            if not ids:
+                return
         for nid in ids:
-            if nid not in self._notes:
-                continue
             note = self._notes[nid]
             note["folder_id"] = folder_id
             card = self._cards.get(nid)
@@ -1957,10 +2795,17 @@ class MainWindow(QMainWindow):
     def _bulk_apply_privacy(self, private: bool) -> None:
         if not self._require_online():
             return
-        ids = list(self._selected_notes)
+        ids = [nid for nid in self._selected_notes if nid in self._notes]
+        # 다른 사람이 편집 중인 메모는 바꾸지 않는다(그 사람의 창이 닫힌다).
+        locked = [nid for nid in ids if self._locked_by_other(nid)]
+        if locked:
+            self._show_notification(
+                i18n.t("error.locked",
+                       holder=self._locked_by_other(locked[0])), True)
+            ids = [nid for nid in ids if nid not in locked]
+            if not ids:
+                return
         for nid in ids:
-            if nid not in self._notes:
-                continue
             note = self._notes[nid]
             note["private_owner"] = (
                 self._client.nickname() if private else None)
@@ -2018,6 +2863,12 @@ class MainWindow(QMainWindow):
         무시하는 구버전 호스트와 통신해도 최소한 로컬 피드백은 보장된다."""
         if not self._require_online():
             return
+        holder = self._locked_by_other(note_id)
+        if holder:
+            # 다른 사람이 쓰고 있다. 나만 보기로 바꾸면 그 사람의 창이 쓰던 글과
+            # 함께 닫힌다. 공유 PC 도 거절하므로 화면을 먼저 바꾸지 않는다.
+            self._show_notification(i18n.t("error.locked", holder=holder), True)
+            return
         note = self._notes.get(note_id)
         if note is not None:
             note["private_owner"] = (
@@ -2040,6 +2891,10 @@ class MainWindow(QMainWindow):
     def _on_card_move_to_folder(self, note_id: str,
                                   folder_id) -> None:
         if not self._require_online():
+            return
+        holder = self._move_blocked_by(note_id, folder_id)
+        if holder:
+            self._show_notification(i18n.t("error.locked", holder=holder), True)
             return
         note = self._notes.get(note_id)
         if note is not None:
@@ -2170,7 +3025,12 @@ class MainWindow(QMainWindow):
 
     def _delete_note_confirm(self, note_id: str) -> None:
         note = self._notes.get(note_id)
-        if note is None or not self._require_online():
+        if note is None:
+            return
+        if note.get(LOCAL_MARK) == KIND_NEW:
+            self._delete_local_note(note_id)
+            return
+        if not self._require_online():
             return
         holder = self._locked_by_other(note_id)
         if holder:
@@ -2303,8 +3163,8 @@ class MainWindow(QMainWindow):
                 default_font_size=self._settings.default_font_size,
                 settings=self._settings,
             )
-            w.requestLock.connect(self._client.acquire_lock)
-            w.releaseLock.connect(self._client.release_lock)
+            w.requestLock.connect(self._on_request_lock)
+            w.releaseLock.connect(self._on_release_lock)
             w.commitEdit.connect(self._on_commit_edit)
             w.deleteRequested.connect(self._delete_note_confirm)
             w.hideRequested.connect(
@@ -2317,6 +3177,7 @@ class MainWindow(QMainWindow):
             w.foldChanged.connect(self._on_fold_changed)
             w.set_dock_resolver(self._resolve_dock_slot)
             w.set_icon_resolver(self._resolve_icon_pos)
+            w.set_drop_probe(self._on_icon_dragged)
             self._stickies[note_id] = w
 
         st = self._local.state.get_note_state(note_id)
@@ -2341,8 +3202,39 @@ class MainWindow(QMainWindow):
         else:
             w.hide()
 
+    def _on_request_lock(self, note_id: str) -> None:
+        if self._can_work_offline():
+            # 공유 PC 에 물을 수 없다. 이 PC 에서만 고친다(다시 붙으면 올릴지 묻는다).
+            self._offline_edit_ids.add(note_id)
+            w = self._stickies.get(note_id)
+            if w is not None:
+                w.enter_edit_mode()
+            return
+        if not self._connected:
+            # 끊겼는데 이 PC 에 적어 둘 곳도 없다(파일을 열지 못했다). 요청을
+            # 보내도 닿지 않으므로 기다리게 두지 않고 까닭을 알린다.
+            w = self._stickies.get(note_id)
+            if w is not None:
+                w.cancel_pending_lock()
+            self._require_online()
+            return
+        self._client.acquire_lock(note_id)
+
+    def _on_release_lock(self, note_id: str) -> None:
+        if note_id in self._offline_edit_ids:
+            self._offline_edit_ids.discard(note_id)
+            return
+        if self._is_local_note(note_id):
+            return
+        self._client.release_lock(note_id)
+
     def _on_commit_edit(self, note_id: str, content: str, color: str,
                         w: int, h: int, version: int) -> None:
+        if self._drafts is not None and (
+                not self._connected or note_id in self._offline_edit_ids
+                or self._is_local_note(note_id)):
+            self._save_offline(note_id, content, color, w, h)
+            return
         self._client.update_note(note_id, content, color, w, h, version)
 
     def _on_position_changed(self, note_id: str, x: int, y: int) -> None:
@@ -2359,7 +3251,9 @@ class MainWindow(QMainWindow):
 
     def _resolve_icon_pos(self, owner_key: str, pos, screen_rect):
         """아이콘 모양으로 접은 메모와 폴더 아이콘이 서로 겹치지 않는 격자
-        자리를 돌려준다."""
+        자리를 돌려준다. 진짜 바탕화면 아이콘이 놓인 칸도 비킨다."""
+        # 놓여 있는 진짜 아이콘의 자리가 오래됐으면 다시 읽는다.
+        self._desktop_grid.refresh_items()
         taken = [
             w.pos() for nid, w in self._stickies.items()
             if nid != owner_key and w.isVisible() and w.is_folded()
@@ -2370,6 +3264,115 @@ class MainWindow(QMainWindow):
             if "folder:" + fid != owner_key and fw.isVisible()
         ]
         return snap_icon_pos(pos, screen_rect, taken)
+
+    @staticmethod
+    def _area_key(area: QRect) -> tuple:
+        return area.left(), area.top(), area.width(), area.height()
+
+    def _area_at(self, pos: QPoint) -> QRect:
+        """그 점이 놓인(없으면 주) 화면의 작업 영역."""
+        screen = QGuiApplication.screenAt(pos) or QGuiApplication.primaryScreen()
+        return (screen.availableGeometry() if screen is not None
+                else QRect(0, 0, 1920, 1080))
+
+    def _grid_before(self, area: QRect) -> nf.IconGrid | None:
+        """이 화면의 아이콘들을 마지막으로 맞춰 놓은 격자. 이번 실행에서 맞춘
+        적이 없으면 지난 실행이 적어 둔 것이다. 그것도 없으면(이 기능이 없던
+        버전에서 올라왔다, 화면 구성이 달라졌다) None 이고, 아이콘은 지금 있는
+        곳에서 가장 가까운 칸으로 간다."""
+        key = self._area_key(area)
+        if key in self._grids_used:
+            return self._grids_used[key]
+        saved = self._local.state.icon_grids
+        raw = saved.get(",".join(str(v) for v in key))
+        if raw is not None:
+            return nf.IconGrid(
+                area=QRect(area),
+                cell=QSize(int(round(raw[0])), int(round(raw[1]))),
+                icon=float(nf.ICON_DEFAULT), x0=area.left() + raw[2],
+                y0=area.top() + raw[3], dx=raw[0], dy=raw[1])
+        return None
+
+    def _align_icons(self) -> None:
+        """아이콘으로 접힌 메모와 메모 폴더 아이콘을 지금의 바탕화면 격자에 맞춘다.
+
+        바탕화면 아이콘의 크기가 바뀌면 진짜 아이콘들은 제 칸을 지킨 채 칸의
+        크기만 달라진다. 우리 아이콘도 같은 칸으로 옮기고 크기를 맞춘다."""
+        if self._force_quit or not self._icons_loaded:
+            return
+        items: list[tuple[QPoint, str, str]] = []
+        for nid, w in self._stickies.items():
+            if w.wants_icon_spot():
+                items.append((w.icon_spot(), "note", nid))
+        for fid, icon in self._folder_icons.items():
+            items.append((icon.pos(), "folder", fid))
+        items.sort(key=lambda item: (item[0].x(), item[0].y(), item[2]))
+        placed: dict[tuple, list[QPoint]] = {}
+        moved = False
+        for pos, kind, key in items:
+            area = self._area_at(pos + QPoint(8, 8))
+            grid = nf.icon_grid(area)
+            before = self._grid_before(area)
+            if before is not None and not before.same_shape(grid):
+                target = nf.move_to_grid(pos, before, grid)
+            else:
+                target = grid.pos_of(*grid.cell_at(pos))
+            taken = placed.setdefault(self._area_key(area), [])
+            target = snap_icon_pos(target, area, taken, grid=grid)
+            taken.append(target)
+            if kind == "note":
+                w = self._stickies[key]
+                if target != pos or w.size() != grid.cell:
+                    w.move_icon(target)
+                    moved = True
+            else:
+                icon = self._folder_icons[key]
+                icon.place(target.x(), target.y())
+                state = self._local.state.folder_icons.get(key)
+                if state is not None and (state.x, state.y) != (target.x(), target.y()):
+                    state.x, state.y = target.x(), target.y()
+                    moved = True
+                icon.update()
+        self._remember_grids()
+        if moved:
+            self._local.save()
+
+    def _remember_grids(self) -> None:
+        """지금의 격자를 적어 둔다(다음에 격자가 바뀌었을 때 견줄 기준)."""
+        saved = self._local.state.icon_grids
+        changed = False
+        for screen in QGuiApplication.screens():
+            area = screen.availableGeometry()
+            grid = nf.icon_grid(area)
+            key = self._area_key(area)
+            self._grids_used[key] = grid
+            value = [grid.dx, grid.dy, grid.x0 - area.left(), grid.y0 - area.top()]
+            name = ",".join(str(v) for v in key)
+            if saved.get(name) != value:
+                saved[name] = value
+                changed = True
+        if changed:
+            self._local.save()
+
+    def _folder_under(self, pos: QPoint) -> str:
+        """그 점 아래에 있는 메모 폴더 아이콘의 폴더 id. 없으면 빈 글."""
+        for fid, icon in self._folder_icons.items():
+            if icon.isVisible() and icon.geometry().contains(pos):
+                return fid
+        return ""
+
+    def _on_icon_dragged(self, note_id: str, pos: QPoint, dropped: bool) -> bool:
+        """아이콘으로 접힌 메모를 끄는 동안과 놓았을 때. 메모 폴더 아이콘 위에
+        놓으면 그 폴더로 옮긴다(받았으면 참)."""
+        target = self._folder_under(pos)
+        for fid, icon in self._folder_icons.items():
+            icon.set_drop_hover(fid == target and not dropped)
+        if not dropped or not target:
+            return False
+        note = self._notes.get(note_id) or {}
+        if (note.get("folder_id") or None) != target:
+            self._on_card_move_to_folder(note_id, target)
+        return True
 
     # ── 바탕 화면 폴더 아이콘 ───────────────────────────────────────────
 
@@ -2428,6 +3431,7 @@ class MainWindow(QMainWindow):
                 icon.toggled.connect(self._toggle_folder_icon)
                 icon.moved.connect(self._on_folder_icon_moved)
                 icon.removeRequested.connect(self._remove_folder_icon)
+                icon.renamed.connect(self._on_folder_icon_renamed)
                 icon.set_slot_resolver(self._resolve_icon_pos)
                 icon.place(state.x, state.y)
                 self._folder_icons[fid] = icon
@@ -2439,18 +3443,27 @@ class MainWindow(QMainWindow):
             if not icon.isVisible():
                 icon.show()
 
-    def _place_folder_icon(self, folder_id: str) -> None:
+    def _place_folder_icon(self, folder_id: str, at: QPoint | None = None,
+                           quiet: bool = False) -> None:
         """폴더를 바탕 화면 아이콘으로 접는다. 그 폴더의 메모는 아이콘을 열 때까지
-        바탕 화면에서 사라진다(메모 자체는 그대로다)."""
+        바탕 화면에서 사라진다(메모 자체는 그대로다). ``at`` 을 주면 그 자리에서
+        가장 가까운 빈 칸에 놓는다."""
         if folder_id not in self._folders:
             return
-        screen = QApplication.primaryScreen()
-        avail = screen.availableGeometry() if screen is not None else None
-        if avail is None:
-            return
-        # Windows 바탕화면 아이콘은 보통 왼쪽에 모여 있다. 겹치지 않게 오른쪽
-        # 위에서부터 놓는다.
-        start = avail.topRight() + QPoint(-ICON_GRID.width() - 4, 10)
+        if at is not None:
+            avail = self._area_at(at)
+            grid = nf.icon_grid(avail)
+            # 누른 자리가 칸의 한가운데쯤에 오게 한다.
+            start = at - QPoint(grid.cell.width() // 2, grid.cell.height() // 2)
+        else:
+            screen = QApplication.primaryScreen()
+            if screen is None:
+                return
+            avail = screen.availableGeometry()
+            grid = nf.icon_grid(avail)
+            # Windows 바탕화면 아이콘은 보통 왼쪽에 모여 있다. 겹치지 않게 오른쪽
+            # 위에서부터 놓는다.
+            start = grid.pos_of(grid.cols() - 1, 0)
         pos = self._resolve_icon_pos("folder:" + folder_id, start, avail)
         self._local.state.folder_icons[folder_id] = FolderIconState(
             x=pos.x(), y=pos.y(), opened=False)
@@ -2458,9 +3471,20 @@ class MainWindow(QMainWindow):
         self._refresh_folder_icons()
         for nid in self._folder_note_ids(folder_id):
             self._sync_note_shown(nid, animate=True)
-        name = self._folders[folder_id].get("name") or ""
-        self._status.showMessage(
-            i18n.t("main.status_folder_icon_placed", folder=name), 5000)
+        if not quiet:
+            name = self._folders[folder_id].get("name") or ""
+            self._status.showMessage(
+                i18n.t("main.status_folder_icon_placed", folder=name), 5000)
+
+    def _on_folder_icon_renamed(self, folder_id: str, name: str) -> None:
+        """폴더 아이콘의 이름을 그 자리에서 고쳤다."""
+        folder = self._folders.get(folder_id)
+        if folder is None or not name or name == folder.get("name"):
+            return
+        if not self._require_online():
+            self._refresh_folder_icons()        # 고치기 전의 이름으로 되돌린다
+            return
+        self._client.update_folder(folder_id, name=name)
 
     def _remove_folder_icon(self, folder_id: str) -> None:
         if self._local.state.folder_icons.pop(folder_id, None) is None:
@@ -2556,6 +3580,10 @@ class MainWindow(QMainWindow):
         """상태줄 오른쪽의 연결 상태, 역할, 닉네임, 접속 인원을 다시 적는다."""
         if self._connected:
             state, text = "connected", i18n.t("main.state_connected")
+        elif self._gate:
+            state = "connecting"
+            text = (i18n.t("main.state_locked") if self._gate == "password"
+                    else i18n.t("main.state_held"))
         elif self._was_connected:
             state, text = "disconnected", i18n.t("main.state_disconnected")
         elif self._host_unreachable():
@@ -2670,6 +3698,7 @@ class MainWindow(QMainWindow):
 
     def _flush_pending_edits(self) -> None:
         """teardown 전에 호출해, 편집 중이던 내용이 재시작 시 사라지지 않게 한다."""
+        self._keep_text_in_flight()
         for sticky in list(self._stickies.values()):
             try:
                 sticky.flush_pending_edit()
@@ -2709,6 +3738,8 @@ class MainWindow(QMainWindow):
         '숨기기'로 받으므로, 이 채비 없이 종료가 시작되면 메모 하나가 숨김으로
         바뀌고 종료는 취소된다."""
         self._force_quit = True
+        self._gate_timer.stop()
+        self._desktop_grid.stop()
         self._flush_pending_edits()
         self._teardown_stickies()
         self._toasts.close_all()

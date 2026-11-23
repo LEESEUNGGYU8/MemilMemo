@@ -29,8 +29,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-HOST = "지우"
-
 
 def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
@@ -67,6 +65,7 @@ from PySide6.QtGui import (  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
+import demo_content  # noqa: E402
 import main as app_main  # noqa: E402
 from app import config  # noqa: E402
 
@@ -81,16 +80,22 @@ MIN = 60 * 1000
 HOUR = 60 * MIN
 DAY = 24 * HOUR
 
+# 메모, 폴더, 사람 이름은 고른 언어의 것을 쓴다(tools/demo_content.py).
+TEXT = demo_content.for_language(ARGS.lang)
+HOST, USER_A, USER_B, USER_OLD = TEXT["people"]
+
 FOLDERS = [
     # id, 이름, 색, 나만 보기
-    ("f_work", "업무", "#BAE1FF", False),
-    ("f_store", "매장 리뉴얼", "#BAFFC9", False),
-    ("f_me", "개인", "#E0BBE4", True),
+    ("f_work", TEXT["folders"][0], "#BAE1FF", False),
+    ("f_store", TEXT["folders"][1], "#BAFFC9", False),
+    ("f_me", TEXT["folders"][2], "#E0BBE4", True),
 ]
 
 
 def _font(px: int, bold: bool = False) -> QFont:
-    f = QFont("Pretendard Variable")
+    from app.ui import theme
+    # 일본어는 그 글자가 든 글꼴로 그린다.
+    f = QFont(theme.load_application_fonts(ARGS.lang) or "Pretendard Variable")
     f.setPixelSize(px)
     f.setBold(bold)
     return f
@@ -111,16 +116,17 @@ def _draw_floor_plan() -> QImage:
     p.drawLine(QPointF(400, h - 40), QPointF(560, h - 40))
     p.setPen(QPen(QColor("#2F3A4A"), 3))
     p.setFont(_font(22, True))
-    p.drawText(QRectF(400, h - 36, 160, 30), Qt.AlignCenter, "입구")
+    plan = TEXT["plan"]
+    p.drawText(QRectF(400, h - 36, 160, 30), Qt.AlignCenter, plan["entrance"])
     blocks = [
-        (90, 90, 250, 90, "#BAE1FF", "계산대"),
-        (90, 230, 120, 250, "#FFE066", "진열 A"),
-        (250, 230, 120, 250, "#FFE066", "진열 B"),
-        (420, 90, 230, 150, "#BAFFC9", "신상품"),
-        (420, 290, 230, 130, "#FFD9A6", "행사 매대"),
-        (700, 90, 180, 330, "#E0BBE4", "창고"),
+        (90, 90, 250, 90, "#BAE1FF"),
+        (90, 230, 120, 250, "#FFE066"),
+        (250, 230, 120, 250, "#FFE066"),
+        (420, 90, 230, 150, "#BAFFC9"),
+        (420, 290, 230, 130, "#FFD9A6"),
+        (700, 90, 180, 330, "#E0BBE4"),
     ]
-    for x, y, bw, bh, color, label in blocks:
+    for (x, y, bw, bh, color), label in zip(blocks, plan["blocks"]):
         p.setPen(QPen(QColor("#2F3A4A"), 3))
         p.setBrush(QColor(color))
         p.drawRoundedRect(QRectF(x, y, bw, bh), 8, 8)
@@ -149,8 +155,8 @@ def _draw_chart() -> QImage:
     p.setFont(_font(30, True))
     p.setPen(QColor("#111827"))
     p.drawText(QRectF(50, 26, w - 100, 50), Qt.AlignLeft | Qt.AlignVCenter,
-               "요일별 방문객")
-    days = ["월", "화", "수", "목", "금", "토", "일"]
+               TEXT["plan"]["chart"])
+    days = TEXT["plan"]["days"]
     vals = [84, 92, 78, 105, 131, 188, 162]
     base_y, top = h - 80, 110
     bar_w, gap = 76, 40
@@ -194,76 +200,68 @@ def _notes() -> list[dict]:
     plan = image_to_data_url(_draw_floor_plan())
     chart = image_to_data_url(_draw_chart())
     title = 'style="font-size:13pt; font-weight:700;"'
+    t = TEXT
+    meeting, todo, layout, info = t["meeting"], t["todo"], t["plan"], t["info"]
+    me, lunch, closing, reply = t["me"], t["lunch"], t["closing"], t["reply"]
     return [
-        dict(id="n_meeting", color="#FFE066", folder="f_work", by="하준",
+        dict(id="n_meeting", color="#FFE066", folder="f_work", by=USER_A,
              upd_by=HOST, age=4 * MIN, pos=(60, 60), size=(300, 250),
              content=(
-                 f'<p><span {title}>주간 회의 메모</span></p>'
-                 + bul("신규 거래처 견적은 금요일까지 회신")
-                 + bul("창고 재고 실사 일정 확정")
-                 + bul("택배 마감 시간 오후 4시로 변경")
+                 f'<p><span {title}>{meeting["title"]}</span></p>'
+                 + "".join(bul(item) for item in meeting["items"])
                  + '<p><span style="background-color:#C5E1A5; font-weight:700;">'
-                   '다음 회의 25일 오전 10시</span></p>')),
+                   f'{meeting["next"]}</span></p>')),
         dict(id="n_todo", color="#FFB3BA", folder="f_work", by=HOST,
-             upd_by="서연", age=22 * MIN, pos=(390, 60), size=(280, 270),
+             upd_by=USER_B, age=22 * MIN, pos=(390, 60), size=(280, 270),
              content=(
-                 f'<p><span {title}>이번 주 할 일</span></p>'
-                 + chk(True, "세금계산서 발행")
-                 + chk(True, "택배 송장 출력")
-                 + chk(False, "거래명세서 정리")
-                 + chk(False, "프린터 토너 주문")
-                 + chk(False, "금요일 회식 장소 예약"))),
-        dict(id="n_plan", color="#BAFFC9", folder="f_store", by="서연",
-             upd_by="서연", age=3 * HOUR, pos=(700, 60), size=(340, 420),
+                 f'<p><span {title}>{todo["title"]}</span></p>'
+                 + "".join(chk(i < 2, item)
+                           for i, item in enumerate(todo["items"])))),
+        dict(id="n_plan", color="#BAFFC9", folder="f_store", by=USER_B,
+             upd_by=USER_B, age=3 * HOUR, pos=(700, 60), size=(340, 420),
              content=(
-                 f'<p><span {title}>매장 배치 시안</span></p>'
+                 f'<p><span {title}>{layout["title"]}</span></p>'
                  f'<p><img src="{plan}" /></p>'
-                 '<p>입구 쪽 행사 매대를 한 칸 넓히는 안입니다.</p>'
+                 f'<p>{layout["text1"]}</p>'
                  f'<p><img src="{chart}" /></p>'
-                 '<p>주말 방문객이 평일의 두 배라 계산대 앞 동선을 비웁니다.</p>')),
+                 f'<p>{layout["text2"]}</p>')),
         dict(id="n_info", color="#BAE1FF", folder=None, by=HOST,
              upd_by=HOST, age=1 * DAY + 2 * HOUR, pos=(60, 340), size=(300, 250),
              content=(
-                 f'<p><span {title}>사무실 정보</span></p>'
-                 + link("\\\\NAS\\업무", "업무 공유 폴더", True)
-                 + link("\\\\NAS\\업무\\연락망.xlsx", "비상 연락망")
-                 + link("\\\\NAS\\업무\\규정\\취업규칙.pdf", "취업규칙")
-                 + link("\\\\NAS\\업무\\양식\\휴가신청서.hwp", "휴가 신청서 양식")
-                 + '<p><a href="http://192.168.0.20">복합기 관리 화면</a></p>'
-                 '<p>회의실 예약은 <span style="background-color:#FFF59D;">'
-                 '이 메모에 이름과 시간</span>을 적어 주세요.</p>')),
+                 f'<p><span {title}>{info["title"]}</span></p>'
+                 + "".join(link(path, text, is_dir)
+                           for path, text, is_dir in info["links"])
+                 + f'<p><a href="http://192.168.0.20">{info["web"]}</a></p>'
+                 f'<p>{info["room"][0]}<span style="background-color:#FFF59D;">'
+                 f'{info["room"][1]}</span>{info["room"][2]}</p>')),
         dict(id="n_me", color="#E0BBE4", folder="f_me", by=HOST, upd_by=HOST,
              private=HOST, age=2 * DAY, pos=(390, 360), size=(280, 200),
              content=(
-                 f'<p><span {title}>개인 메모</span></p>'
-                 + chk(False, "치과 예약 목요일 6시 반")
-                 + chk(False, "어머니 생신 선물 고르기")
-                 + chk(True, "자동차 보험 갱신"))),
-        dict(id="n_lunch", color="#FFD9A6", folder=None, by="하준",
-             upd_by="하준", age=50 * MIN, pos=(60, 590), size=(300, 232),
+                 f'<p><span {title}>{me["title"]}</span></p>'
+                 + "".join(chk(i == 2, item)
+                           for i, item in enumerate(me["items"])))),
+        dict(id="n_lunch", color="#FFD9A6", folder=None, by=USER_A,
+             upd_by=USER_A, age=50 * MIN, pos=(60, 590), size=(300, 232),
              content=(
-                 f'<p><span {title}>점심 주문 받아요</span></p>'
-                 + bul("김치찌개 2 (지우, 서연)", "arrow")
-                 + bul("제육볶음 1 (하준)", "arrow")
+                 f'<p><span {title}>{lunch["title"]}</span></p>'
+                 + "".join(bul(item, "arrow") for item in lunch["items"])
                  + '<p><span style="color:#D64545; font-weight:700;">'
-                   '11시 40분에 주문 넣습니다</span></p>')),
+                   f'{lunch["note"]}</span></p>')),
         dict(id="n_deploy", color="#3A3A3A", folder="f_work", by=HOST,
              upd_by=HOST, age=5 * DAY, pos=(390, 590), size=(280, 200),
              content=(
                  '<p><span style="font-size:13pt; font-weight:700; '
-                 'color:#FFFFFF;">월말 마감 체크</span></p>'
-                 + chk(True, "매출 집계 대조")
-                 + chk(False, "미수금 목록 정리")
-                 + chk(False, "재고 실사표 보관"))),
-        dict(id="n_reply", color="#F5F5F5", folder="f_work", by="서연",
+                 f'color:#FFFFFF;">{closing["title"]}</span></p>'
+                 + "".join(chk(i == 0, item)
+                           for i, item in enumerate(closing["items"])))),
+        dict(id="n_reply", color="#F5F5F5", folder="f_work", by=USER_B,
              upd_by=HOST, age=9 * DAY, pos=(700, 510), size=(340, 280),
              content=(
-                 f'<p><span {title}>문의 답변 문구</span></p>'
-                 '<p>안녕하세요. 문의 주신 상품은 오늘 오후 4시 이전 결제 건까지 '
-                 '당일 출고됩니다. 도서산간 지역은 하루 이틀 더 걸릴 수 있습니다.</p>'
-                 '<p>교환과 반품은 수령 후 7일 이내에 접수해 주세요. '
-                 '<span style="text-decoration: underline;">단순 변심은 왕복 배송비가 '
-                 '부과됩니다.</span></p>')),
+                 f'<p><span {title}>{reply["title"]}</span></p>'
+                 f'<p>{reply["text1"]}</p>'
+                 f'<p>{reply["text2"]}'
+                 '<span style="text-decoration: underline;">'
+                 f'{reply["underlined"]}</span></p>')),
     ]
 
 
@@ -310,13 +308,13 @@ def seed() -> None:
                             "w": n["size"][0], "h": n["size"][1]}
                   for n in notes},
         "users": {
-            "하준": {"last_seen_at": NOW_MS - 3 * MIN,
+            USER_A: {"last_seen_at": NOW_MS - 3 * MIN,
                      "last_joined_at": NOW_MS - 2 * HOUR,
                      "last_disconnected_at": 0},
-            "서연": {"last_seen_at": NOW_MS - 1 * MIN,
+            USER_B: {"last_seen_at": NOW_MS - 1 * MIN,
                      "last_joined_at": NOW_MS - 5 * HOUR,
                      "last_disconnected_at": 0},
-            "민호": {"last_seen_at": NOW_MS - 2 * DAY,
+            USER_OLD: {"last_seen_at": NOW_MS - 2 * DAY,
                      "last_joined_at": NOW_MS - 2 * DAY - HOUR,
                      "last_disconnected_at": NOW_MS - 2 * DAY},
         },
@@ -338,30 +336,29 @@ def seed() -> None:
             folder_id=n["folder"], private_owner=n.get("private"),
         ))
     todo = next(n for n in notes if n["id"] == "n_todo")
-    before = todo["content"].replace(
-        "금요일 회식 장소 예약", "회식 장소 알아보기")
+    before = todo["content"].replace(*TEXT["todo"]["edit"])
     meeting = next(n for n in notes if n["id"] == "n_meeting")
     for entry in (
-        HistoryEntry(note_id="n_todo", user="서연", action="update",
+        HistoryEntry(note_id="n_todo", user=USER_B, action="update",
                      content_before=before, content_after=todo["content"],
                      color_before="#FFB3BA", color_after="#FFB3BA",
                      session_start=NOW_MS - 25 * MIN,
                      session_end=NOW_MS - 22 * MIN),
         HistoryEntry(note_id="n_meeting", user=HOST, action="update",
                      content_before=meeting["content"].replace(
-                         "오후 4시로 변경", "오후 3시"),
+                         *TEXT["meeting"]["edit"]),
                      content_after=meeting["content"],
                      color_before="#FFE066", color_after="#FFE066",
                      session_start=NOW_MS - 6 * MIN,
                      session_end=NOW_MS - 4 * MIN),
-        HistoryEntry(note_id="n_meeting", user="하준", action="create",
+        HistoryEntry(note_id="n_meeting", user=USER_A, action="create",
                      content_before=None, content_after="",
                      color_before=None, color_after="#FFE066",
                      session_start=NOW_MS - 2 * HOUR,
                      session_end=NOW_MS - 2 * HOUR),
-        HistoryEntry(note_id="n_lunch", user="하준", action="update",
-                     content_before="점심 주문 받아요",
-                     content_after="점심 주문 받아요\n김치찌개 2\n제육볶음 1",
+        HistoryEntry(note_id="n_lunch", user=USER_A, action="update",
+                     content_before=TEXT["lunch"]["title"],
+                     content_after=TEXT["lunch"]["history"],
                      color_before="#FFD9A6", color_after="#FFD9A6",
                      session_start=NOW_MS - 55 * MIN,
                      session_end=NOW_MS - 50 * MIN),
@@ -418,7 +415,7 @@ def shoot_raw(window) -> None:
     from app.ui.settings_dialog import SettingsDialog
     from app.ui.update_dialog import UpdateAvailableDialog
 
-    window._users = [HOST, "하준", "서연"]
+    window._users = [HOST, USER_A, USER_B]
     window._refresh_status_text()
     window.resize(380, 640)
     shot(window, "raw-main")
@@ -437,9 +434,9 @@ def shoot_raw(window) -> None:
         window._set_view_mode(density="standard", layout="list")
 
     # 검색·폴더·선택 모드
-    window._search_input.setText("주문")
+    window._search_input.setText(TEXT["search"][0])
     shot(window, "raw-main-search")
-    window._search_input.setText("없는 검색어")
+    window._search_input.setText(TEXT["search"][1])
     shot(window, "raw-main-search-empty")
     window._search_input.clear()
     window._select_folder("f_work")
@@ -469,7 +466,7 @@ def shoot_raw(window) -> None:
     note._commit_and_release()
     popup_shot(note._show_more_menu, "raw-menu-note-more")
     locked = window._stickies["n_lunch"]
-    locked.set_lock_holder("하준")
+    locked.set_lock_holder(USER_A)
     shot(locked, "raw-note-locked")
     locked.set_lock_holder(None)
 
@@ -483,16 +480,17 @@ def shoot_raw(window) -> None:
         settle()
         popup_shot(info._show_attach_menu, "raw-menu-note-attach")
         info._commit_and_release()
-        href = fl.path_to_href("\\\\NAS\\업무\\연락망.xlsx")
+        sample_path, sample_text, _is_dir = TEXT["info"]["links"][1]
+        href = fl.path_to_href(sample_path)
         popup_shot(lambda: info._show_link_menu(href, QPoint(200, 200)),
                    "raw-menu-link")
-        ld = LinkDialog(text="비상 연락망", href=href, editing=True)
+        ld = LinkDialog(text=sample_text, href=href, editing=True)
         ld.show()
         shot(ld, "raw-link-dialog-edit")
         ld.close()
         ld = LinkDialog()
         ld.show()
-        ld._target_edit.setText("C:\\Users\\Public\\Documents\\견적서.xlsx")
+        ld._target_edit.setText(TEXT["quote_file"])
         shot(ld, "raw-link-dialog-local")
         ld.close()
 
@@ -612,6 +610,10 @@ def run() -> None:
         print("메인 창을 찾지 못했습니다.")
         QApplication.quit()
         return
+    # 참가자 창에 이 PC 의 실제 주소와 촬영용 포트 대신 예시 주소를 보여 준다.
+    from app.ui import main_window as main_window_module
+    main_window_module._local_lan_ip = lambda: "192.168.0.12"
+    window._local.state.last_host_port = config.DEFAULT_PORT
     try:
         if ARGS.which in ("raw", "all"):
             shoot_raw(window)

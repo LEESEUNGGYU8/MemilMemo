@@ -9,7 +9,9 @@ from . import packaging
 APP_NAME = "SyncNotes"
 # 앱 버전의 단일 출처. 자동 업데이트가 이 값을 GitHub 릴리스 태그와 비교한다.
 # 메밀메모로 이름을 바꾸면서 1.0.0 부터 다시 센다(SyncNotes 는 1.0.7 까지였다).
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
+# 닉네임의 길이 상한. 참여한 PC 마다 이 이름을 적어 두므로 끝없이 길면 안 된다.
+MAX_NICKNAME_LENGTH = 64
 
 # 포크해서 다른 곳에 배포하려면 이 두 값만 바꾼다.
 UPDATE_REPO_OWNER = "LEESEUNGGYU8"
@@ -64,6 +66,9 @@ DEFAULT_COLOR = COLORS[0]
 
 DEFAULT_HEARTBEAT_MS = 3000
 DEFAULT_PORT = 5555
+# 내부망에서 공유 PC 를 찾는 신호를 받는 UDP 포트(app/network/discovery.py).
+# 공유에 쓰는 TCP 포트는 바꿀 수 있지만 이 번호는 모든 PC 가 같아야 한다.
+DISCOVERY_PORT = 5555
 
 DEFAULT_NOTE_WIDTH = 280
 DEFAULT_NOTE_HEIGHT = 260
@@ -83,6 +88,41 @@ CORNER_RADIUS = 12
 LOCK_IDLE_TIMEOUT_MS = 5 * 60 * 1000
 
 
+def _real_profile() -> str | None:
+    """이 Windows 계정의 실제 사용자 폴더(환경 변수와 무관)."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        userenv = ctypes.WinDLL("userenv", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        advapi32.OpenProcessToken.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+        userenv.GetUserProfileDirectoryW.argtypes = [
+            wintypes.HANDLE, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        TOKEN_QUERY = 0x0008
+        token = wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(
+                kernel32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(token)):
+            return None
+        try:
+            size = wintypes.DWORD(0)
+            userenv.GetUserProfileDirectoryW(token, None, ctypes.byref(size))
+            buf = ctypes.create_unicode_buffer(max(size.value, 260))
+            size = wintypes.DWORD(len(buf))
+            if not userenv.GetUserProfileDirectoryW(token, buf, ctypes.byref(size)):
+                return None
+            return buf.value or None
+        finally:
+            kernel32.CloseHandle(token)
+    except Exception:
+        return None
+
+
 def _real_appdata() -> str | None:
     """Windows 가 알려 주는 실제 Roaming 폴더(환경 변수와 무관)."""
     if sys.platform != "win32":
@@ -92,26 +132,61 @@ def _real_appdata() -> str | None:
         from ctypes import wintypes
         buf = ctypes.create_unicode_buffer(wintypes.MAX_PATH)
         CSIDL_APPDATA = 0x001A
-        if ctypes.windll.shell32.SHGetFolderPathW(None, CSIDL_APPDATA, None, 0, buf) != 0:
-            return None
-        return buf.value or None
+        if ctypes.windll.shell32.SHGetFolderPathW(None, CSIDL_APPDATA, None, 0, buf) == 0:
+            return buf.value or None
     except Exception:
-        return None
+        pass
+    # USERPROFILE 까지 다른 곳으로 돌려 띄우면 위의 물음이 실패한다(돌린 폴더에
+    # AppData 가 없다). 계정의 실제 사용자 폴더에서 헤아린다.
+    profile = _real_profile()
+    return os.path.join(profile, "AppData", "Roaming") if profile else None
 
 
 def isolated_run() -> bool:
-    """APPDATA 를 다른 곳으로 돌려 띄운 실행인가(테스트, 시험 실행).
+    """APPDATA 나 USERPROFILE 을 다른 곳으로 돌려 띄운 실행인가(테스트, 시험 실행).
 
     그런 실행은 실제로 쓰고 있는 앱과 섞이면 안 된다. 같은 파이프 이름으로 듣지
     않고(ipc.ipc_name), 작업 표시줄 목록이나 우클릭 메뉴 같은 사용자 환경을 고쳐
     쓰지 않는다. 알 수 없을 때는 평소 실행으로 본다."""
-    env = os.environ.get("APPDATA")
-    real = _real_appdata()
-    if not env or not real:
-        return False
     def norm(p: str) -> str:
         return os.path.normcase(os.path.normpath(p))
-    return norm(env) != norm(real)
+
+    env = os.environ.get("APPDATA")
+    real = _real_appdata()
+    if env and real and norm(env) != norm(real):
+        return True
+    home = os.environ.get("USERPROFILE")
+    profile = _real_profile()
+    return bool(home and profile and norm(home) != norm(profile))
+
+
+def discovery_port() -> int | None:
+    """공유 PC 가 찾는 신호를 받을 포트. None 이면 받지 않는다.
+
+    시험으로 띄운 실행은 실제 포트를 쓰지 않는다(쓰고 있는 앱과 섞인다). 시험이
+    환경 변수로 포트를 정해 준 때만 받는다."""
+    if not isolated_run():
+        return DISCOVERY_PORT
+    try:
+        port = int(os.environ.get("MEMIL_DISCOVERY_PORT", ""))
+    except ValueError:
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
+def discovery_targets() -> list[tuple[str, int]] | None:
+    """찾는 신호를 보낼 곳. None 이면 내부망 전체다.
+
+    시험으로 띄운 실행은 내부망에 신호를 뿌리지 않는다. 환경 변수로 받은
+    곳(``주소:포트,주소:포트``)에만 보내고, 없으면 아무 데도 보내지 않는다."""
+    if not isolated_run():
+        return None
+    targets = []
+    for item in os.environ.get("MEMIL_DISCOVERY_TARGETS", "").split(","):
+        host, _, port = item.strip().rpartition(":")
+        if host and port.isdigit():
+            targets.append((host, int(port)))
+    return targets
 
 
 # 스토어판이 메모를 두는 폴더(사용자 폴더 바로 아래). 패키지 앱이 AppData 에
@@ -152,6 +227,11 @@ def default_settings_path() -> Path:
 
 def default_backup_dir() -> Path:
     return app_data_dir() / "backups"
+
+
+def default_drafts_path() -> Path:
+    """공유 PC 와 끊긴 동안 이 PC 에서 쓴 메모(참여한 PC). 다시 붙으면 올릴지 묻는다."""
+    return app_data_dir() / "offline.sqlite3"
 
 
 def default_replica_path() -> Path:

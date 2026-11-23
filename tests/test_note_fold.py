@@ -76,8 +76,23 @@ def test_wall_for_drag_finds_all_four_walls():
     assert wall(QPoint(600, 2)) == nf.DOCK_TOP
     assert wall(QPoint(600, SCREEN.bottom() - slip.height() - 1)) == nf.DOCK_BOTTOM
     assert wall(QPoint(600, 300)) == nf.DOCK_NONE
-    # 아이콘 격자의 첫 칸(벽에서 10)은 붙지 않는다. 벽 옆에도 아이콘을 둘 수 있다.
-    assert wall(QPoint(nf.ICON_GRID_ORIGIN.x(), 300)) == nf.DOCK_NONE
+    # 벽에서 조금 떨어진 쪽지는 붙지 않는다.
+    assert wall(QPoint(nf.SNAP_DISTANCE + 4, 300)) == nf.DOCK_NONE
+    # 아이콘은 벽에 닿아 있는 첫 칸에도 놓인다. 그림이 벽을 넘도록 밀어야 붙는다.
+    cell = nf.ICON_CELL_DEFAULT
+
+    def icon_wall(pos: QPoint) -> str:
+        rect = QRect(pos, cell)
+        return nf.wall_for_drag(nf.icon_wall_probe(rect, nf.ICON_DEFAULT),
+                                rect.center(), screens)[0]
+
+    assert icon_wall(QPoint(0, 300)) == nf.DOCK_NONE
+    assert icon_wall(QPoint(-10, 300)) == nf.DOCK_NONE
+    assert icon_wall(QPoint(-16, 300)) == nf.DOCK_LEFT
+    assert icon_wall(QPoint(600, 5)) == nf.DOCK_NONE
+    assert icon_wall(QPoint(600, -16)) == nf.DOCK_TOP
+    assert icon_wall(QPoint(SCREEN.right() - cell.width() + 1, 300)) == nf.DOCK_NONE
+    assert icon_wall(QPoint(SCREEN.right() - cell.width() + 17, 300)) == nf.DOCK_RIGHT
     # 모서리에서는 더 깊이 들어간 쪽이 이긴다.
     assert wall(QPoint(-30, -5)) == nf.DOCK_LEFT
     assert wall(QPoint(-5, -30)) == nf.DOCK_TOP
@@ -613,20 +628,26 @@ def test_slip_kept_at_the_screen_edge_by_an_older_version_stays_put(qapp):
     avail = _avail()
     w = StickyNoteWidget(_note(id="e"), "지우", settings=settings)
     # 옛 버전은 화면 오른쪽 끝에 둔 아이콘의 자리를 펼친 자리로 적었다.
-    x = avail.right() - nf.ICON_SIZE.width() - 1
-    w.apply_local_state(x, 120, 300, 280, folded=True, fold_style="icon",
-                        fold_x=x, fold_y=120, fold_at=True)
+    grid = nf.icon_grid(avail)
+    spot = grid.pos_of(grid.cols() - 1, 1)
+    x, y = spot.x(), spot.y()
+    w.apply_local_state(x, y, 300, 280, folded=True, fold_style="icon",
+                        fold_x=x, fold_y=y, fold_at=True)
     w.show()
-    assert w.pos() == QPoint(x, 120)
+    assert w.pos() == spot
     w.unfold()
     # 메모는 화면 안에서 펴지고,
     assert avail.contains(w.geometry())
     opened = w.pos()
     # 다시 접으면 아이콘은 있던 자리로 돌아간다(왼쪽으로 밀려나지 않는다).
     w.fold()
-    assert w.pos() == QPoint(x, 120)
+    assert w.pos() == spot
     w.unfold()
     assert w.pos() == opened
+    # 칸에서 벗어난 자리에 적혀 있던 아이콘은 접을 때 가까운 칸으로 간다.
+    w._fold_pos = spot + QPoint(-9, 14)
+    w.fold()
+    assert w.pos() == spot
     w._teardown = True
     w.close()
 

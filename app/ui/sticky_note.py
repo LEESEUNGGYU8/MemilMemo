@@ -356,6 +356,11 @@ class StickyNoteWidget(QWidget):
         self.private_owner: str | None = note.get("private_owner")
         self._content: str = note.get("content", "") or ""
         self._pending_commit: str | None = None
+        # 보내 놓고 답을 받지 못한 글이 어느 판을 보고 쓴 것인가. 다시 붙었을 때
+        # 그 사이 다른 사람이 고쳤는지 가리는 기준이다.
+        self._pending_commit_version = 0
+        # 답이 오기 전에 한 번 더 보냈을 때, 먼저 보낸 글.
+        self._earlier_commit: str | None = None
         self._edit_baseline: tuple[str, str, int, int] | None = None
         self._my_nickname = my_nickname
         self._lock_holder: str | None = None
@@ -614,6 +619,12 @@ class StickyNoteWidget(QWidget):
         # 이 메모를 접었을 때의 모양. 비어 있으면 설정의 기본 모양을 따른다.
         self._fold_style = ""
         self._icon_resolver = None
+        # 아이콘으로 접힌 메모를 끌 때, 그 아래에 받아 줄 것(메모 폴더 아이콘)이
+        # 있는지 묻는 함수와 끌기 시작한 자리.
+        self._drop_probe = None
+        self._drag_origin: QPoint | None = None
+        # 끄는 동안 벽에 닿아 있는가(붙어 있던 탭을 끌기 시작했으면 처음부터 참).
+        self._drag_at_wall = False
         self._fade_anim: QVariantAnimation | None = None
         self._title_src: str | None = None
         self._title_text = ""
@@ -652,10 +663,11 @@ class StickyNoteWidget(QWidget):
     def _apply_content_to_view(self, content: str) -> None:
         if not content:
             self._text.clear()
-        elif "<" in content and ">" in content:
+        elif html_guard.is_markup(content):
             # 본문이 가리키는 바깥 자원(네트워크 경로의 그림 등)은 걷어 내고 그린다.
             self._text.setHtml(html_guard.clean(content))
         else:
+            # 서식 없이 저장된 글. 꺾쇠가 들어 있어도 글자 그대로 보여 준다.
             self._text.setPlainText(content)
         self._convert_loaded_markers()
         # 링크마다 종류 아이콘 자리를 끼우고 글자색을 지금 메모 색에 맞춘다.
@@ -767,7 +779,9 @@ class StickyNoteWidget(QWidget):
                         break
                 it += 1
             block = block.next()
-        if has_rich:
+        if has_rich or "<" in plain:
+            # 꺾쇠가 든 글은 서식이 없어도 HTML 로 저장한다. 글자 그대로 두면 읽는
+            # 쪽(옛 버전 포함)이 꺾쇠 사이를 태그로 읽어 그 글이 사라진다.
             return self._marker_save_html()
         return plain
 
@@ -794,7 +808,14 @@ class StickyNoteWidget(QWidget):
         # 방금 전송한 내용이 그대로 돌아온 경우 undo 스택을 지키려고 뷰를 유지한다.
         own_echo = (self._pending_commit is not None
                     and new_content == self._pending_commit)
-        if own_echo:
+        if (not own_echo and self._earlier_commit is not None
+                and new_content == self._earlier_commit):
+            # 잇달아 두 번 보낸 저장 가운데 먼저 것의 답이다. 화면에는 그 뒤에 쓴
+            # 글이 있으므로 건드리지 않고, 나중 것의 답을 기다린다.
+            self._earlier_commit = None
+            self._content = new_content
+        elif own_echo:
+            self._earlier_commit = None
             self._pending_commit = None
             self._content = new_content
         elif not self._edit_mode and new_content != self._content:
@@ -847,6 +868,7 @@ class StickyNoteWidget(QWidget):
             self.releaseLock.emit(self.note_id)
             return
         self._edit_mode = True
+        self._earlier_commit = None
         self._text.setReadOnly(False)
         self._text.setFocus(Qt.OtherFocusReason)
         self._overlay.hide()
@@ -897,7 +919,7 @@ class StickyNoteWidget(QWidget):
             return
         self._request_edit()
         if not self._pending_lock and not self._edit_mode:
-            # 끊겨 있어 편집을 시작하지 못했다(안내는 _request_edit 이 띄웠다).
+            # 편집을 청하지 못했다(다른 사람이 편집 중이다).
             self._pending_drop = None
 
     def _apply_pending_drop(self) -> None:
@@ -909,6 +931,10 @@ class StickyNoteWidget(QWidget):
                                       self._text.document().characterCount() - 1)))
         self._text.setTextCursor(cursor)
         self._text.insertFromMimeData(source)
+        if not self.isActiveWindow():
+            # 다른 창을 쓰던 채로 끌어다 놓았다. 앞에 있지 않은 메모가 잠금을 쥔
+            # 채 남지 않게, 넣은 것만 보내고 편집을 끝낸다(링크를 넣을 때와 같다).
+            self._commit_and_release()
 
     def add_file_links(self, paths: list[str]) -> None:
         """파일·폴더를 가리키는 링크를 본문 끝에 한 줄에 하나씩 넣는다.
@@ -927,7 +953,7 @@ class StickyNoteWidget(QWidget):
         if not self._pending_lock:
             self._request_edit()
         if not self._pending_lock and not self._edit_mode:
-            # 끊겨 있어 편집을 시작하지 못했다(안내는 _request_edit 이 띄웠다).
+            # 편집을 청하지 못했다(다른 사람이 편집 중이다).
             self._pending_links = []
 
     def _apply_pending_links(self) -> None:
@@ -1032,17 +1058,66 @@ class StickyNoteWidget(QWidget):
             width, height)
 
     def set_offline(self, offline: bool) -> None:
-        """호스트와 끊겼는지 알린다.
+        """호스트와 끊겼는지 알린다(손잡이 줄에 '오프라인'을 적는다).
 
-        끊긴 동안에는 새로 편집을 시작하지 못한다(잠금을 받을 길이 없다).
-        이미 편집하던 글은 그대로 이어 쓸 수 있고, 다시 붙으면 메인 창이
-        unsent_edit() 로 가져가 보낸다."""
+        끊긴 동안 고친 글은 메인 창이 이 PC 에 적어 두었다가 다시 붙으면 올릴지
+        묻는다. 연결돼 있을 때부터 편집하던 글은 그대로 이어 쓸 수 있고, 다시
+        붙으면 메인 창이 unsent_edit() 로 가져가 보낸다."""
         offline = bool(offline)
         if offline == self._offline:
             return
         self._offline = offline
         self._pending_lock = False
         self._refresh_lock_ui()
+
+    def _version_to_send(self) -> int:
+        """지금 보내는 저장에 적을 판 번호.
+
+        앞서 보낸 저장의 답이 아직 오지 않았으면(글을 쓰다 멈춘 직후 곧바로 다른
+        곳을 누른 경우), 공유 PC 는 온 차례대로 처리하므로 이 저장이 닿을 때는
+        판 번호가 하나 올라가 있다. 그대로 보내면 거절돼 글이 사라진다."""
+        if self._pending_commit is None:
+            self._pending_commit_version = self.version
+            return self.version
+        self._earlier_commit = self._pending_commit
+        return self.version + 1
+
+    def unsent_base_version(self) -> int:
+        """보내지 못한 글(unsent_edit)이 보고 쓴 판 번호."""
+        return self.version if self._edit_mode else self._pending_commit_version
+
+    def is_editing(self) -> bool:
+        return self._edit_mode
+
+    def lock_lost(self) -> str | None:
+        """편집 중인데 공유 PC 가 잠금을 풀었다(오래 손대지 않았다).
+
+        편집을 끝낸다. 그대로 두면 창에는 옛 글이 남은 채 다른 사람이 고친 판
+        번호만 따라가, 나중에 한 글자만 쳐도 그 사람의 글을 덮어쓴다. 아직
+        보내지 못한 글이 있으면 돌려준다(메인 창이 잠금을 다시 받아 보낸다)."""
+        if not self._edit_mode:
+            return None
+        self._autosave_timer.stop()
+        self._idle_save_timer.stop()
+        self._edit_mode = False
+        self._text.setReadOnly(True)
+        snapshot = self._edit_snapshot()
+        unsent = snapshot[0] if snapshot != self._edit_baseline else None
+        self._edit_baseline = None
+        if unsent is not None:
+            self._pending_commit = unsent
+            self._pending_commit_version = self.version
+            self._content = unsent
+        self._lock_label.setText(i18n.t("sticky.offline") if self._offline else "")
+        self._set_format_bar_enabled(False)
+        return unsent
+
+    def cancel_pending_lock(self) -> None:
+        """편집 요청을 들어줄 수 없다. 기다리는 상태를 푼다."""
+        self._pending_lock = False
+        self._pending_check = None
+        self._pending_drop = None
+        self._pending_links = []
 
     def unsent_edit(self) -> str | None:
         """호스트에 닿았는지 확인되지 않은 편집 내용. 없으면 None."""
@@ -1058,12 +1133,9 @@ class StickyNoteWidget(QWidget):
             # 뷰어를 연 뒤 응답이 오기 전에 다시 눌렀다면 편집하려는 뜻이다.
             self._abandon_grant = False
             return
-        if self._offline:
-            # 요청을 보내도 닿지 않는다. 아무 반응이 없는 것처럼 두지 않는다.
-            self._show_overlay(i18n.t("sticky.offline_notice"))
-            return
         if self._lock_holder and self._lock_holder != self._my_nickname:
             return
+        # 끊긴 동안에도 요청은 보낸다. 메인 창이 이 PC 에서만 고치게 해 준다.
         self._pending_lock = True
         self.requestLock.emit(self.note_id)
 
@@ -1078,15 +1150,16 @@ class StickyNoteWidget(QWidget):
         # baseline 과 같으면 updated_at·이력 행을 건드리지 않도록 전송을 건너뛴다.
         if snapshot != self._edit_baseline:
             new_content = snapshot[0]
+            version = self._version_to_send()
             self._pending_commit = new_content
             self._content = new_content
             self.commitEdit.emit(
                 self.note_id, new_content, self.color,
-                self.width(), self.height(), self.version,
+                self.width(), self.height(), version,
             )
         self._edit_baseline = None
         self.releaseLock.emit(self.note_id)
-        self._lock_label.setText("")
+        self._lock_label.setText(i18n.t("sticky.offline") if self._offline else "")
         self._set_format_bar_enabled(False)
 
     def _on_body_changed(self) -> None:
@@ -1114,11 +1187,12 @@ class StickyNoteWidget(QWidget):
         if snapshot == self._edit_baseline:
             return
         new_content = snapshot[0]
+        version = self._version_to_send()
         self._pending_commit = new_content
         self._content = new_content
         self.commitEdit.emit(
             self.note_id, new_content, self.color,
-            self.width(), self.height(), self.version,
+            self.width(), self.height(), version,
         )
         # baseline 을 굴려 이후 idle 자동 저장 tick 도 no-op 이 되게 한다.
         self._edit_baseline = snapshot
@@ -1279,7 +1353,7 @@ class StickyNoteWidget(QWidget):
         if self._edit_mode:
             edit_menu.add_edit_actions(menu, self._text)
         else:
-            can_edit = not self._offline and not self.is_locked_by_other()
+            can_edit = not self.is_locked_by_other()
             add_centered_menu_action(
                 menu, svg_icon("edit", color=ink if can_edit else "#B0B0B0"),
                 i18n.t("sticky.menu_edit"), self._request_edit, enabled=can_edit)
@@ -2217,17 +2291,91 @@ class StickyNoteWidget(QWidget):
         겹치지 않는 격자 자리를 돌려준다."""
         self._icon_resolver = resolver
 
+    def set_drop_probe(self, probe) -> None:
+        """``probe(note_id, 커서 자리, 놓았는가) -> bool``. 아이콘으로 접힌 메모를
+        끄는 동안 부른다. 놓았을 때 참을 돌려주면 받아 준 것이다(메모 폴더
+        아이콘 위에 놓았다). 그러면 아이콘은 끌기 전의 자리로 돌아간다."""
+        self._drop_probe = probe
+
+    def _probe_drop(self, gp: QPoint, dropped: bool) -> bool:
+        if self._drop_probe is None:
+            return False
+        try:
+            return bool(self._drop_probe(self.note_id, QPoint(gp), dropped))
+        except Exception:
+            return False
+
+    # ── 아이콘 격자 ──
+
+    def _icon_grid(self, at: QPoint | None = None) -> nf.IconGrid:
+        """이 메모의 아이콘이 놓이는(``at`` 을 주면 그 점이 있는) 화면의 격자."""
+        if at is None:
+            if self._folded and not self._dock:
+                at = self.geometry().center()
+            else:
+                at = (self._fold_pos if self._fold_at
+                      else self._open_pos) + QPoint(8, 8)
+        return nf.icon_grid(self._screen_rect_at(at))
+
+    def wants_icon_spot(self) -> bool:
+        """아이콘 모양으로 접혀 있거나, 접으면 아이콘이 될 자리를 가진 메모인가."""
+        return (not self._dock and self._style_pref() == nf.FOLD_ICON
+                and (self._fold_at or self._folded))
+
+    def icon_spot(self) -> QPoint:
+        """아이콘이 놓인(놓일) 자리."""
+        if self._folded and not self._dock and not self._fold_busy():
+            return self.pos()
+        return QPoint(self._fold_pos if self._fold_at else self._open_pos)
+
+    def move_icon(self, pos: QPoint) -> None:
+        """아이콘의 자리와 크기를 다시 맞춘다(바탕화면 아이콘의 크기가 바뀌었다,
+        격자에 맞춰 다시 놓는다)."""
+        self._fold_pos = QPoint(pos)
+        self._fold_at = True
+        if (self._folded and not self._dock and not self._fold_busy()
+                and self._icon_mode()):
+            self._stop_geo_anim()
+            grid = nf.icon_grid(self._screen_rect_at(pos + QPoint(8, 8)))
+            self.setGeometry(QRect(pos, grid.cell))
+            self._refresh_face_tip()
+            self.update()
+        self._emit_fold_state()
+
     def set_fold_style(self, style: str) -> None:
         """접힌 모양을 쪽지나 아이콘으로 바꾼다. 접혀 있으면 그 자리에서 바뀐다."""
         if style not in nf.FOLD_STYLES or self._fold_busy():
             return
         self._fold_style = style
         if self._folded and not self._dock:
-            self._stop_geo_anim()
-            self.setGeometry(QRect(self.pos(), self._face_size()))
-            self._refresh_face_tip()
-            self.update()
+            self._settle_face()
         self._emit_fold_state()
+
+    def _settle_face(self) -> None:
+        """접힌 모양이 바뀐 뒤 창을 그 모양의 크기로 맞춘다. 아이콘이 됐으면
+        바탕화면 아이콘의 칸에 맞춰 놓는다."""
+        self._stop_geo_anim()
+        pos = self.pos()
+        if self._icon_mode():
+            pos = self._resolve_icon_pos(pos)
+            self._fold_pos = QPoint(pos)
+            self._fold_at = True
+        self.setGeometry(QRect(pos, self._face_size(pos + QPoint(8, 8))))
+        self._refresh_face_tip()
+        self.update()
+
+    def refresh_fold_face(self) -> None:
+        """설정의 접힌 모양이 바뀌었을 때 다시 맞춘다. 모양을 따로 고르지 않은
+        접힌 메모만 따라간다(그리는 모양은 설정을 바로 따르는데 창 크기가 옛
+        모양에 남으면 쪽지 크기의 창에 아이콘이 잘려 그려진다)."""
+        if (not self._folded or self._dock or self._fold_busy()
+                or self._fold_style in nf.FOLD_STYLES):
+            return
+        if self.size() != self._face_size():
+            self._settle_face()
+            self._emit_fold_state()
+        self._refresh_face_tip()
+        self.update()
 
     def fade_to(self, visible: bool) -> None:
         """폴더 아이콘을 열고 닫을 때 메모를 부드럽게 나타내거나 감춘다."""
@@ -2348,6 +2496,13 @@ class StickyNoteWidget(QWidget):
         self._open_pos = self.pos()
         if dock in nf.DOCK_SIDES:
             self._dock_to(dock, self._along(dock, self.pos()), self._avail())
+        elif not self._dock and self._icon_mode():
+            # 아이콘은 바탕화면 아이콘과 같은 칸에 놓인다. 둔 자리가 없으면 펼쳐
+            # 있던 곳에서 가까운 빈 칸을 잡는다. 둔 자리가 있어도 펼쳐 둔 사이에
+            # 다른 아이콘이 그 칸에 놓였으면 옆의 빈 칸으로 간다.
+            self._fold_pos = self._resolve_icon_pos(
+                self._fold_pos if self._fold_at else self._open_pos)
+            self._fold_at = True
         self._fold_now()
 
     def _fold_now(self) -> None:
@@ -2369,7 +2524,8 @@ class StickyNoteWidget(QWidget):
             color=self.color, title=self._title(),
             anchor=self._fold_anchor(), dock=self._dock,
             private=bool(self.private_owner), font=self.font(),
-            style=self._style_now(), thumb=self._fold_thumb())
+            style=self._style_now(), thumb=self._fold_thumb(),
+            icon=self._icon_grid(self._fold_target.center()).icon)
         self._fold_t = 0.0
         self.update()
         self._run_fold(0.0, 1.0, nf.FOLD_MS, self._finish_fold)
@@ -2528,6 +2684,10 @@ class StickyNoteWidget(QWidget):
         else:
             pos = QPoint(tab.left(), avail.bottom() - face.height() - 23)
         rect = nf.keep_on_screen(QRect(pos, face), avail)
+        if self._icon_mode():
+            # 아이콘은 바탕화면 아이콘의 칸에 맞춰 놓는다.
+            at = self._resolve_icon_pos(rect.topLeft())
+            rect = QRect(at, self._face_size(at + QPoint(8, 8)))
         self._fold_pos = rect.topLeft()
         self._fold_at = True
         if self._folded:
@@ -2585,6 +2745,8 @@ class StickyNoteWidget(QWidget):
 
     def _begin_slip_drag(self) -> None:
         self._slip_dragging = True
+        self._drag_origin = None if self._dock else QPoint(self.pos())
+        self._drag_at_wall = bool(self._dock)
         cur = self.size()
         target = self._face_size()
         if cur != target:
@@ -2601,9 +2763,18 @@ class StickyNoteWidget(QWidget):
 
     def _drag_slip_to(self, gp: QPoint) -> None:
         screens = self._screens()
-        rect = QRect(gp - self._slip_grab, self._face_size())
-        side, index = nf.wall_for_drag(rect, gp, screens)
+        rect = QRect(gp - self._slip_grab, self._face_size(gp))
+        probe = rect
+        if self._style_pref() == nf.FOLD_ICON and not self._drag_at_wall:
+            # 아이콘은 벽에 닿아 있는 첫 칸에도 놓인다. 그림이 벽을 넘도록 밀어야
+            # 탭으로 붙는다. 붙어 있던 탭은 전과 같이 벽에서 떼어 낼 때까지 탭이다.
+            probe = nf.icon_wall_probe(rect, self._icon_grid(gp).icon)
+        side, index = nf.wall_for_drag(probe, gp, screens)
+        self._drag_at_wall = bool(side)
         self._drag_cursor = QPoint(gp)
+        if self._style_pref() == nf.FOLD_ICON:
+            # 메모 폴더 아이콘 위를 지나면 그 폴더가 받을 채비를 한다.
+            self._probe_drop(gp, False)
         if side:
             # 화면 벽에 닿으면 접힌 모양과 무관하게 쪽지로 붙는다.
             avail = QRect(screens[index][1])
@@ -2627,12 +2798,26 @@ class StickyNoteWidget(QWidget):
             self._dock_to(side, along, QRect(self._drag_avail))
             self._slide_to(self._tab_rect(self._slip_hover))
         else:
-            self._dock = nf.DOCK_NONE
+            was_docked, self._dock = bool(self._dock), nf.DOCK_NONE
             pos = self.pos()
             if self._icon_mode():
+                if self._probe_drop(self._drag_cursor, True):
+                    # 메모 폴더 아이콘 위에 놓았다(그 폴더로 들어갔다). 아이콘은
+                    # 끌기 전의 자리로 돌아간다.
+                    back = self._drag_origin
+                    if back is None or was_docked:
+                        back = self._resolve_icon_pos(pos)
+                    self._fold_pos = QPoint(back)
+                    self._fold_at = True
+                    self._slide_to(QRect(back, self._face_size(back + QPoint(8, 8))))
+                    self._apply_z_order()
+                    self._refresh_face_tip()
+                    self.update()
+                    self._emit_fold_state()
+                    return
                 # 바탕화면 아이콘처럼 격자에 맞추고, 다른 아이콘과 겹치면 비켜 놓는다.
                 pos = self._resolve_icon_pos(pos)
-                self._slide_to(QRect(pos, nf.ICON_SIZE))
+                self._slide_to(QRect(pos, self._face_size(pos + QPoint(8, 8))))
             self._fold_pos = QPoint(pos)
             self._fold_at = True
             self._apply_z_order()
@@ -2666,14 +2851,15 @@ class StickyNoteWidget(QWidget):
     def _icon_mode(self) -> bool:
         return self._style_now() == nf.FOLD_ICON
 
-    def _face_size(self) -> QSize:
-        """떠 있는 접힌 메모의 크기(쪽지 또는 아이콘)."""
-        return (QSize(nf.ICON_SIZE) if self._style_pref() == nf.FOLD_ICON
-                else QSize(nf.SLIP_SIZE))
+    def _face_size(self, at: QPoint | None = None) -> QSize:
+        """떠 있는 접힌 메모의 크기(쪽지 또는 아이콘). 아이콘은 그 화면의
+        바탕화면 아이콘 한 칸과 같다."""
+        if self._style_pref() == nf.FOLD_ICON:
+            return QSize(self._icon_grid(at).cell)
+        return QSize(nf.SLIP_SIZE)
 
     def _resolve_icon_pos(self, pos: QPoint) -> QPoint:
-        avail = self._screen_rect_at(pos + QPoint(nf.ICON_SIZE.width() // 2,
-                                                  nf.ICON_SIZE.height() // 2))
+        avail = self._screen_rect_at(pos + QPoint(38, 50))
         if self._icon_resolver is not None:
             try:
                 return QPoint(self._icon_resolver(self.note_id, pos, avail))
@@ -2855,7 +3041,10 @@ class StickyNoteWidget(QWidget):
         if self._dock:
             return self._tab_rect(False)
         pos = self._fold_pos if self._fold_at else self._open_pos
-        return QRect(pos, self._face_size())
+        # 접어 둔 자리의 모니터가 뽑혔으면 보이는 화면 안으로 들인다. 그러지
+        # 않으면 접을 때마다 메모가 화면 밖으로 사라진다.
+        size = self._face_size()
+        return QRect(self._pull_on_screen(pos, size), size)
 
     def _dock_on_top(self) -> bool:
         s = self._settings
@@ -2966,7 +3155,8 @@ class StickyNoteWidget(QWidget):
                 nf.paint_icon(painter, QRectF(self.rect()), self.color,
                               self._title(), private=bool(self.private_owner),
                               hover=self._slip_hover, font=self.font(),
-                              thumb=self._fold_thumb())
+                              thumb=self._fold_thumb(),
+                              icon=self._icon_grid().icon)
             else:
                 nf.paint_slip(painter, QRectF(self.rect()), self.color,
                               self._title(), dock=dock,

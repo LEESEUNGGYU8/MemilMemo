@@ -15,7 +15,7 @@ import time
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
-from . import config
+from . import config, packaging
 
 # 작업 표시줄 목록과 바탕 화면 우클릭 메뉴의 '새 메모'가 실행 파일에 넘기는 표시.
 NEW_NOTE_FLAG = "--new-note"
@@ -23,10 +23,14 @@ NEW_NOTE_FLAG = "--new-note"
 AT_CURSOR_FLAG = "--at-cursor"
 # 파일·폴더 우클릭 메뉴가 넘기는 표시. 뒤에 그 경로가 온다.
 LINK_NOTE_FLAG = "--link-note"
+# 바탕 화면 우클릭 메뉴의 '새 메모 폴더 추가'가 넘기는 표시.
+NEW_FOLDER_FLAG = "--new-folder"
 
 # 떠 있는 인스턴스에 넘기는 명령.
 CMD_NEW_NOTE = "new-note"
 CMD_NEW_NOTE_HERE = "new-note-here"
+# 우클릭한 자리에 메모 폴더를 만들고 아이콘으로 둔다.
+CMD_NEW_FOLDER_HERE = "new-folder-here"
 CMD_SHOW = "show"
 # 뒤에 빈칸 하나를 두고 경로가 온다(한 줄에 경로 하나).
 CMD_LINK_NOTE = "link-note"
@@ -39,6 +43,11 @@ def new_note_command(argv: list[str]) -> str | None:
     if NEW_NOTE_FLAG not in argv:
         return None
     return CMD_NEW_NOTE_HERE if AT_CURSOR_FLAG in argv else CMD_NEW_NOTE
+
+
+def new_folder_command(argv: list[str]) -> str | None:
+    """실행 인자가 '새 메모 폴더 추가' 요청이면 넘길 명령을, 아니면 None."""
+    return CMD_NEW_FOLDER_HERE if NEW_FOLDER_FLAG in argv else None
 
 
 def link_note_paths(argv: list[str]) -> list[str]:
@@ -126,6 +135,11 @@ def ipc_name() -> str:
     # Windows 명명된 파이프는 경로 문자에 민감하므로 안전한 문자만 남긴다.
     safe = "".join(ch if ch.isalnum() else "_" for ch in user)
     name = f"SyncNotes-IPC-{safe}"
+    if packaging.is_packaged():
+        # 설치판과 스토어판을 함께 깔아 둔 PC 에서 서로의 명령을 받지 않게 한다.
+        # 같은 이름이면 먼저 켜진 쪽이 다른 판의 '새 메모'까지 가져가, 메모가
+        # 엉뚱한 판의 폴더에 생긴다.
+        name += "-Store"
     if config.isolated_run():
         # 데이터 폴더를 따로 쓰는 시험 실행은 실제 앱의 '새 메모'를 가로채지 않게
         # 이름도 따로 쓴다. 같은 폴더로 띄운 두 번째 실행끼리는 이름이 같다.

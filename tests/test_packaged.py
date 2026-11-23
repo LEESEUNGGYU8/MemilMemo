@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -203,6 +204,96 @@ def test_adoption_clears_a_half_done_attempt(places, store):
     assert not (new / "adopt.tmp").exists()
 
 
+def test_adoption_does_not_touch_a_classic_file_that_was_left_open(places, store):
+    """설치판이 꺼지지 않고 죽었다(전원이 나갔다). 사본 파일 옆에 아직 합쳐지지
+    않은 기록(-wal)이 남아 있다. 그 기록까지 가져오되, 옛 폴더는 건드리지 않는다."""
+    import shutil
+    import sqlite3
+    old, new = places
+    _fill_classic(old)
+    # 사본에 메모를 하나 더 쓰고, 닫기 전의 파일들을 그대로 떠 둔다(죽은 모습).
+    live = ReplicaStore(old / "replica.sqlite3")
+    live.upsert_note({"id": "r2", "version": 1, "content": "죽기 직전에 받은 메모",
+                      "updated_at": 2})
+    crashed = old.parent / "crashed"
+    crashed.mkdir()
+    for path in old.glob("replica.sqlite3*"):
+        shutil.copyfile(path, crashed / path.name)
+    live.close()
+    for path in old.glob("replica.sqlite3*"):
+        path.unlink()
+    for path in crashed.iterdir():
+        shutil.copyfile(path, old / path.name)
+    assert (old / "replica.sqlite3-wal").stat().st_size > 0
+    before = _tree(old)
+
+    assert "replica.sqlite3" in data_home.adopt_classic_data()
+
+    assert _tree(old) == before              # 합치지도, 파일을 만들지도 않았다
+    conn = sqlite3.connect(str(new / "replica.sqlite3"))
+    try:
+        assert {r[0] for r in conn.execute("SELECT id FROM notes")} == {"r1", "r2"}
+    finally:
+        conn.close()
+    assert not list(new.glob("raw-*")) and not (new / "adopt.tmp").exists()
+
+
+def test_adoption_brings_notes_written_offline(places, store):
+    from app.offline_drafts import DraftStore
+    old, new = places
+    _fill_classic(old)
+    drafts = DraftStore(old / "offline.sqlite3")
+    drafts.save_new({"id": "d1", "content": "끊긴 동안 쓴 글"}, address="10.0.0.2:5555",
+                    nickname="지우")
+    drafts.close()
+
+    assert "offline.sqlite3" in data_home.adopt_classic_data()
+
+    got = DraftStore(new / "offline.sqlite3")
+    try:
+        assert [d.content for d in got.pending("지우")] == ["끊긴 동안 쓴 글"]
+    finally:
+        got.close()
+
+
+def test_two_first_runs_do_not_adopt_at_the_same_time(places, store, monkeypatch):
+    """창이 뜨기 전에 한 번 더 켰다. 뒤에 켜진 실행은 앞선 실행이 끝나기를 기다린다."""
+    old, new = places
+    _fill_classic(old)
+    new.mkdir(parents=True)
+    (new / "adopt.lock").write_bytes(b"")              # 앞선 실행이 가져오는 중
+    monkeypatch.setattr(data_home, "_LOCK_WAIT", 0.2)
+
+    assert data_home.adopt_classic_data() == []
+    assert not (new / "notes.sqlite3").exists()        # 겹쳐서 옮기지 않았다
+
+    # 가져오다 죽은 실행이 남긴 오래된 잠금은 걷고 가져온다.
+    stale = time.time() - 3600
+    os.utime(new / "adopt.lock", (stale, stale))
+    assert "notes.sqlite3" in data_home.adopt_classic_data()
+    assert not (new / "adopt.lock").exists()
+
+
+def test_file_held_by_another_program_is_moved_on_a_later_try(places, store, monkeypatch):
+    """방금 만든 파일을 백신이 잠깐 쥐고 있다. 한 번 실패했다고 그 파일을 빼놓지 않는다."""
+    old, new = places
+    _fill_classic(old)
+    real = os.replace
+    failed = []
+
+    def flaky(src, dst):
+        if str(dst).endswith("local_state.json") and not failed:
+            failed.append(dst)
+            raise PermissionError(13, "in use")
+        return real(src, dst)
+
+    monkeypatch.setattr(data_home.os, "replace", flaky)
+    monkeypatch.setattr(data_home.time, "sleep", lambda _s: None)
+
+    assert "local_state.json" in data_home.adopt_classic_data()
+    assert failed and (new / "local_state.json").is_file()
+
+
 def test_classic_edition_adopts_nothing(places):
     old, new = places
     _fill_classic(old)
@@ -288,14 +379,24 @@ def test_store_edition_keeps_the_shell_menu_in_a_file(places, store, no_registry
     shell_menu.refresh("새 메모", "새 메모에 링크로 넣기")
     assert not marker.exists()
 
-    assert shell_menu.set_registered(True, "새 메모", "새 메모에 링크로 넣기")
+    assert shell_menu.set_registered(True, "새 메모 추가", "새 메모에 링크로 넣기",
+                                     "새 메모 폴더 추가")
     assert shell_menu.is_registered()
-    # 메뉴 DLL 이 읽는 꼴: UTF-8, 첫 줄이 바탕 화면 항목, 둘째 줄이 파일 항목.
-    assert marker.read_bytes() == "새 메모\n새 메모에 링크로 넣기\n".encode("utf-8")
+    # 메뉴 DLL 이 읽는 꼴: UTF-8, 첫 줄이 바탕 화면의 새 메모, 둘째 줄이 파일 항목,
+    # 셋째 줄이 바탕 화면의 새 메모 폴더(나중에 생긴 줄이라 맨 뒤다).
+    assert marker.read_bytes() == (
+        "새 메모 추가\n새 메모에 링크로 넣기\n새 메모 폴더 추가\n".encode("utf-8"))
 
     # 화면 언어가 바뀌면 메뉴의 글자도 따라간다.
-    shell_menu.refresh("New note", "Link in a new note")
-    assert marker.read_text(encoding="utf-8") == "New note\nLink in a new note\n"
+    shell_menu.refresh("Add New Note", "Link in a New Note", "Add New Note Folder")
+    assert marker.read_text(encoding="utf-8") == (
+        "Add New Note\nLink in a New Note\nAdd New Note Folder\n")
+
+    # 옛 버전이 적어 둔 두 줄짜리 파일은 켤 때 세 줄로 고쳐 적는다.
+    marker.write_text("새 메모\n새 메모에 링크로 넣기\n", encoding="utf-8")
+    shell_menu.refresh("새 메모 추가", "새 메모에 링크로 넣기", "새 메모 폴더 추가")
+    assert marker.read_text(encoding="utf-8").splitlines() == [
+        "새 메모 추가", "새 메모에 링크로 넣기", "새 메모 폴더 추가"]
 
     assert shell_menu.set_registered(False, "새 메모", "")
     assert not marker.exists() and not shell_menu.is_registered()
@@ -371,7 +472,7 @@ def test_store_settings_switch_the_startup_task_and_the_menu(
     dlg._on_accept()
     assert task["state"] == startup_task.ENABLED
     assert (new / shell_menu.MARKER_NAME).read_text(encoding="utf-8") == (
-        "새 메모\n새 메모에 링크로 넣기\n")
+        "새 메모 추가\n새 메모에 링크로 넣기\n새 메모 폴더 추가\n")
     dlg.deleteLater()
 
     again = SettingsDialog(settings, role="host")
@@ -556,3 +657,55 @@ def test_whole_app_as_the_store_edition_stays_out_of_appdata(qapp):
     assert report["registry_writes"] == []
     assert report["export_ok"] and report["export_outside_appdata"]
     assert report["update_checks"] == 0
+
+
+# ── 묶음 설정과 메뉴 DLL ────────────────────────────────────────────────
+
+def _clsids_in_dll_source() -> dict[str, str]:
+    import re
+
+    text = (Path(__file__).resolve().parent.parent / "shellext"
+            / "memil_menu.cpp").read_text(encoding="utf-8")
+    found: dict[str, str] = {}
+    pattern = re.compile(
+        r"const CLSID (CLSID_\w+)\s*=\s*\{0x([0-9A-Fa-f]{8}),\s*0x([0-9A-Fa-f]{4}),"
+        r"\s*0x([0-9A-Fa-f]{4}),\s*\{([^}]*)\}\};")
+    for name, a, b, c, tail in pattern.findall(text):
+        d = [part.strip()[2:].upper().rjust(2, "0") for part in tail.split(",")]
+        found[name] = (f"{a}-{b}-{c}-{d[0]}{d[1]}-{''.join(d[2:])}").upper()
+    return found
+
+
+def test_menu_dll_and_package_manifest_agree_on_the_menu_entries():
+    import importlib.util
+    from xml.etree import ElementTree
+
+    path = Path(__file__).resolve().parent.parent / "tools" / "make_msix.py"
+    spec = importlib.util.spec_from_file_location("make_msix_for_test", path)
+    msix = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(msix)
+
+    # DLL 이 아는 클래스와 묶음에 적는 클래스가 같아야 탐색기가 메뉴를 띄운다.
+    assert _clsids_in_dll_source() == {
+        "CLSID_NewNote": msix.CLSID_NEW_NOTE, "CLSID_LinkNote": msix.CLSID_LINK_NOTE,
+        "CLSID_NewFolder": msix.CLSID_NEW_FOLDER}
+    assert len({msix.CLSID_NEW_NOTE, msix.CLSID_LINK_NOTE, msix.CLSID_NEW_FOLDER}) == 3
+
+    text = msix.MANIFEST.format(
+        identity='"Test.App"', publisher='"CN=Test"', version='"1.0.0.0"',
+        publisher_display="Test", languages='    <Resource Language="ko-KR" />',
+        exe=msix.EXE_NAME, task=msix.STARTUP_TASK_ID, alias=msix.ALIAS, port=5555,
+        find_port=5555, menu_dll=msix.MENU_DLL, clsid_new=msix.CLSID_NEW_NOTE,
+        clsid_link=msix.CLSID_LINK_NOTE, clsid_folder=msix.CLSID_NEW_FOLDER)
+    root = ElementTree.fromstring(text.encode("utf-8"))
+    com = "{http://schemas.microsoft.com/appx/manifest/com/windows10}"
+    d10 = "{http://schemas.microsoft.com/appx/manifest/desktop/windows10/10}"
+    classes = [el.get("Id") for el in root.iter(com + "Class")]
+    assert classes == [msix.CLSID_NEW_NOTE, msix.CLSID_LINK_NOTE, msix.CLSID_NEW_FOLDER]
+    # 바탕 화면 메뉴: '새 메모 추가' 다음에 '새 메모 폴더 추가'.
+    desktop = [el for el in root.iter(d10 + "ItemType")
+               if el.get("Type") == "DesktopBackground"]
+    assert len(desktop) == 1
+    verbs = [(v.get("Id"), v.get("Clsid")) for v in desktop[0]]
+    assert verbs == [("MemilNewNote", msix.CLSID_NEW_NOTE),
+                     ("MemilNewNoteFolder", msix.CLSID_NEW_FOLDER)]

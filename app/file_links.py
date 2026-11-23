@@ -142,6 +142,10 @@ def is_folder_href(href: str) -> bool:
 
 def _ext_of(name: str) -> str:
     base = name.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    # Windows 는 이름 끝의 점과 빈칸을 떼고 연다('a.cmd.' 와 'a.cmd ' 는 'a.cmd'
+    # 다). 그대로 두면 실행 파일인데도 확장자가 없는 것으로 보여 묻지 않고 열린다.
+    # 데이터 스트림 표기('a.cmd::$DATA')도 떼고 본다.
+    base = base.split(":", 1)[0].rstrip(". ")
     if "." not in base.strip("."):
         return ""
     return base.rsplit(".", 1)[-1].lower()

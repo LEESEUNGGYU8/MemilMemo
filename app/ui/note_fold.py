@@ -12,6 +12,7 @@ import math
 import platform
 import re
 from collections import OrderedDict
+from dataclasses import dataclass
 
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt
 from PySide6.QtGui import (
@@ -68,11 +69,25 @@ FOLD_SLIP = "slip"
 FOLD_ICON = "icon"
 FOLD_STYLES = (FOLD_SLIP, FOLD_ICON)
 
-# 아이콘 한 칸의 크기와, 끌어다 놓을 때 맞춰지는 격자 간격.
-ICON_SIZE = QSize(88, 98)
-ICON_GRID = QSize(96, 106)
-ICON_GRID_ORIGIN = QPoint(10, 10)
-_GLYPH_W, _GLYPH_H, _GLYPH_TOP = 46.0, 52.0, 6.0
+# Windows 바탕화면 아이콘의 기본 모양(100% 배율의 '보통 아이콘'): 그림의 한 변,
+# 칸의 크기, 작업 영역의 왼쪽 위에서 첫 칸까지. 진짜 바탕화면을 읽지 못할 때 쓴다.
+# 읽을 수 있으면 그 값을 따른다(app/ui/icon_grid.py).
+ICON_DEFAULT = 48
+ICON_CELL_DEFAULT = QSize(76, 100)
+ICON_ORIGIN_DEFAULT = QPoint(0, 5)
+# 칸 안에서 그림은 위에서 이만큼 내려와 폭의 가운데에 놓이고, 이름은 그림 아래로
+# 이만큼 떨어져 시작한다(바탕화면의 아이콘 목록이 그리는 자리를 재서 맞췄다).
+ICON_TOP_PAD = 2.0
+ICON_LABEL_GAP = 3.0
+ICON_LABEL_PX = 12
+# 이 버전 전에 쓰던 고정 격자. 그때 놓아 둔 아이콘을 새 격자의 같은 칸으로 옮긴다.
+# 메모 종이는 세로로, 폴더는 가로로 긴 그림이다. 그림 자리(정사각형) 안에서의 비율.
+_PAPER_RATIO = 46.0 / 52.0
+# 선 굵기와 모서리를 정한 기준 크기(이 크기일 때 1배).
+_GLYPH_BASE = 48.0
+_FOLDER_BASE = 42.0
+# 열린 폴더의 앞 덮개가 오른쪽으로 기우는 정도(몸통 폭에 대한 비율).
+_FLAP_LEAN = 0.13
 
 FOLD_MS = 460
 UNFOLD_MS = 400
@@ -294,10 +309,124 @@ def tab_width_for(title: str, font: QFont | None = None,
 
 # ── 바탕화면 아이콘 모양 ────────────────────────────────────────────────
 
-def icon_glyph_rect(cell: QRectF) -> QRectF:
-    """아이콘 칸 안에서 그림(종이·폴더)이 놓이는 자리."""
-    return QRectF(cell.left() + (cell.width() - _GLYPH_W) / 2.0,
-                  cell.top() + _GLYPH_TOP, _GLYPH_W, _GLYPH_H)
+@dataclass(frozen=True)
+class IconGrid:
+    """한 화면의 아이콘 격자(논리 픽셀, 화면 좌표).
+
+    접힌 메모와 메모 폴더의 아이콘은 진짜 바탕화면 아이콘과 같은 칸에 같은 크기로
+    놓인다. 칸의 시작과 간격은 소수로 둔다: 배율이 정수가 아닌 화면에서 칸마다
+    반올림한 값을 더해 가면 오른쪽으로 갈수록 진짜 아이콘과 어긋난다."""
+    area: QRect                 # 칸을 놓을 수 있는 곳(작업 영역)
+    cell: QSize                 # 칸 하나의 크기(아이콘 창의 크기)
+    icon: float                 # 아이콘 그림의 한 변
+    x0: float                   # 칸 (0, 0) 의 왼쪽 위
+    y0: float
+    dx: float                   # 옆 칸, 아래 칸까지의 거리
+    dy: float
+    # 진짜 바탕화면 아이콘이 놓여 있는 칸. 그 위에 겹쳐 놓지 않는다.
+    taken: frozenset = frozenset()
+
+    def cols(self) -> int:
+        right = self.area.left() + self.area.width()
+        return max(1, int((right - self.x0 + 0.5) // self.dx))
+
+    def rows(self) -> int:
+        bottom = self.area.top() + self.area.height()
+        return max(1, int((bottom - self.y0 + 0.5) // self.dy))
+
+    def pos_of(self, col: int, row: int) -> QPoint:
+        return QPoint(int(round(self.x0 + col * self.dx)),
+                      int(round(self.y0 + row * self.dy)))
+
+    def cell_at(self, pos: QPoint) -> tuple[int, int]:
+        """그 자리(아이콘 창의 왼쪽 위)에서 가장 가까운 칸. 화면 밖이면 끝 칸."""
+        col = int(round((pos.x() - self.x0) / self.dx))
+        row = int(round((pos.y() - self.y0) / self.dy))
+        return (max(0, min(self.cols() - 1, col)),
+                max(0, min(self.rows() - 1, row)))
+
+    def same_shape(self, other: "IconGrid") -> bool:
+        """칸의 크기와 자리가 같은가(놓인 아이콘은 견주지 않는다)."""
+        return (self.cell == other.cell and abs(self.icon - other.icon) < 0.01
+                and abs(self.x0 - other.x0) < 0.01 and abs(self.y0 - other.y0) < 0.01
+                and abs(self.dx - other.dx) < 0.01 and abs(self.dy - other.dy) < 0.01)
+
+
+def make_icon_grid(area: QRect, cell: QSize, offset: QPoint,
+                   icon: float = ICON_DEFAULT) -> IconGrid:
+    """작업 영역의 왼쪽 위에서 ``offset`` 만큼 떨어진 곳에서 시작하는 격자."""
+    return IconGrid(area=QRect(area), cell=QSize(cell), icon=float(icon),
+                    x0=float(area.left() + offset.x()),
+                    y0=float(area.top() + offset.y()),
+                    dx=float(cell.width()), dy=float(cell.height()))
+
+
+def default_icon_grid(area: QRect) -> IconGrid:
+    return make_icon_grid(area, ICON_CELL_DEFAULT, ICON_ORIGIN_DEFAULT)
+
+
+_grid_source = None
+
+
+def set_icon_grid_source(source) -> None:
+    """``source(area) -> IconGrid | None`` 이 화면마다의 격자를 준다(앱이 진짜
+    바탕화면을 읽어 넣는다). None 을 주면 기본 격자로 돌아간다."""
+    global _grid_source
+    _grid_source = source
+
+
+def icon_grid(area: QRect) -> IconGrid:
+    """그 화면(작업 영역)의 아이콘 격자."""
+    if _grid_source is not None:
+        try:
+            grid = _grid_source(QRect(area))
+        except Exception:
+            grid = None
+        if grid is not None:
+            return grid
+    return default_icon_grid(area)
+
+
+def icon_side(cell: QRectF, icon: float | None = None) -> float:
+    """칸 안에 그릴 아이콘 그림의 한 변. 모르면 칸의 크기에서 짐작한다."""
+    if icon:
+        return float(icon)
+    return max(16.0, min(cell.width() - (ICON_CELL_DEFAULT.width() - ICON_DEFAULT),
+                         cell.height() - (ICON_CELL_DEFAULT.height() - ICON_DEFAULT)))
+
+
+def _device_scale(p: QPainter) -> float:
+    """그리는 곳의 배율(화면 픽셀 / 논리 픽셀)."""
+    device = p.device()
+    try:
+        scale = float(device.devicePixelRatioF()) if device is not None else 1.0
+    except (AttributeError, RuntimeError):
+        scale = 1.0
+    return scale if scale > 0 else 1.0
+
+
+def icon_glyph_rect(cell: QRectF, icon: float | None = None,
+                    dpr: float = 1.0) -> QRectF:
+    """아이콘 칸 안에서 그림이 놓이는 정사각형. 진짜 바탕화면 아이콘의 그림
+    자리와 같다(폭의 가운데, 위에서 조금 내려온 곳). 위의 여백은 배율이 달라도
+    화면 픽셀로 같아서(창틀 두께에서 온 값이다) ``dpr`` 로 나눈다."""
+    side = icon_side(cell, icon)
+    return QRectF(cell.left() + (cell.width() - side) / 2.0,
+                  cell.top() + ICON_TOP_PAD / (dpr or 1.0), side, side)
+
+
+def note_glyph_rect(box: QRectF) -> QRectF:
+    """그림 자리 안에 세로로 긴 종이를 가운데 놓는다."""
+    width = box.width() * _PAPER_RATIO
+    return QRectF(box.left() + (box.width() - width) / 2.0, box.top(),
+                  width, box.height())
+
+
+def folder_glyph_rect(box: QRectF) -> QRectF:
+    """그림 자리 안에 가로로 긴 폴더를 가운데 놓는다."""
+    height = box.height() * _PAPER_RATIO
+    return QRectF(box.left(), box.top() + (box.height() - height) / 2.0,
+                  box.width(), height)
 
 
 def icon_paper_path(rect: QRectF) -> QPainterPath:
@@ -315,6 +444,32 @@ def icon_paper_path(rect: QRectF) -> QPainterPath:
     path.quadTo(x0, y1, x0, y1 - r)
     path.lineTo(x0, y0 + r)
     path.quadTo(x0, y0, x0 + r, y0)
+    path.closeSubpath()
+    return path
+
+
+def rounded_polygon(points: list[QPointF], radius: float) -> QPainterPath:
+    """꼭짓점을 모두 둥글린 다각형. 변이 짧으면 반지름을 그만큼 줄인다."""
+    path = QPainterPath()
+    count = len(points)
+    if count < 3:
+        return path
+    for i in range(count):
+        prev, here, nxt = points[i - 1], points[i], points[(i + 1) % count]
+        to_prev = QPointF(prev.x() - here.x(), prev.y() - here.y())
+        to_next = QPointF(nxt.x() - here.x(), nxt.y() - here.y())
+        len_prev = math.hypot(to_prev.x(), to_prev.y()) or 1.0
+        len_next = math.hypot(to_next.x(), to_next.y()) or 1.0
+        r = min(radius, len_prev / 2.0, len_next / 2.0)
+        start = QPointF(here.x() + to_prev.x() / len_prev * r,
+                        here.y() + to_prev.y() / len_prev * r)
+        stop = QPointF(here.x() + to_next.x() / len_next * r,
+                       here.y() + to_next.y() / len_next * r)
+        if i == 0:
+            path.moveTo(start)
+        else:
+            path.lineTo(start)
+        path.quadTo(here, stop)
     path.closeSubpath()
     return path
 
@@ -379,12 +534,14 @@ def paint_note_glyph(p: QPainter, rect: QRectF, color: str, *,
                      thumb: QPixmap | None = None) -> None:
     """메모 색의 작은 종이. 위쪽 띠와 글줄 몇 가닥으로 메모임을 알린다.
 
-    ``thumb`` 을 주면 글줄 대신 그 그림을 종이 안에 작게 넣는다(이미지가 든 메모)."""
+    ``thumb`` 을 주면 글줄 대신 그 그림을 종이 안에 작게 넣는다(이미지가 든 메모).
+    어떤 크기로 그려도 비율이 같다(바탕화면 아이콘의 크기를 따라간다)."""
     p.save()
     p.setRenderHint(QPainter.Antialiasing)
     base = QColor(color)
     dark = text_color_for_bg(color) == "#FFFFFF"
     body = QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5)
+    k = max(0.4, body.height() / _GLYPH_BASE)
     path = icon_paper_path(body)
     p.setPen(Qt.NoPen)
     p.setBrush(base)
@@ -402,8 +559,9 @@ def paint_note_glyph(p: QPainter, rect: QRectF, color: str, *,
                      body.bottom() - inset - top)
         if box.width() > 6 and box.height() > 6:
             p.setRenderHint(QPainter.SmoothPixmapTransform)
+            corner = 2.0 * k
             clip = QPainterPath()
-            clip.addRoundedRect(box, 2.0, 2.0)
+            clip.addRoundedRect(box, corner, corner)
             p.save()
             p.setClipPath(clip, Qt.IntersectClip)
             p.drawPixmap(box, thumb, QRectF(thumb.rect()))
@@ -411,7 +569,7 @@ def paint_note_glyph(p: QPainter, rect: QRectF, color: str, *,
             p.setPen(QPen(QColor(255, 255, 255, 120) if dark
                           else QColor(0, 0, 0, 70), 1.0))
             p.setBrush(Qt.NoBrush)
-            p.drawRoundedRect(box, 2.0, 2.0)
+            p.drawRoundedRect(box, corner, corner)
     else:
         pen = QPen(ink, max(1.2, body.height() * 0.045))
         pen.setCapStyle(Qt.RoundCap)
@@ -437,17 +595,21 @@ def paint_note_glyph(p: QPainter, rect: QRectF, color: str, *,
     p.drawLine(tri[0], tri[2])
     p.drawLine(tri[2], tri[1])
     p.drawPath(path)
-    if private and body.width() >= 30:
-        side = 13.0
-        spot = QPointF(body.left() + 4.0, body.bottom() - side - 4.0)
+    if private and body.width() >= 24:
+        side = max(9.0, min(30.0, 13.0 * k))
+        gap = 4.0 * min(k, 1.6)
+        spot = QPointF(body.left() + gap, body.bottom() - side - gap)
         if thumb is not None and not thumb.isNull():
             # 사진 위에서도 보이도록 종이 색 바탕을 깐다.
             p.setPen(Qt.NoPen)
             p.setBrush(base)
             p.drawRoundedRect(QRectF(spot.x() - 2.0, spot.y() - 2.0,
                                      side + 4.0, side + 4.0), 4.0, 4.0)
-        icon = svg_icon("lock", color="#FFFFFF" if dark else "#1F2937")
-        p.drawPixmap(spot, icon.pixmap(int(side), int(side)))
+        icon = svg_icon("lock", int(round(side)),
+                        "#FFFFFF" if dark else "#1F2937")
+        pix = icon.pixmap(int(round(side * 2)), int(round(side * 2)))
+        p.drawPixmap(QRectF(spot.x(), spot.y(), side, side), pix,
+                     QRectF(pix.rect()))
     p.restore()
 
 
@@ -459,14 +621,22 @@ def paint_folder_glyph(p: QPainter, rect: QRectF, color: str, *,
     base = QColor(color)
     line = _shade(base, lighter=False, amount=96)
     w, h = rect.width(), rect.height()
-    body = QRectF(rect.left() + 0.5, rect.top() + h * 0.2,
-                  w - 1.0, h * 0.68)
-    r = 4.0
+    k = max(0.4, h / _FOLDER_BASE)
+    # 테두리는 큰 아이콘에서도 가늘게 둔다. 선의 절반이 그림 칸 밖으로 나가지
+    # 않도록 그만큼 들여 그린다.
+    pen_w = max(1.0, min(2.4, 1.1 * k))
+    inset = pen_w / 2.0
+    body = QRectF(rect.left() + inset, rect.top() + h * 0.2,
+                  w - 2.0 * inset, h * 0.68)
+    if opened:
+        # 젖힌 덮개의 위쪽 끝이 그림 칸의 오른쪽 끝에 닿게 몸통을 그만큼 좁힌다.
+        body.setWidth(body.width() / (1.0 + _FLAP_LEAN * 0.5))
+    r = 4.0 * k
     back = QPainterPath()
     tab_w = body.width() * 0.42
     back.moveTo(body.left() + r, body.top() - h * 0.1)
-    back.lineTo(body.left() + tab_w - 3.0, body.top() - h * 0.1)
-    back.lineTo(body.left() + tab_w + 4.0, body.top())
+    back.lineTo(body.left() + tab_w - 3.0 * k, body.top() - h * 0.1)
+    back.lineTo(body.left() + tab_w + 4.0 * k, body.top())
     back.lineTo(body.right() - r, body.top())
     back.quadTo(body.right(), body.top(), body.right(), body.top() + r)
     back.lineTo(body.right(), body.bottom() - r)
@@ -477,22 +647,22 @@ def paint_folder_glyph(p: QPainter, rect: QRectF, color: str, *,
     back.quadTo(body.left(), body.top() - h * 0.1,
                 body.left() + r, body.top() - h * 0.1)
     back.closeSubpath()
-    p.setPen(QPen(line, 1.1))
+    p.setPen(QPen(line, pen_w))
     p.setBrush(_shade(base, lighter=False, amount=26))
     p.drawPath(back)
-    front = QPainterPath()
     if opened:
         # 앞 덮개를 앞으로 젖힌 모양: 위쪽 변이 오른쪽으로 기울어 벌어진다.
+        # 닫힌 덮개와 같게 네 모서리를 모두 둥글린다.
         top = body.top() + body.height() * 0.34
-        lean = body.width() * 0.13
-        front.moveTo(body.left() + lean, top)
-        front.lineTo(body.right() + lean * 0.5 - 0.5, top)
-        front.lineTo(body.right() - r, body.bottom())
-        front.lineTo(body.left() + r, body.bottom())
-        front.quadTo(body.left(), body.bottom(),
-                     body.left() + 1.5, body.bottom() - r)
-        front.closeSubpath()
+        lean = body.width() * _FLAP_LEAN
+        front = rounded_polygon([
+            QPointF(body.left() + lean, top),
+            QPointF(body.right() + lean * 0.5, top),
+            QPointF(body.right(), body.bottom()),
+            QPointF(body.left(), body.bottom()),
+        ], r)
     else:
+        front = QPainterPath()
         top = body.top() + body.height() * 0.2
         front.addRoundedRect(QRectF(body.left(), top, body.width(),
                                     body.bottom() - top), r, r)
@@ -528,25 +698,42 @@ def _wrap_label(text: str, font: QFont, width: float,
     return [ln.strip() for ln in lines]
 
 
-def paint_icon_label(p: QPainter, cell: QRectF, text: str,
-                     font: QFont | None = None) -> None:
-    """아이콘 아래의 이름. 어떤 바탕 화면 위에서도 읽히도록 흰 글자에 어두운
-    테두리 그림자를 두른다(Windows 바탕화면 아이콘 이름과 같은 방식)."""
-    f = QFont(font) if font is not None else QFont(p.font())
-    f.setPixelSize(12)
+def icon_label_font(font: QFont | None = None) -> QFont:
+    """아이콘 아래 이름의 글꼴."""
+    f = QFont(font) if font is not None else QFont()
+    f.setPixelSize(ICON_LABEL_PX)
     f.setBold(False)
     f.setWeight(QFont.Medium)
+    return f
+
+
+def icon_label_rect(cell: QRectF, icon: float | None = None,
+                    font: QFont | None = None, lines: int = 2,
+                    dpr: float = 1.0) -> QRectF:
+    """아이콘 아래 이름이 놓이는 자리(진짜 바탕화면 아이콘의 이름 자리와 같다)."""
+    fm = QFontMetricsF(icon_label_font(font))
+    top = (cell.top() + icon_side(cell, icon)
+           + (ICON_TOP_PAD + ICON_LABEL_GAP) / (dpr or 1.0))
+    return QRectF(cell.left() + 3.0, top, cell.width() - 6.0,
+                  fm.lineSpacing() * lines)
+
+
+def paint_icon_label(p: QPainter, cell: QRectF, text: str,
+                     font: QFont | None = None,
+                     icon: float | None = None) -> None:
+    """아이콘 아래의 이름. 어떤 바탕 화면 위에서도 읽히도록 흰 글자에 어두운
+    테두리 그림자를 두른다(Windows 바탕화면 아이콘 이름과 같은 방식)."""
+    f = icon_label_font(font if font is not None else p.font())
     fm = QFontMetricsF(f)
-    width = cell.width() - 6.0
-    lines = _wrap_label(text, f, width)
+    area = icon_label_rect(cell, icon, f, dpr=_device_scale(p))
+    lines = _wrap_label(text, f, area.width())
     if not lines:
         return
     p.save()
     p.setFont(f)
-    top = cell.top() + _GLYPH_TOP + _GLYPH_H + 5.0
     for i, line in enumerate(lines):
-        rect = QRectF(cell.left() + 3.0, top + i * fm.lineSpacing(),
-                      width, fm.lineSpacing())
+        rect = QRectF(area.left(), area.top() + i * fm.lineSpacing(),
+                      area.width(), fm.lineSpacing())
         p.setPen(QColor(0, 0, 0, 120))
         for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (0, 2)):
             p.drawText(rect.translated(dx, dy),
@@ -590,68 +777,70 @@ def _paint_glyph(p: QPainter, rect: QRectF, hover: bool, draw) -> None:
 def paint_icon(p: QPainter, cell: QRectF, color: str, title: str, *,
                private: bool = False, hover: bool = False,
                font: QFont | None = None,
-               thumb: QPixmap | None = None) -> None:
-    """접힌 메모를 바탕화면 아이콘 모양으로 그린다."""
+               thumb: QPixmap | None = None,
+               icon: float | None = None) -> None:
+    """접힌 메모를 바탕화면 아이콘 모양으로 그린다. ``icon`` 은 그림의 한 변이다
+    (바탕화면 아이콘의 크기)."""
     p.save()
     p.setRenderHint(QPainter.Antialiasing)
     _paint_icon_hit_area(p, cell)
-    glyph = icon_glyph_rect(cell)
+    glyph = note_glyph_rect(icon_glyph_rect(cell, icon, _device_scale(p)))
     _paint_glyph(p, glyph, hover, lambda q: paint_note_glyph(
         q, glyph, color, private=private, thumb=thumb))
-    paint_icon_label(p, cell, title, font)
+    paint_icon_label(p, cell, title, font, icon)
     p.restore()
 
 
 def paint_folder_icon(p: QPainter, cell: QRectF, color: str, name: str, *,
                       opened: bool = False, count: int = 0,
-                      hover: bool = False, font: QFont | None = None) -> None:
+                      hover: bool = False, font: QFont | None = None,
+                      icon: float | None = None, label: bool = True) -> None:
     """메모 폴더를 바탕화면 아이콘 모양으로 그린다. 오른쪽 아래 숫자는 그
-    폴더에 든 메모 수다."""
+    폴더에 든 메모 수다. ``label`` 이 거짓이면 이름을 그리지 않는다(이름을 고치는
+    칸이 그 자리에 떠 있을 때)."""
     p.save()
     p.setRenderHint(QPainter.Antialiasing)
     _paint_icon_hit_area(p, cell)
-    glyph = icon_glyph_rect(cell)
-    glyph = QRectF(glyph.left() - 3.0, glyph.top() + 2.0,
-                   glyph.width() + 6.0, glyph.height() - 6.0)
+    box = icon_glyph_rect(cell, icon, _device_scale(p))
+    glyph = folder_glyph_rect(box)
     _paint_glyph(p, glyph, hover, lambda q: paint_folder_glyph(
         q, glyph, color, opened=opened))
-    if count > 0:
+    # 아주 작은 아이콘에는 숫자를 얹을 자리가 없다(그림을 다 가린다).
+    if count > 0 and box.width() >= 24:
+        k = max(0.75, min(2.2, box.width() / ICON_DEFAULT))
         f = QFont(font) if font is not None else QFont(p.font())
-        f.setPixelSize(10)
+        f.setPixelSize(max(9, int(round(10 * k))))
         f.setBold(True)
-        label = str(count) if count < 100 else "99+"
+        text = str(count) if count < 100 else "99+"
         fm = QFontMetricsF(f)
-        w = max(17.0, fm.horizontalAdvance(label) + 9.0)
-        badge = QRectF(glyph.right() - w + 5.0, glyph.bottom() - 13.0, w, 17.0)
+        height = 17.0 * k
+        w = max(height, fm.horizontalAdvance(text) + 9.0 * k)
+        badge = QRectF(glyph.right() - w + 5.0 * k, glyph.bottom() - 13.0 * k,
+                       w, height)
         p.setPen(QPen(QColor("#FFFFFF"), 1.4))
         p.setBrush(QColor("#374151"))
-        p.drawRoundedRect(badge, 8.5, 8.5)
+        p.drawRoundedRect(badge, height / 2.0, height / 2.0)
         p.setFont(f)
         p.setPen(QColor("#FFFFFF"))
-        p.drawText(badge, Qt.AlignCenter, label)
-    paint_icon_label(p, cell, name, font)
+        p.drawText(badge, Qt.AlignCenter, text)
+    if label:
+        paint_icon_label(p, cell, name, font, icon)
     p.restore()
 
 
 def snap_icon_pos(pos: QPoint, screen: QRect,
-                  taken: list[QPoint] | None = None) -> QPoint:
+                  taken: list[QPoint] | None = None,
+                  grid: IconGrid | None = None) -> QPoint:
     """아이콘을 놓은 자리에서 가장 가까운 빈 격자 칸의 왼쪽 위.
 
     ``taken`` 은 이미 다른 아이콘이 놓인 자리다. 같은 칸이면 가까운 빈 칸으로
-    비켜 놓는다(바탕화면 아이콘이 겹쳐 쌓이지 않게)."""
-    gw, gh = ICON_GRID.width(), ICON_GRID.height()
-    ox = screen.left() + ICON_GRID_ORIGIN.x()
-    oy = screen.top() + ICON_GRID_ORIGIN.y()
-    cols = max(1, (screen.width() - ICON_GRID_ORIGIN.x()) // gw)
-    rows = max(1, (screen.height() - ICON_GRID_ORIGIN.y()) // gh)
-
-    def cell_of(pt: QPoint) -> tuple[int, int]:
-        col = int(round((pt.x() - ox) / gw))
-        row = int(round((pt.y() - oy) / gh))
-        return (max(0, min(cols - 1, col)), max(0, min(rows - 1, row)))
-
-    used = {cell_of(pt) for pt in (taken or [])}
-    want = cell_of(pos)
+    비켜 놓는다(바탕화면 아이콘이 겹쳐 쌓이지 않게). 진짜 바탕화면 아이콘이 놓인
+    칸도 비킨다."""
+    if grid is None:
+        grid = icon_grid(screen)
+    cols, rows = grid.cols(), grid.rows()
+    used = {grid.cell_at(pt) for pt in (taken or [])} | set(grid.taken)
+    want = grid.cell_at(pos)
     best = want
     if want in used:
         found = None
@@ -670,7 +859,27 @@ def snap_icon_pos(pos: QPoint, screen: QRect,
                 break
         if found is not None:
             best = found
-    return QPoint(ox + best[0] * gw, oy + best[1] * gh)
+    return grid.pos_of(*best)
+
+
+def icon_wall_probe(cell: QRect, icon: float) -> QRect:
+    """끌고 있는 아이콘이 벽에 닿았는지 볼 때 쓰는 사각형.
+
+    진짜 바탕화면 아이콘처럼 첫 칸은 벽에 바로 닿아 있다. 칸의 끝으로 재면 첫 칸에
+    놓으려는 아이콘이 탭으로 붙어 버린다. 그림이 벽을 넘어가도록 밀었을 때만
+    닿은 것으로 본다."""
+    inset = SNAP_DISTANCE + max(8, int(round((cell.width() - icon) / 2.0)))
+    inset = max(0, min(inset, (min(cell.width(), cell.height()) - 2) // 2))
+    return cell.adjusted(inset, inset, -inset, -inset)
+
+
+def move_to_grid(pos: QPoint, old: IconGrid, new: IconGrid) -> QPoint:
+    """격자가 바뀌었을 때 아이콘이 갈 자리: 옛 격자에서 있던 칸과 같은 칸.
+
+    바탕화면 아이콘의 크기를 바꾸면 진짜 아이콘들도 제 칸을 지킨 채 칸의 크기만
+    달라진다. 화면 밖으로 밀려나는 칸은 끝 칸으로 들인다."""
+    col, row = old.cell_at(pos)
+    return new.pos_of(min(col, new.cols() - 1), min(row, new.rows() - 1))
 
 
 # ── 접는 그림 ───────────────────────────────────────────────────────────
@@ -686,8 +895,10 @@ class FoldFrames:
                  color: str, title: str, anchor: str = DOCK_LEFT,
                  dock: str = DOCK_NONE, private: bool = False,
                  font: QFont | None = None, style: str = FOLD_SLIP,
-                 thumb: QPixmap | None = None):
+                 thumb: QPixmap | None = None, icon: float | None = None):
         self.thumb = thumb
+        # 아이콘으로 접을 때 그림의 한 변(바탕화면 아이콘의 크기).
+        self.icon = icon
         self.dpr = open_pix.devicePixelRatio() or 1.0
         self.full = open_pix
         self.W = int(round(open_pix.width() / self.dpr))
@@ -733,7 +944,9 @@ class FoldFrames:
     def _paper_target(self) -> QRectF:
         """접힌 종이가 마지막에 놓이는 자리. 쪽지는 쪽지 전체, 아이콘은 그림."""
         cell = self.slip_rect()
-        return icon_glyph_rect(cell) if self.style == FOLD_ICON else cell
+        if self.style == FOLD_ICON:
+            return note_glyph_rect(icon_glyph_rect(cell, self.icon, self.dpr))
+        return cell
 
     def _paper_path(self, rect: QRectF) -> QPainterPath:
         body = rect.adjusted(0.5, 0.5, -0.5, -0.5)
@@ -746,7 +959,8 @@ class FoldFrames:
         if self.style == FOLD_ICON:
             paint_note_glyph(p, paper, self.color, private=self.private,
                              thumb=self.thumb)
-            paint_icon_label(p, self.slip_rect(), self.title, self.font)
+            paint_icon_label(p, self.slip_rect(), self.title, self.font,
+                             self.icon)
         else:
             paint_slip(p, paper, self.color, self.title, dock=self.dock,
                        private=self.private, font=self.font)

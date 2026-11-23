@@ -321,8 +321,10 @@ def test_key(monkeypatch):
     # 파일과 폴더 항목도 시험용 자리로 돌린다(실제 우클릭 메뉴를 건드리지 않는다).
     links = (root + r"\LinkFile", root + r"\LinkFolder")
     monkeypatch.setattr(shell_menu, "LINK_KEY_PATHS", links)
+    monkeypatch.setattr(shell_menu, "FOLDER_KEY_PATH", root + r"\NewNoteFolder")
     yield root + r"\NewNote"
     for path in (root + r"\NewNote\command", root + r"\NewNote",
+                 root + r"\NewNoteFolder\command", root + r"\NewNoteFolder",
                  links[0] + r"\command", links[0],
                  links[1] + r"\command", links[1], root,
                  r"Software\SyncNotesTests"):
@@ -394,8 +396,8 @@ def test_settings_dialog_toggles_the_menu(qapp, test_key, monkeypatch):
     real = shell_menu.set_registered
     monkeypatch.setattr(
         shell_menu, "set_registered",
-        lambda on, label, link="": calls.append((on, label, link))
-        or real(on, label, link))
+        lambda on, label, link="", folder="": calls.append((on, label, link, folder))
+        or real(on, label, link, folder))
 
     dlg = SettingsDialog(AppSettings(), role="host")
     assert not dlg._desktop_menu.isChecked()
@@ -405,9 +407,12 @@ def test_settings_dialog_toggles_the_menu(qapp, test_key, monkeypatch):
     dlg = SettingsDialog(AppSettings(), role="host")
     dlg._desktop_menu.setChecked(True)
     dlg._on_accept()
-    assert calls == [(True, "새 메모", "새 메모에 링크로 넣기")]
+    assert calls == [(True, "새 메모 추가", "새 메모에 링크로 넣기",
+                      "새 메모 폴더 추가")]
     assert shell_menu.is_registered()
-    # 켜면 파일과 폴더의 항목도 함께 들어간다.
+    assert shell_menu._read()[0] == "새 메모 추가"
+    # 켜면 '새 메모 폴더 추가'와 파일, 폴더의 항목도 함께 들어간다.
+    assert shell_menu._read_entry(shell_menu.FOLDER_KEY_PATH)[0] == "새 메모 폴더 추가"
     for path in shell_menu.LINK_KEY_PATHS:
         assert shell_menu._read_entry(path)[0] == "새 메모에 링크로 넣기"
 
@@ -416,8 +421,54 @@ def test_settings_dialog_toggles_the_menu(qapp, test_key, monkeypatch):
     dlg._desktop_menu.setChecked(False)
     dlg._on_accept()
     assert not shell_menu.is_registered()
+    assert shell_menu._read_entry(shell_menu.FOLDER_KEY_PATH) == ("", "", "")
     for path in shell_menu.LINK_KEY_PATHS:
         assert shell_menu._read_entry(path) == ("", "", "")
+
+
+# ── 바탕화면 우클릭 메뉴: 새 메모 폴더 추가 ──────────────────────────────
+
+def test_new_folder_command_from_argv():
+    assert ipc.new_folder_command(
+        ["app", "--new-folder", "--at-cursor"]) == ipc.CMD_NEW_FOLDER_HERE
+    assert ipc.new_folder_command(["app", "--new-note", "--at-cursor"]) is None
+    assert ipc.new_folder_command(["app"]) is None
+    # 새 메모와 헷갈리지 않는다.
+    assert ipc.new_note_command(["app", "--new-folder", "--at-cursor"]) is None
+
+
+def test_register_adds_the_new_folder_entry_below_new_note(test_key):
+    assert shell_menu.register("새 메모 추가", "", "새 메모 폴더 추가")
+    label, icon, command = shell_menu._read_entry(shell_menu.FOLDER_KEY_PATH)
+    assert label == "새 메모 폴더 추가"
+    assert icon == shell_menu.icon_location()
+    assert command == shell_menu.folder_command_line()
+    assert command.endswith("--new-folder --at-cursor")
+    assert shell_menu.unregister()
+    assert shell_menu._read_entry(shell_menu.FOLDER_KEY_PATH) == ("", "", "")
+
+
+def test_real_menu_keys_sort_new_note_above_new_folder():
+    """탐색기는 키 이름의 차례로 메뉴를 놓는다. 폴더 항목이 바로 아래에 온다."""
+    note_key = shell_menu.KEY_PATH.rsplit("\\", 1)
+    folder_key = shell_menu.FOLDER_KEY_PATH.rsplit("\\", 1)
+    assert note_key[0] == folder_key[0]
+    assert note_key[1] < folder_key[1]
+    assert folder_key[1].startswith(note_key[1])
+
+
+def test_refresh_adds_the_new_folder_entry_for_an_older_install(test_key, monkeypatch):
+    # 옛 버전은 '새 메모'만 넣었다. 올라온 뒤 처음 켤 때 글자가 바뀌고 폴더 항목이 생긴다.
+    shell_menu.register("새 메모")
+    assert shell_menu._read_entry(shell_menu.FOLDER_KEY_PATH) == ("", "", "")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", r"C:\Apps\Memo\Memo.exe")
+    monkeypatch.setattr(config, "isolated_run", lambda: False)
+    shell_menu.refresh("새 메모 추가", "새 메모에 링크로 넣기", "새 메모 폴더 추가")
+    assert shell_menu._read()[0] == "새 메모 추가"
+    assert shell_menu._read_entry(shell_menu.FOLDER_KEY_PATH) == (
+        "새 메모 폴더 추가", r"C:\Apps\Memo\Memo.exe,0",
+        r'"C:\Apps\Memo\Memo.exe" --new-folder --at-cursor')
 
 
 # ── 파일·폴더 우클릭 메뉴: 새 메모에 링크로 넣기 ─────────────────────────

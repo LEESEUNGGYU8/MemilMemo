@@ -36,7 +36,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QLabel, QTextEdit
 
-from .. import config
+from .. import config, html_guard
 from .. import file_links as fl
 from .link_icons import link_icon_pixmap
 from .safe_text import SafeTextDocument, is_plain_raster
@@ -504,7 +504,8 @@ has_non_checkbox_image = has_non_marker_image
 def html_to_plain(html: str) -> str:
     if not html:
         return ""
-    if "<" not in html:
+    if not html_guard.is_markup(html):
+        # 서식 없이 저장된 글이다. 꺾쇠가 들어 있어도 글자 그대로다.
         return html
     # 읽기만 해도 본문이 가리키는 스타일시트를 파일에서 열려고 한다.
     doc = SafeTextDocument()

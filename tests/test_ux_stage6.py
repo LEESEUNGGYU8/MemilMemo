@@ -314,11 +314,16 @@ def test_drop_is_refused_when_someone_else_is_editing(qapp):
     w.close()
 
 
-def test_drop_is_refused_offline(qapp):
+def test_drop_asks_to_edit_even_offline(qapp):
+    """끊긴 동안에도 편집을 청한다(메인 창이 이 PC 에서만 고치게 해 준다)."""
     w, sent, locks = make_sticky(qapp)
     w.set_offline(True)
     drop_image(w)
-    assert locks == [] and w._pending_drop is None and "<img" not in w._text.toHtml()
+    assert locks == ["n"] and w._pending_drop is not None
+    # 들어줄 수 없으면 놓은 것도 잊는다.
+    w.cancel_pending_lock()
+    assert w._pending_drop is None and not w._pending_lock
+    assert "<img" not in w._text.toHtml()
     w._teardown = True
     w.close()
 
@@ -444,10 +449,11 @@ def test_participants_window_is_flat_and_short(qapp):
 # ── 접힌 아이콘의 작은 그림 ─────────────────────────────────────────────
 
 def _render_icon(thumb) -> QImage:
-    img = QImage(nf.ICON_SIZE, QImage.Format_ARGB32_Premultiplied)
+    cell = nf.ICON_CELL_DEFAULT
+    img = QImage(cell, QImage.Format_ARGB32_Premultiplied)
     img.fill(Qt.transparent)
     p = QPainter(img)
-    nf.paint_icon(p, QRectF(0, 0, nf.ICON_SIZE.width(), nf.ICON_SIZE.height()),
+    nf.paint_icon(p, QRectF(0, 0, cell.width(), cell.height()),
                   "#FFE066", "메모", thumb=thumb)
     p.end()
     return img
@@ -463,7 +469,8 @@ def test_folded_icon_shows_the_first_image(qapp):
 
     plain, with_thumb = _render_icon(None), _render_icon(thumb)
     assert plain != with_thumb
-    glyph = nf.icon_glyph_rect(QRectF(0, 0, nf.ICON_SIZE.width(), nf.ICON_SIZE.height()))
+    glyph = nf.icon_glyph_rect(QRectF(0, 0, nf.ICON_CELL_DEFAULT.width(),
+                                      nf.ICON_CELL_DEFAULT.height()))
     center = with_thumb.pixelColor(int(glyph.center().x()), int(glyph.center().y() + 6))
     assert center.red() > 180 and center.green() < 90        # 종이 안에 사진이 보인다
 
