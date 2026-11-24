@@ -12,14 +12,13 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    QDoubleSpinBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
-    QSpinBox,
     QStackedWidget,
     QToolButton,
     QVBoxLayout,
@@ -28,15 +27,20 @@ from PySide6.QtWidgets import (
 
 from .. import config, i18n, packaging, shell_menu
 from ..settings import (
+    ANIMATION_SPEED_MAX,
+    ANIMATION_SPEED_MIN,
+    ANIMATION_SPEED_STEP,
     IMAGE_VIEWER_BUILTIN,
     IMAGE_VIEWER_SYSTEM,
     AppSettings,
     autostart_supported,
+    clamp_animation_speed,
     get_windows_autostart,
     set_windows_autostart,
 )
 from . import note_fold
 from .icons import color_swatch_icon, svg_icon
+from .number_field import DecimalField, IntField, with_unit
 from .theme import COLOR_FOCUS, color_name, refresh_style
 
 
@@ -298,10 +302,10 @@ class _ColorPicker(QWidget):
         self._current = current
         self._buttons: dict[str, QToolButton] = {}
 
-        row = QHBoxLayout(self)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(4)
-        for hex_color in config.COLORS:
+        grid = QGridLayout(self)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(4)
+        for index, hex_color in enumerate(config.COLORS):
             btn = QToolButton()
             btn.setFixedSize(26, 26)
             btn.setIcon(color_swatch_icon(hex_color, 20))
@@ -318,7 +322,7 @@ class _ColorPicker(QWidget):
             )
             btn.clicked.connect(lambda _=False, c=hex_color: self._select(c))
             self._buttons[hex_color] = btn
-            row.addWidget(btn)
+            grid.addWidget(btn, *divmod(index, config.COLOR_COLUMNS))
         self._refresh()
 
     def _select(self, color: str) -> None:
@@ -339,16 +343,19 @@ class SettingsDialog(QDialog):
 
     backupNowRequested = Signal()
     restoreRequested = Signal()
-    copiesRequested = Signal()
+    resetConnectionRequested = Signal()     # 접속 정보 바꾸기
+    shareRequested = Signal()               # 혼자 쓰던 메모의 공유 시작
 
     def __init__(self, settings: AppSettings, role: str = "guest",
-                 parent: QWidget | None = None):
+                 parent: QWidget | None = None, *, solo: bool = False):
+        """``solo`` 는 공유하지 않고 혼자 쓰는 중인가(그때 ``role`` 은 "host" 다)."""
         super().__init__(parent)
         self.setWindowTitle(i18n.t("settings.window_title", app=i18n.t("app.name")))
         self.setMinimumSize(700, 500)
         self.setStyleSheet(_QSS)
         self._settings = settings
         self._role = role
+        self._solo = bool(solo)
 
         nav = QWidget()
         nav.setObjectName("SettingsNav")
@@ -483,11 +490,10 @@ class SettingsDialog(QDialog):
     def _build_memo_page(self, title: str) -> QWidget:
         page = _Page(title)
 
-        self._font_size = QSpinBox()
-        self._font_size.setRange(8, 48)
-        self._font_size.setSuffix(" pt")
+        self._font_size = IntField(8, 48)
         self._font_size.setValue(self._settings.default_font_size)
-        page.add_row(i18n.t("settings.label_font_size"), _field(self._font_size))
+        page.add_row(i18n.t("settings.label_font_size"),
+                     _field(with_unit(self._font_size, "pt")))
 
         self._color_picker = _ColorPicker(self._settings.default_note_color)
         page.add_row(i18n.t("settings.label_note_color"), self._color_picker)
@@ -537,6 +543,15 @@ class SettingsDialog(QDialog):
         page.add_row(i18n.t("settings.check_fold_animation"),
                      self._fold_animation)
 
+        self._animation_speed = DecimalField(
+            ANIMATION_SPEED_MIN, ANIMATION_SPEED_MAX, ANIMATION_SPEED_STEP)
+        self._animation_speed.setValue(
+            clamp_animation_speed(self._settings.animation_speed))
+        speed = with_unit(self._animation_speed, i18n.t("settings.unit_times"))
+        speed.setEnabled(self._fold_animation.isChecked())
+        self._fold_animation.toggled.connect(speed.setEnabled)
+        page.add_row(i18n.t("settings.label_animation_speed"), _field(speed))
+
         self._dock_on_top = self._switch(self._settings.dock_on_top)
         page.add_row(i18n.t("settings.check_dock_on_top"), self._dock_on_top)
         page.add_stretch()
@@ -556,19 +571,29 @@ class SettingsDialog(QDialog):
     def _build_network_page(self, title: str) -> QWidget:
         page = _Page(title, i18n.t("settings.note_network"))
 
-        self._port = QSpinBox()
-        self._port.setRange(1, 65535)
+        self._port = IntField(1, 65535)
         self._port.setValue(self._settings.default_port)
         page.add_row(i18n.t("settings.label_host_port"), _field(self._port))
 
-        self._heartbeat = QDoubleSpinBox()
-        self._heartbeat.setDecimals(1)
-        self._heartbeat.setRange(0.5, 60.0)
-        self._heartbeat.setSingleStep(0.5)
-        self._heartbeat.setSuffix(i18n.t("connect.unit_seconds"))
+        self._heartbeat = DecimalField(0.5, 60.0, 0.5)
         self._heartbeat.setValue(self._settings.default_heartbeat_ms / 1000)
-        page.add_row(i18n.t("settings.label_heartbeat"), _field(self._heartbeat))
+        page.add_row(i18n.t("settings.label_heartbeat"), _field(with_unit(
+            self._heartbeat, i18n.t("connect.unit_seconds"))))
         page.add_stretch()
+
+        actions = QHBoxLayout()
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(8)
+        actions.addStretch(1)
+        if self._solo:
+            # 혼자 쓰던 메모를 다른 PC 와 나눈다. 그다음부터는 공유 PC 로 켜진다.
+            actions.addWidget(self._action_button(
+                i18n.t("settings.btn_share_start"), self.shareRequested.emit))
+        # 다음에 켤 때 시작 방식을 다시 고른다(트레이 메뉴에도 있다).
+        actions.addWidget(self._action_button(
+            i18n.t("main.tray_change_connection"),
+            self.resetConnectionRequested.emit))
+        page.add_layout(actions, top=8)
         return page
 
     def _build_backup_page(self, title: str) -> QWidget:
@@ -606,8 +631,7 @@ class SettingsDialog(QDialog):
         interval_row = QHBoxLayout(interval_wrap)
         interval_row.setContentsMargins(0, 0, 0, 0)
         interval_row.setSpacing(6)
-        self._backup_interval = QSpinBox()
-        self._backup_interval.setRange(1, 999)
+        self._backup_interval = IntField(1, 999)
         self._backup_interval.setValue(self._settings.backup_interval_value)
         self._backup_unit = QComboBox()
         for label, key in (
@@ -632,24 +656,21 @@ class SettingsDialog(QDialog):
         page.add_row(i18n.t("settings.label_backup_interval"),
                      _field(interval_wrap))
 
-        self._backup_keep = QSpinBox()
-        self._backup_keep.setRange(1, 1000)
-        self._backup_keep.setSuffix(i18n.t("settings.backup_keep_suffix"))
+        self._backup_keep = IntField(1, 1000)
         self._backup_keep.setValue(self._settings.backup_keep_count)
-        page.add_row(i18n.t("settings.label_backup_keep"),
-                     _field(self._backup_keep))
+        page.add_row(i18n.t("settings.label_backup_keep"), _field(with_unit(
+            self._backup_keep, i18n.t("settings.backup_keep_suffix"))))
         page.add_stretch()
 
         actions = QHBoxLayout()
         actions.setContentsMargins(0, 0, 0, 0)
         actions.setSpacing(8)
-        # 참여한 PC 가 받아 둔 메모 사본. 공유 PC 가 고장 났을 때 여기서 꺼낸다.
-        actions.addWidget(self._action_button(
-            i18n.t("settings.btn_copies"), self.copiesRequested.emit))
         actions.addStretch(1)
+        # 백업과, 참여한 PC 가 받아 둔 메모 사본을 한 창에서 고른다. 공유 PC 가
+        # 고장 났을 때 참여한 PC 도 여기서 메모를 꺼낸다.
+        actions.addWidget(self._action_button(
+            i18n.t("settings.btn_restore"), self.restoreRequested.emit))
         if is_host:
-            actions.addWidget(self._action_button(
-                i18n.t("settings.btn_restore"), self.restoreRequested.emit))
             actions.addWidget(self._action_button(
                 i18n.t("settings.btn_backup_now"), self.backupNowRequested.emit))
         page.add_layout(actions, top=8)
@@ -769,6 +790,7 @@ class SettingsDialog(QDialog):
         s.image_viewer = self._image_viewer.currentData() or IMAGE_VIEWER_BUILTIN
         s.fold_style = self._fold_style.currentData() or "slip"
         s.fold_animation = self._fold_animation.isChecked()
+        s.animation_speed = clamp_animation_speed(self._animation_speed.value())
         s.dock_on_top = self._dock_on_top.isChecked()
 
         s.autostart = self._autostart.isChecked()

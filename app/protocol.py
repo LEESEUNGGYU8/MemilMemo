@@ -29,6 +29,12 @@ MSG_PONG = "pong"
 MSG_GET_HISTORY = "get_history"
 # 암호가 걸린 공유에 참여할 때, 암호를 안다는 증명(app/share_auth.py).
 MSG_AUTH = "auth"
+# 휴지통(1.0.4 부터). delete_note 로 지운 메모는 휴지통으로 간다. 옛 공유 PC 는
+# 이 메시지들을 모르고 지나친다(welcome 에 trash_days 가 없으면 휴지통이 없다).
+MSG_GET_TRASH = "get_trash"
+MSG_RESTORE_NOTE = "restore_note"
+MSG_PURGE_NOTE = "purge_note"
+MSG_EMPTY_TRASH = "empty_trash"
 
 # 서버 → 클라이언트
 MSG_WELCOME = "welcome"
@@ -51,6 +57,9 @@ MSG_ERROR = "error"
 # 암호가 걸린 공유다. 인사(hello)에 이것으로 답하고, 증명이 맞으면 welcome 을 보낸다.
 MSG_AUTH_REQUIRED = "auth_required"
 MSG_AUTH_FAILED = "auth_failed"
+# 휴지통에 든 메모들(그 참가자가 볼 수 있는 것만), 휴지통이 달라졌다는 알림.
+MSG_TRASH_LIST = "trash_list"
+MSG_TRASH_CHANGED = "trash_changed"
 
 
 @dataclass

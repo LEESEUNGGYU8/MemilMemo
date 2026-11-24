@@ -374,11 +374,12 @@ def test_note_menu_while_resting(qapp, monkeypatch):
     seen = _captured_menu(monkeypatch)
     w, _sent, locks = make_sticky(qapp, "회의는 3시")
     w._show_text_menu(w._text.viewport().rect().center(), w.mapToGlobal(w.rect().center()))
-    assert seen[-1] == [("편집", True), ("전체 복사", True)]
+    # 서식은 보기 상태에서도 뜰 수 있다. 입히는 것은 편집 중일 때만 나온다.
+    assert seen[-1] == [("편집", True), ("전체 복사", True), ("서식 복사", True)]
 
     w.set_lock_holder(OTHER)
     w._show_text_menu(w._text.viewport().rect().center(), w.mapToGlobal(w.rect().center()))
-    assert seen[-1] == [("편집", False), ("전체 복사", True)]
+    assert seen[-1] == [("편집", False), ("전체 복사", True), ("서식 복사", True)]
     w._teardown = True
     w.close()
 
@@ -390,7 +391,8 @@ def test_note_menu_while_editing_is_in_the_app_language(qapp, monkeypatch):
     w._text.selectAll()
     w._show_text_menu(w._text.viewport().rect().center(), w.mapToGlobal(w.rect().center()))
     texts = [t for t, _on in seen[-1]]
-    assert texts == ["실행 취소", "다시 실행", "잘라내기", "복사", "붙여넣기", "모두 선택"]
+    assert texts == ["실행 취소", "다시 실행", "잘라내기", "복사", "붙여넣기", "모두 선택",
+                     "서식 복사", "서식 붙여넣기"]
     assert dict(seen[-1])["잘라내기"] and dict(seen[-1])["복사"]
     assert not dict(seen[-1])["실행 취소"]           # 아직 고친 것이 없다
     w._teardown = True
@@ -528,7 +530,7 @@ def test_copies_dialog_marks_and_offers_what_is_missing(qapp, copies):
     dlg._pick.setCurrentIndex(1)                    # 옮겨 둔 옛 사본
     rows = [dlg._list.item(i).text() for i in range(dlg._list.count())]
     # 공유 PC 에 없는 메모를 위에 따로 묶어 보여 준다.
-    assert rows[0] == "공유 PC에 없는 메모 2" and rows[3] == "공유 PC에도 있는 메모 1"
+    assert rows[0] == "공유 PC에 없는 메모 2개" and rows[3] == "공유 PC에도 있는 메모 1개"
     assert sorted(rows[1:3]) == ["내 비공개", "폴더 속 메모"] and rows[4] == "공개 메모"
     assert dlg._import_btn.text() == "2개 가져오기"
     assert dlg._list.currentRow() == 1 and dlg._preview.toPlainText() in (
@@ -622,9 +624,9 @@ def test_taking_over_refuses_an_empty_copy(tmp_path):
 def test_settings_and_banner_lead_to_the_copies(qapp, make_window, monkeypatch, tmp_path):
     asked = []
     dlg = SettingsDialog(AppSettings(), role="guest")
-    dlg.copiesRequested.connect(lambda: asked.append("settings"))
+    dlg.restoreRequested.connect(lambda: asked.append("settings"))
     button = [b for b in dlg.findChildren(QPushButton)
-              if b.text() == i18n.t("settings.btn_copies")]
+              if b.text() == i18n.t("settings.btn_restore")]
     assert len(button) == 1
     button[0].click()
     assert asked == ["settings"]
@@ -633,6 +635,13 @@ def test_settings_and_banner_lead_to_the_copies(qapp, make_window, monkeypatch, 
     win, _client = make_window(connect=False)
     monkeypatch.setattr(replica_mod, "list_copies", lambda path, **k: [])
     monkeypatch.setattr("app.ui.main_window.list_copies", lambda path, **k: [])
+    monkeypatch.setattr("app.ui.main_window.list_backups", lambda folder: [])
+    shown = []
+    monkeypatch.setattr(CopiesDialog, "exec", lambda self: shown.append(self) or 0)
     win._copies_btn.click()
-    assert win.told == [(i18n.t("copies.window_title"), i18n.t("copies.empty"))]
+    # 아무것도 없어도 알림만 띄우고 끝내지 않는다. 창에서 파일을 골라 넣을 수 있다.
+    assert win.told == [] and len(shown) == 1
+    assert shown[0].windowTitle() == i18n.t("restore.window_title")
+    assert shown[0].sources() == [] and not shown[0]._pick.isEnabled()
+    assert not shown[0]._takeover_btn.isEnabled()
     assert QMessageBox is not None

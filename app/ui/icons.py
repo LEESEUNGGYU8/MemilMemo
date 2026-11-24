@@ -176,6 +176,14 @@ _SVG = {
         '<path d="M5 20.5h8" stroke="{color}" stroke-width="3" '
         'stroke-linecap="round"/></svg>'
     ),
+    "brush": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<path d="M5 4.5h11.5a1.5 1.5 0 0 1 1.5 1.5v3a1.5 1.5 0 0 1-1.5 1.5H5z" '
+        'stroke="{color}" stroke-width="1.8" fill="none" stroke-linejoin="round"/>'
+        '<path d="M18 7.5h1.6v5.2h-7.1v2.3" stroke="{color}" stroke-width="1.8" '
+        'fill="none" stroke-linecap="round" stroke-linejoin="round"/>'
+        '<rect x="11" y="15" width="3" height="5.5" rx="1" fill="{color}"/></svg>'
+    ),
     "text_color": (
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
         '<path d="M11 4h2l5.4 13h-2.5l-1.3-3.3H9.4L8.1 17H5.6L11 4z'
@@ -372,6 +380,63 @@ def svg_icon(name: str, size: int = 18, color: str = "#333333") -> QIcon:
     """SVG 아이콘. 125~200% 배율 화면에서 흐리지 않도록 1배와 2배 그림을
     함께 넣는다(Qt 가 화면 배율에 맞는 쪽을 골라 그린다)."""
     svg_str = _SVG[name].format(color=color)
+    renderer = QSvgRenderer(QByteArray(svg_str.encode("utf-8")))
+    icon = QIcon()
+    for scale in (1, 2):
+        pix = QPixmap(size * scale, size * scale)
+        pix.fill(Qt.transparent)
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.Antialiasing)
+        renderer.render(painter)
+        painter.end()
+        pix.setDevicePixelRatio(scale)
+        icon.addPixmap(pix)
+    return icon
+
+
+_FOLDER_LOCK = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+    '<path d="M8 11V8a4 4 0 0 1 8 0v3" stroke="{edge}" stroke-width="2" '
+    'fill="none" stroke-linecap="round"/>'
+    '<rect x="4.8" y="10.4" width="14.4" height="10.2" rx="2.8" fill="{color}" '
+    'stroke="{edge}" stroke-width="1.3"/></svg>'
+)
+
+
+def folder_lock_icon(color: str, size: int = 18) -> QIcon:
+    """나만 보는 폴더의 표시: 폴더 색으로 채운 자물쇠. 다른 폴더의 색 동그라미와
+    같은 자리에 놓여, 폴더이면서 나만 본다는 것이 함께 읽힌다."""
+    fill = QColor(color)
+    if not fill.isValid():
+        fill = QColor("#FFE066")
+    svg_str = _FOLDER_LOCK.format(color=fill.name(), edge="#5B5B5B")
+    renderer = QSvgRenderer(QByteArray(svg_str.encode("utf-8")))
+    icon = QIcon()
+    for scale in (1, 2):
+        pix = QPixmap(size * scale, size * scale)
+        pix.fill(Qt.transparent)
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.Antialiasing)
+        renderer.render(painter)
+        painter.end()
+        pix.setDevicePixelRatio(scale)
+        icon.addPixmap(pix)
+    return icon
+
+
+_TEXT_COLOR = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+    '<path d="M11 4h2l5.4 13h-2.5l-1.3-3.3H9.4L8.1 17H5.6L11 4z'
+    'M10.15 11.6h3.7L12 7l-1.85 4.6z" fill="{color}" fill-rule="evenodd"/>'
+    '<rect x="4" y="18.6" width="16" height="3.6" rx="1.4" fill="{bar}" '
+    'stroke="{edge}" stroke-width="0.6"/></svg>'
+)
+
+
+def text_color_icon(color: str, bar: str, size: int = 18) -> QIcon:
+    """글자 색 단추의 그림. 글자는 메모의 글자색으로, 아래의 띠는 지금 글자에
+    정해져 있는 색으로 그린다."""
+    svg_str = _TEXT_COLOR.format(color=color, bar=bar, edge=color)
     renderer = QSvgRenderer(QByteArray(svg_str.encode("utf-8")))
     icon = QIcon()
     for scale in (1, 2):

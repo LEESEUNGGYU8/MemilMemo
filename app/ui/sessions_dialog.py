@@ -30,7 +30,8 @@ from .icons import svg_icon
 from .theme import RoundedScrollBar
 
 # 사람 표시에 쓰는 색. 어두운 메모 색과 흰색은 글자가 묻혀 뺀다.
-_AVATAR_COLORS = [c for c in config.COLORS if c not in ("#F5F5F5", "#3A3A3A")]
+# 참가자의 색은 처음 여섯 색에서 고른다(색이 늘어도 사람마다의 색은 그대로다).
+_AVATAR_COLORS = list(config.COLORS[:6])
 _SURFACE = "#FAFBFD"
 _LINE = "#ECECEC"
 

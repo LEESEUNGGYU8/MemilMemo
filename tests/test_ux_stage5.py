@@ -411,28 +411,38 @@ def test_backup_tab_warns_about_the_same_disk_and_offers_restore(qapp, tmp_path)
     restore[0].click()
     assert asked == [True]
 
+    # 참여한 PC 에도 같은 단추가 있다. 받아 둔 사본을 거기서 꺼낸다.
     guest = SettingsDialog(AppSettings(), role="guest")
     assert guest._backup_dir_hint.isHidden()
-    assert not [b for b in guest.findChildren(QPushButton)
-                if b.text() == i18n.t("settings.btn_restore")]
+    assert len([b for b in guest.findChildren(QPushButton)
+                if b.text() == i18n.t("settings.btn_restore")]) == 1
     host.deleteLater()
     guest.deleteLater()
 
 
-def test_restore_dialog_lists_newest_first(qapp, tmp_path):
-    from app.ui.restore_dialog import RestoreDialog
+def test_restore_window_lists_backups_newest_first(qapp, tmp_path):
+    from app.backup import list_backups
+    from app.replica import backup_source
+    from app.ui.copies_dialog import CopiesDialog
     older = tmp_path / "notes_20261118_090000.sqlite3"
     newer = tmp_path / "notes_20261119_103000.sqlite3"
     older.write_bytes(b"x" * 2048)
     newer.write_bytes(b"x" * (3 * 1024 * 1024))
 
-    dlg = RestoreDialog([newer, older])
-    assert dlg.selected() == newer             # 가장 새것이 골라져 있다
-    assert "3.0 MB" in dlg._list.item(0).text() and "2 KB" in dlg._list.item(1).text()
-    dlg._list.setCurrentRow(1)
-    assert dlg.selected() == older
-    assert RestoreDialog([]).selected() is None
+    found = [backup_source(p) for p in list_backups(tmp_path)]
+    dlg = CopiesDialog(found, host_notes=None, can_takeover=False, can_restore=True)
+    assert dlg.selected_path() == str(newer)    # 가장 새것이 골라져 있다
+    assert "3.0 MB" in dlg._pick.itemText(0) and "2 KB" in dlg._pick.itemText(1)
+    dlg._pick.setCurrentIndex(1)
+    assert dlg.selected_path() == str(older)
+    # 읽을 수 없는 파일이라 메모가 없다. 그런 것으로는 복원하지 못한다.
+    assert dlg._takeover_btn.text() == i18n.t("restore.btn_restore")
+    assert not dlg._takeover_btn.isEnabled()
+    empty = CopiesDialog([], host_notes=None, can_takeover=False, can_restore=True)
+    assert empty.selected_path() == "" and not empty._pick.isEnabled()
+    assert empty._pick.itemText(0) == i18n.t("restore.empty")
     dlg.deleteLater()
+    empty.deleteLater()
 
 
 # ── 글자 다듬기 ─────────────────────────────────────────────────────────

@@ -1,0 +1,464 @@
+/* 메밀메모 사이트의 모양. 한국어(/), 영어(/en/), 일본어(/ja/) 페이지가 함께 쓴다.
+   차례: 바탕, 머리 줄, 첫 화면, 첫 화면의 움직이는 장면, 시작하기, 주요 기능,
+   자주 묻는 질문, 바닥글, 개인정보처리방침, 움직임. */
+
+:root {
+  color-scheme: light;
+  --paper: #FFDA5C;
+  --seal: #D8412D;
+  --seal-deep: #A92E1E;
+  --ink: #1F2937;
+  /* 노란 바탕 위의 옅은 글자와 줄은 회색이 아니라 같은 노란 기운으로 둔다. */
+  --ink-soft: #5C5544;
+  --line: #EBDFB4;
+  --bg: #FFF8DC;
+  --card: #FFFFFF;
+  --focus: #2563EB;
+  --radius: 14px;
+  --ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --desk-a: #243B55;
+  --desk-b: #3F5F7F;
+  --font: "Pretendard Variable", Pretendard, -apple-system, "Segoe UI", "Malgun Gothic", sans-serif;
+}
+:root:lang(ja) {
+  --font: "Pretendard JP Variable", "Pretendard JP", "Pretendard Variable", "Hiragino Kaku Gothic ProN",
+          "Yu Gothic UI", Meiryo, sans-serif;
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font);
+  font-size: 17px;
+  line-height: 1.6;
+  /* 한글은 낱말 가운데에서 끊지 않는다. */
+  word-break: keep-all;
+  overflow-wrap: break-word;
+}
+/* 일본어는 띄어쓰기가 없어 글자 사이에서 끊는다. 제목과 짧은 글은, 되는 브라우저에서는
+   구절 단위로 끊는다. */
+:lang(ja) body { word-break: normal; line-break: strict; }
+:lang(ja) :is(h1, h2, h3, summary, dt, .lead, .memo-text, .note) { word-break: auto-phrase; }
+:lang(en) body { word-break: normal; }
+::selection { background: var(--paper); color: var(--ink); }
+a { color: inherit; text-underline-offset: 3px; }
+a:focus-visible, summary:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 3px;
+  border-radius: 10px;
+}
+h1, h2, h3 { text-wrap: balance; }
+p, dd, li span { text-wrap: pretty; }
+/* 한 덩어리로 읽어야 하는 말은 줄이 바뀌어도 갈라지지 않게 묶는다. */
+.nb { display: inline-block; white-space: nowrap; }
+.wrap { width: min(1080px, 100% - 32px); margin-inline: auto; }
+
+/* ── 머리 줄 ── */
+header {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 22px;
+  padding: 20px 0;
+}
+.brand { display: flex; align-items: center; gap: 10px; margin-right: auto; text-decoration: none; }
+.brand img { width: 36px; height: 36px; }
+.brand span { font-weight: 800; font-size: 19px; letter-spacing: -0.02em; }
+header nav { display: flex; gap: 20px; }
+header nav a { color: var(--ink-soft); font-size: 15px; font-weight: 600; text-decoration: none; }
+header nav a:hover { color: var(--ink); text-decoration: underline; }
+/* 언어 고르기: 지금 보는 언어만 짙게 둔다. */
+header nav.langs { gap: 14px; padding-left: 22px; border-left: 1px solid var(--line); }
+header nav.langs a { font-size: 14px; font-weight: 500; }
+header nav.langs a[aria-current] { color: var(--ink); font-weight: 700; }
+@media (max-width: 699px) {
+  header { padding-top: 12px; column-gap: 12px; }
+  header nav { gap: 14px; }
+  /* 좁은 화면에서는 언어 줄을 맨 위에 따로 둔다. */
+  header nav.langs { order: -1; width: 100%; justify-content: flex-end; padding-left: 0; border-left: 0; }
+}
+
+/* ── 첫 화면 ── */
+.hero { display: grid; grid-template-columns: minmax(0, 1fr); gap: 36px; padding: 36px 0 56px; }
+.hero h1 {
+  margin: 0; font-size: clamp(32px, 5.4vw, 58px); line-height: 1.2;
+  letter-spacing: -0.035em; font-weight: 800;
+}
+/* 영어와 일본어 제목은 글자 수가 많아 한 단계 작게 둔다. */
+:lang(en) .hero h1 { font-size: clamp(31px, 4.7vw, 50px); line-height: 1.14; letter-spacing: -0.03em; }
+:lang(ja) .hero h1 { font-size: clamp(29px, 4.5vw, 46px); line-height: 1.3; letter-spacing: -0.01em; }
+/* 형광펜: 낱말이 줄을 넘지 않으므로 밑줄도 끊기지 않는다. */
+.mark {
+  background: linear-gradient(var(--paper), var(--paper)) no-repeat 0 88% / 100% 0.42em;
+}
+.hero p.lead {
+  margin: 18px 0 0; font-size: clamp(17px, 2vw, 20px); color: var(--ink-soft);
+}
+/* 내려받기 단추와 그 아래의 Microsoft Store 배지. 단추의 글이 언어마다 길이가 달라
+   나란히 두면 어떤 언어는 한 줄을 넘으므로, 언제나 위아래로 둔다. */
+.cta {
+  --get-h: 59px;
+  display: flex; flex-direction: column; align-items: flex-start; gap: 12px; margin-top: 30px;
+}
+.download {
+  display: inline-flex; align-items: center; gap: 10px; white-space: nowrap;
+  min-height: var(--get-h);
+  background: var(--seal); color: #FFFFFF; text-decoration: none;
+  font-weight: 700; font-size: 18px;
+  padding: 15px 26px; border-radius: 12px;
+  box-shadow: 0 6px 18px rgba(169, 46, 30, 0.25);
+  transition: background-color .2s var(--ease), transform .2s var(--ease), box-shadow .2s var(--ease);
+}
+.download:hover { background: var(--seal-deep); transform: translateY(-2px); box-shadow: 0 10px 24px rgba(169, 46, 30, 0.3); }
+.download:active { transform: translateY(0); }
+.download:focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; }
+.download svg { width: 20px; height: 20px; transition: transform .25s var(--ease); }
+.download:hover svg { transform: translateY(2px); }
+/* Microsoft 의 배지 그림은 손대지 않는다. 높이만 내려받기 단추에 맞춘다. */
+.store { display: block; line-height: 0; border-radius: 7px; transition: transform .2s var(--ease); }
+.store img { display: block; height: var(--get-h); width: auto; }
+.store:hover { transform: translateY(-2px); }
+.store:active { transform: translateY(0); }
+.shot {
+  margin: 0; border-radius: var(--radius); overflow: hidden;
+  border: 1px solid var(--line);
+  box-shadow: 0 24px 60px -24px rgba(31, 41, 55, 0.35);
+  background: var(--card);
+}
+.shot img { display: block; width: 100%; height: auto; }
+/* 장면이 지금 보여 주는 것을 형광펜으로 짚는다(제목의 형광펜과 같은 것).
+   스크립트가 돌 때만 보인다. */
+.trail {
+  list-style: none; display: none; margin: 16px 0 0; padding: 0;
+  font-size: 14px; line-height: 1.9; font-weight: 600; color: var(--ink-soft);
+  /* 한 줄에 다 들어가면 한 줄로 두고, 넘치면 줄마다 비슷한 길이로 나눈다
+     (마지막 하나만 다음 줄로 떨어지지 않는다). 낱말 사이는 띄어쓰기 한 칸에
+     word-spacing 을 더한 만큼이다. */
+  text-wrap: balance; word-spacing: 10px;
+}
+/* 한국어는 한 치수 작게 두면 넓은 화면에서 장면의 폭 한 줄에 들어간다. */
+:lang(ko) .trail { font-size: 13px; word-spacing: 6px; }
+.js .trail { display: block; }
+.trail li {
+  display: inline; white-space: nowrap; word-spacing: normal;
+  background: linear-gradient(var(--paper), var(--paper)) no-repeat 0 88% / 0 0.42em;
+  transition: background-size .35s var(--ease), color .2s;
+}
+.trail li.on { color: var(--ink); background-size: 100% 0.42em; }
+
+/* ── 첫 화면의 움직이는 장면(assets/scene.js 가 그린다) ──
+   크기와 색은 앱이 그리는 값이다: 메모 머리 줄 32, 쪽지 184x40, 탭 46x40,
+   아이콘 칸 76x100(그림 48). */
+.fit { position: relative; width: 100%; overflow: hidden; }
+.fit > .stage {
+  position: absolute; left: 0; top: 0; transform-origin: 0 0; background: var(--card);
+  font-family: var(--font); font-size: 14px; line-height: 1.55; color: #1F1F1F;
+  word-break: keep-all; overflow-wrap: break-word;
+  -webkit-user-select: none; user-select: none;
+}
+.stage *, .stage *::before, .stage *::after { box-sizing: border-box; }
+/* PC 한 대의 화면. 내 PC(.me)와 함께 쓰는 다른 PC(.peer)는 바탕색이 다르다. */
+.pc { position: absolute; overflow: hidden; }
+.pc > .layer { position: absolute; left: 0; top: 0; background: linear-gradient(135deg, var(--desk-a), var(--desk-b)); }
+.pc.peer > .layer { background: linear-gradient(135deg, #1D4B48, #3B7A70); }
+
+/* 두 PC 를 잇는 줄: 이름표, '내부망', 건너가는 점. */
+.lan { position: absolute; display: flex; align-items: center; gap: 12px; padding: 0 14px; color: var(--ink); }
+.lan.mid { padding: 0 96px; }
+.who { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; white-space: nowrap; }
+.who.rev { flex-direction: row-reverse; }
+.who i {
+  display: grid; place-items: center; width: 20px; height: 20px; border-radius: 50%;
+  background: var(--a); color: #1F1F1F; font-style: normal; font-size: 11px; font-weight: 700; line-height: 1;
+}
+.who b { font-weight: 600; }
+.who.on-desk {
+  position: absolute; right: 10px; bottom: 3px; z-index: 3; color: #FFFFFF;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9), 0 0 4px rgba(0, 0, 0, 0.55);
+}
+.who.on-desk i { text-shadow: none; }
+.lan-line { position: relative; flex: 1; height: 1.5px; background: rgba(92, 85, 68, 0.32); }
+.lan-line b {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); padding: 0 10px;
+  background: var(--card); color: var(--ink-soft); font-size: 12px; font-weight: 600; white-space: nowrap;
+}
+.lan-dot {
+  position: absolute; left: 0; top: 50%; width: 8px; height: 8px; margin: -4px 0 0 -4px;
+  border-radius: 50%; background: var(--seal); opacity: 0;
+}
+
+/* 메모 창 */
+.mm, .slip, .tab {
+  --m-ink: #1F1F1F; --m-hover: rgba(0, 0, 0, 0.09); --m-edge: rgba(0, 0, 0, 0.43); --m-strip: rgba(0, 0, 0, 0.16);
+}
+.mm {
+  position: absolute; border-radius: 12px;
+  background: var(--m); color: var(--m-ink);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2), 0 16px 30px -12px rgba(0, 0, 0, 0.55);
+}
+.mm-bar {
+  display: flex; align-items: center; justify-content: flex-end; gap: 2px;
+  height: 32px; padding: 0 8px; border-radius: 12px; background: var(--m-bar);
+}
+/* 누가 고치고 있는지: 앱은 머리 줄 왼쪽에 작은 글씨로 적는다. */
+.mm-lock {
+  flex: 1; min-width: 0; padding-left: 4px; overflow: hidden; white-space: nowrap;
+  font-size: 12px; font-weight: 600; color: #3A3A3A;
+}
+.mm-btn { flex: none; display: grid; place-items: center; width: 26px; height: 26px; border-radius: 6px; opacity: 0.86; }
+.mm-btn.hot { background: var(--m-hover); }
+.mm-btn svg { width: 16px; height: 16px; }
+.mm-btn .dot { width: 14px; height: 14px; border-radius: 50%; background: var(--m); box-shadow: inset 0 0 0 1px var(--m-edge); }
+.mm-body { padding: 8px 20px 28px; }
+.mm-title { margin: 0 0 6px; font-size: 16px; font-weight: 700; line-height: 1.45; }
+.mm-line { display: flex; align-items: flex-start; gap: 8px; margin: 3px 0; border-radius: 4px; }
+.mm-text { flex: 0 1 auto; min-width: 0; min-height: 1.55em; }
+.mm-check {
+  flex: none; width: 16px; height: 16px; margin: 3px 0 0;
+  border: 1.6px solid var(--m-ink); border-radius: 4.5px;
+  display: grid; place-items: center; color: var(--m);
+}
+.mm-check svg { width: 12px; height: 12px; opacity: 0; }
+.mm-line.done .mm-check { background: var(--m-ink); }
+.mm-line.done .mm-check svg { opacity: 1; }
+.mm-line.done .mm-text { text-decoration: line-through; opacity: 0.5; }
+.mm-bullet { flex: none; width: 16px; height: 22px; display: grid; place-items: center; }
+.mm-bullet::before { content: ""; width: 5px; height: 5px; background: var(--m-ink); }
+.mm-mark { background: rgba(255, 255, 255, 0.55); font-weight: 700; padding: 0 2px; }
+.mm-caret {
+  display: inline-block; width: 1.5px; height: 1.05em; margin-left: 1px; vertical-align: -0.16em;
+  background: currentColor;
+}
+.mm-grip { position: absolute; right: 2px; bottom: 2px; width: 22px; height: 22px; color: var(--m-ink); opacity: 0.49; }
+
+/* 접힌 쪽지 */
+.slip { position: absolute; width: 184px; height: 40px; filter: drop-shadow(0 4px 6px rgba(0, 0, 0, 0.32)); }
+.slip-face {
+  position: absolute; inset: 0; background: var(--m);
+  clip-path: path("M10 0H171L184 13V30Q184 40 174 40H10Q0 40 0 30V10Q0 0 10 0Z");
+}
+.slip-face::after {
+  content: ""; position: absolute; right: 0; top: 0; width: 13px; height: 13px;
+  background: var(--m-ear); clip-path: polygon(0 0, 100% 100%, 0 100%);
+}
+.slip-title {
+  position: absolute; left: 12px; right: 20px; top: 0; line-height: 40px;
+  font-size: 13px; font-weight: 700; color: var(--m-ink);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* 가장자리 탭 */
+.tab {
+  position: absolute; width: 46px; height: 40px; overflow: hidden;
+  background: var(--m); color: var(--m-ink);
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.32);
+  transition: width 140ms cubic-bezier(0.37, 0, 0.63, 1);
+}
+.tab.right { right: 0; border-radius: 10px 0 0 10px; }
+.tab::before { content: ""; position: absolute; top: 0; bottom: 0; right: 0; width: 4px; background: var(--m-strip); }
+.tab-title { position: absolute; left: 12px; top: 0; line-height: 40px; font-size: 13px; font-weight: 700; white-space: nowrap; }
+
+/* 바탕화면 아이콘 */
+.dicon {
+  position: absolute; width: 76px; padding: 1px 2px 4px; text-align: center;
+  border: 1px solid transparent; border-radius: 3px;
+}
+.dicon .glyph { position: relative; display: block; width: 48px; height: 48px; margin: 0 auto; }
+.dicon .glyph svg { display: block; width: 48px; height: 48px; overflow: visible; }
+.dicon .label {
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
+  margin-top: 4px; font-size: 12px; line-height: 15px; font-weight: 500; color: #FFFFFF;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9), 0 0 4px rgba(0, 0, 0, 0.55);
+  /* 낱말 사이에서 먼저 끊고, 한 낱말이 칸보다 길 때만 가운데에서 끊는다. */
+  word-break: keep-all; overflow-wrap: anywhere;
+}
+.dicon.sel { background: rgba(218, 218, 218, 0.32); border-color: rgba(188, 188, 188, 0.36); }
+.dicon.drop { background: rgba(255, 255, 255, 0.3); border-color: rgba(255, 255, 255, 0.6); }
+.dicon .badge {
+  position: absolute; right: -5px; bottom: -3px; min-width: 18px; height: 18px; padding: 0 4px;
+  border-radius: 9px; background: #374151; color: #FFFFFF; box-shadow: 0 0 0 1.5px #FFFFFF;
+  font-size: 11px; font-weight: 700; line-height: 18px; text-shadow: none;
+}
+
+/* 끌어 고르는 사각형, 마우스, 우클릭 메뉴 */
+.marquee {
+  position: absolute; pointer-events: none; z-index: 9000;
+  background: rgba(0, 120, 215, 0.22); border: 1px solid rgba(0, 120, 215, 0.95);
+}
+.cur {
+  position: absolute; left: 0; top: 0; width: 20px; height: 28px; z-index: 9999;
+  will-change: transform; filter: drop-shadow(0 1px 1.5px rgba(0, 0, 0, 0.45));
+}
+.cur svg { display: block; width: 20px; height: 28px; transform-origin: 2px 2px; transition: transform 90ms ease; }
+.cur.down svg { transform: scale(0.86); }
+.sc-menu {
+  position: absolute; z-index: 9500; padding: 4px; border-radius: 8px;
+  background: #F9F9F9; color: #1F1F1F; font-size: 13px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.16), 0 10px 24px -6px rgba(0, 0, 0, 0.5);
+}
+.sc-menu div { height: 28px; padding: 0 14px 0 12px; border-radius: 5px; line-height: 28px; white-space: nowrap; }
+.sc-menu div.hot { background: rgba(0, 0, 0, 0.08); }
+
+/* 접는 그림 */
+.fold-stage { position: absolute; pointer-events: none; filter: drop-shadow(0 10px 12px rgba(0, 0, 0, 0.3)); }
+.fold-piece { position: absolute; overflow: hidden; }
+.fold-piece > .mm, .fold-settle > .mm { position: absolute; box-shadow: none; visibility: visible !important; }
+.fold-shade { position: absolute; inset: 0; background: #000000; opacity: 0; }
+.fold-crease { position: absolute; opacity: 0; }
+.fold-crease.h { background: linear-gradient(to bottom, rgba(0, 0, 0, 0), rgba(0, 0, 0, 0.18)); }
+.fold-crease.v { background: linear-gradient(to right, rgba(0, 0, 0, 0), rgba(0, 0, 0, 0.18)); }
+.fold-settle { position: absolute; overflow: hidden; }
+.fold-face { position: absolute; left: 0; top: 0; opacity: 0; }
+.fold-face .slip, .fold-face .dicon, .fold-face .tab { position: absolute; left: 0; right: auto; top: 0; filter: none; box-shadow: none; }
+
+/* ── 구역 ── */
+section { padding: 60px 0; border-top: 1px solid var(--line); }
+h2 {
+  margin: 0 0 28px; font-size: clamp(26px, 3.4vw, 36px); letter-spacing: -0.03em;
+  line-height: 1.25; font-weight: 800;
+}
+:lang(ja) h2 { letter-spacing: -0.01em; }
+
+/* ── 시작하기 ──
+   단계마다 메밀메모의 메모 창 한 장이다. 색(메모 색과 그보다 옅은 머리 줄),
+   모서리, 머리 줄의 단추, 오른쪽 아래 손잡이는 앱이 그리는 값 그대로다. */
+ol.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 18px; counter-reset: step; }
+.memo {
+  counter-increment: step;
+  position: relative; color: #1F1F1F;
+  background: var(--memo); border-radius: 12px;
+  box-shadow: 0 1px 2px rgba(84, 62, 0, 0.16), 0 16px 28px -16px rgba(84, 62, 0, 0.5);
+}
+.memo:nth-child(1) { --memo: #FFE066; --memo-bar: #FFE27A; }
+.memo:nth-child(2) { --memo: #FFB3BA; --memo-bar: #FFC7CD; }
+.memo:nth-child(3) { --memo: #BAFFC9; --memo-bar: #CEFFD9; }
+.memo-bar {
+  display: flex; align-items: center; justify-content: flex-end; gap: 2px;
+  height: 32px; padding: 0 8px; border-radius: 12px; background: var(--memo-bar);
+}
+.memo-bar svg { box-sizing: content-box; width: 16px; height: 16px; padding: 5px; color: #333333; }
+.memo-text { padding: 12px 20px 30px; }
+.memo-text b { display: block; font-size: 19px; line-height: 1.45; }
+.memo-text b::before { content: counter(step) ". "; }
+.memo-text span { display: block; margin-top: 4px; font-size: 16px; }
+.memo-grip { position: absolute; right: 2px; bottom: 2px; width: 22px; height: 22px; color: rgba(0, 0, 0, 0.49); }
+/* 설치할 때의 안내. 위의 세 장이 펴 놓은 메모라면 이것은 접어 둔 쪽지 한 장이다
+   (앱이 접힌 메모를 그리는 모양: 오른쪽 위를 접은 종이, 첫 줄만 보인다).
+   눈에 띄어야 할 낱말에는 첫 화면과 같은 형광펜을 긋는다. */
+.note {
+  display: flex; margin: 26px 0 0;
+  filter: drop-shadow(0 1px 1px rgba(84, 62, 0, 0.2)) drop-shadow(0 9px 10px rgba(84, 62, 0, 0.16));
+}
+.note-face {
+  position: relative; display: flex; align-items: flex-start; gap: 10px;
+  min-height: 40px; padding: 9px 34px 9px 14px; border-radius: 10px;
+  background: #FFFFFF; color: #1F1F1F; font-size: 15px; line-height: 22px;
+  clip-path: polygon(0 0, calc(100% - 13px) 0, 100% 13px, 100% 100%, 0 100%);
+}
+.note-face::after {
+  content: ""; position: absolute; right: 0; top: 0; width: 13px; height: 13px;
+  background: #D4D4D4; clip-path: polygon(0 0, 100% 100%, 0 100%);
+}
+.note-face svg { flex: none; width: 18px; height: 18px; margin-top: 2px; color: var(--ink-soft); }
+.note-face span { text-wrap: balance; }   /* 끝에 낱말 하나만 남지 않게 고르게 나눈다 */
+.note-face b {
+  font-weight: 700;
+  background: linear-gradient(var(--paper), var(--paper)) no-repeat 0 90% / 100% 0.42em;
+}
+
+/* ── 주요 기능 ── */
+.feature {
+  display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; align-items: center;
+  padding: 26px 0;
+}
+.feature h3 { margin: 0 0 8px; font-size: clamp(21px, 2.4vw, 25px); letter-spacing: -0.02em; line-height: 1.3; }
+.feature p { margin: 0; color: var(--ink-soft); }
+
+dl.more { margin: 30px 0 0; display: grid; gap: 0 40px; grid-template-columns: minmax(0, 1fr); }
+dl.more div { padding: 16px 0; border-top: 1px solid var(--line); }
+dl.more dt { font-weight: 700; }
+dl.more dd { margin: 2px 0 0; color: var(--ink-soft); font-size: 16px; }
+
+/* ── 자주 묻는 질문 ── */
+.faq details { border-top: 1px solid var(--line); }
+.faq details:last-child { border-bottom: 1px solid var(--line); }
+.faq summary {
+  cursor: pointer; list-style: none; padding: 18px 40px 18px 0; position: relative;
+  font-weight: 700; font-size: 18px;
+}
+.faq summary::-webkit-details-marker { display: none; }
+.faq summary::after {
+  content: ""; position: absolute; right: 8px; top: 50%; width: 10px; height: 10px;
+  border-right: 2px solid var(--ink-soft); border-bottom: 2px solid var(--ink-soft);
+  transform: translateY(-70%) rotate(45deg);
+  transition: transform .25s var(--ease);
+}
+.faq details[open] summary::after { transform: translateY(-30%) rotate(-135deg); }
+.faq details p { margin: 0; padding: 0 40px 20px 0; color: var(--ink-soft); }
+
+/* 마지막 질문의 아랫줄이 곧 바닥글의 윗줄이다. */
+.faq { padding-bottom: 0; }
+
+footer {
+  padding: 32px 0 56px;
+  color: var(--ink-soft); font-size: 15px;
+  display: flex; flex-wrap: wrap; gap: 8px 22px;
+}
+
+@media (min-width: 640px) {
+  ol.steps { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .memo { min-height: 204px; }
+  dl.more { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (min-width: 900px) {
+  .hero { grid-template-columns: minmax(0, 0.86fr) minmax(0, 1.14fr); align-items: center; padding: 56px 0 76px; gap: 48px; }
+  .feature { grid-template-columns: minmax(0, 0.78fr) minmax(0, 1.22fr); gap: 52px; padding: 34px 0; }
+  .feature.flip .text { order: 2; }
+  dl.more { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+/* ── 개인정보처리방침(body.doc) ── */
+.doc { line-height: 1.7; }
+/* 이 쪽의 머리 줄에는 언어 줄뿐이라 앞의 세로줄을 두지 않는다. */
+.doc header nav.langs { padding-left: 0; border-left: 0; }
+.doc .wrap { width: min(760px, 100% - 32px); }
+.doc h1 {
+  margin: 36px 0 6px; font-size: clamp(30px, 5vw, 44px); line-height: 1.2;
+  letter-spacing: -0.035em; font-weight: 800;
+}
+.doc:lang(ja) h1 { letter-spacing: -0.01em; }
+.doc .date { margin: 0; color: var(--ink-soft); font-size: 15px; }
+.doc .lead { margin: 26px 0 0; font-weight: 700; font-size: 20px; }
+/* 형광펜: 첫 화면의 제목과 같은 방식이다. */
+.doc .lead span { background: linear-gradient(var(--paper), var(--paper)) no-repeat 0 88% / 100% 0.42em; }
+.doc h2 { margin: 0 0 6px; font-size: 20px; letter-spacing: -0.02em; line-height: inherit; font-weight: 700; }
+.doc section { padding: 22px 0; }
+.doc section:first-of-type { margin-top: 30px; }
+.doc section p { margin: 0; color: var(--ink-soft); }
+.doc section p + p { margin-top: 8px; }
+.doc code {
+  font-family: Consolas, "Cascadia Mono", monospace; font-size: 0.92em;
+  background: #F6EBC2; padding: 1px 6px; border-radius: 6px; word-break: break-all;
+}
+.doc article + article { margin-top: 64px; padding-top: 8px; border-top: 3px solid var(--line); }
+.doc footer { margin-top: 40px; padding-top: 28px; border-top: 1px solid var(--line); }
+
+/* ── 움직임 ──
+   기본은 다 보이는 상태다. 스크립트가 돌 때(html.js)만 감췄다가 보인다. */
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes rise { from { opacity: 0; transform: translateY(18px); } to { opacity: 1; transform: none; } }
+  @keyframes sweep { from { background-size: 0 0.42em; } to { background-size: 100% 0.42em; } }
+  @keyframes settle { from { opacity: 0; transform: translateY(26px) rotate(1.2deg); } to { opacity: 1; transform: none; } }
+  @keyframes caret { 50% { opacity: 0; } }
+
+  .hero h1, .hero .lead, .hero .cta { animation: rise .8s var(--ease) both; }
+  .hero .lead { animation-delay: .08s; }
+  .hero .cta { animation-delay: .16s; }
+  .hero .shot { animation: settle 1s var(--ease) .12s both; }
+  /* 형광펜을 긋는다. */
+  .hero .mark { animation: sweep .7s var(--ease) .55s both; }
+  .mm-caret { animation: caret 1s steps(1) infinite; }
+
+  .js .reveal { opacity: 0; transform: translateY(22px); transition: opacity .8s var(--ease), transform .8s var(--ease); transition-delay: var(--d, 0s); }
+  .js .reveal.in { opacity: 1; transform: none; }
+}

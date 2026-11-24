@@ -122,7 +122,8 @@ def test_delete_entry_shows_the_text_as_it_was(viewer):
     text = viewer._detail.toPlainText()
     assert "해체신고 절차" in text and "2. 접수" in text
     assert "line-through" not in viewer._detail.toHtml()
-    assert viewer._header.text().startswith(i18n.t("history.action_delete"))
+    assert viewer._header.text().endswith(
+        i18n.t("history.by_delete", user="")[-3:])      # '○○님이 삭제함'
 
 
 def test_deleted_note_comes_back_as_a_new_note(viewer, monkeypatch):

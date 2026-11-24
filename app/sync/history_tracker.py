@@ -84,3 +84,19 @@ class HistoryTracker:
             session_end=t,
         )
         return self.repo.insert_history(entry)
+
+    def record_restore(self, note: Note, user: str) -> HistoryEntry:
+        """휴지통에서 되살린 기록."""
+        t = now_ms()
+        entry = HistoryEntry(
+            note_id=note.id,
+            user=user,
+            action="restore",
+            content_before=None,
+            content_after=note.content,
+            color_before=None,
+            color_after=note.color,
+            session_start=t,
+            session_end=t,
+        )
+        return self.repo.insert_history(entry)

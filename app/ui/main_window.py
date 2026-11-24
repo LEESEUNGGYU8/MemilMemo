@@ -34,11 +34,14 @@ from ..ipc import (
     CMD_SHOW, split_command,
 )
 from ..datetime_fmt import fmt_relative
-from ..local_state import FolderIconState, LocalStateStore
+from ..local_state import FolderIconState, LocalStateStore, NoteLocalState
 from ..network.client_base import ClientBase
 from ..models import new_id
 from ..offline_drafts import KIND_EDIT, KIND_NEW, Draft, DraftStore
-from ..replica import ReplicaStore, copy_to_show, list_copies, read_copy
+from ..backup import list_backups
+from ..replica import (
+    ReplicaStore, backup_source, copy_to_show, list_copies, read_copy,
+)
 from ..settings import (
     VIEW_COMPACT,
     VIEW_DETAILED,
@@ -52,12 +55,14 @@ from ..network.discovery import Searcher
 from .copies_dialog import CopiesDialog
 from .folder_dialog import FolderEditDialog
 from .folder_icon import FolderIconWidget
+from .folder_window import FolderWindow
 from .history_viewer import HistoryViewer
-from .icons import color_swatch_icon, svg_icon
+from .icons import color_swatch_icon, folder_lock_icon, svg_icon
 from .menu_item import add_centered_menu_action
 from .note_card import GRID_MIN_COLUMN, CardFlowLayout, NoteCard
 from . import note_fold as nf
 from .icon_grid import DesktopGrid
+from .icon_select import IconController, folder_key, note_key
 from .note_fold import FOLD_ICON, free_dock_slot, snap_icon_pos
 from .rich_text import has_non_checkbox_image, html_to_plain
 from .sessions_dialog import SessionsDialog
@@ -66,6 +71,7 @@ from .sticky_note import StickyNoteWidget
 from .theme import RoundedScrollBar
 from . import toast
 from .toast import ToastManager
+from .trash_dialog import TrashDialog
 
 
 # 실제 폴더 id 와 같은 dict 키 자리에 분기 없이 섞여 저장되도록 문자열 sentinel 로 둔다.
@@ -176,8 +182,9 @@ class _ConnectionBadge(QWidget):
 
 class MainWindow(QMainWindow):
     backupRequested = Signal()
-    restoreRequested = Signal()
-    takeoverRequested = Signal(str)     # 공유를 이어받을 사본 파일의 경로
+    restoreRequested = Signal(str)      # 복원할 백업 파일의 경로(공유 PC)
+    shareRequested = Signal(str)        # 혼자 쓰던 메모의 공유 시작(걸 비밀번호)
+    takeoverRequested = Signal(str)     # 공유를 이어받을 사본이나 백업 파일의 경로
 
     # 지운 뒤 '되돌리기'가 보이는 시간.
     _UNDO_MS = 10_000
@@ -193,8 +200,11 @@ class MainWindow(QMainWindow):
                  role: str, settings: AppSettings | None = None,
                  app_icon: QIcon | None = None, parent=None,
                  replica: ReplicaStore | None = None,
-                 drafts: DraftStore | None = None):
+                 drafts: DraftStore | None = None, *, solo: bool = False):
+        """``solo`` 는 공유하지 않고 혼자 쓰는 중인가. 그때 ``role`` 은 "host" 다
+        (메모가 이 PC 에 있다). 포트를 열지 않았으므로 참가자가 없다."""
         super().__init__(parent)
+        self._solo = bool(solo)
         self.setWindowTitle(i18n.t("app.name"))
         self.resize(380, 600)
         if app_icon is not None and not app_icon.isNull():
@@ -204,6 +214,7 @@ class MainWindow(QMainWindow):
         self._local = local_state
         self._role = role
         self._settings = settings or AppSettings()
+        nf.set_animation_speed(self._settings.animation_speed)
         self._app_icon = app_icon
         self._notes: dict[str, dict[str, Any]] = {}
         self._folders: dict[str, dict[str, Any]] = {}
@@ -318,6 +329,12 @@ class MainWindow(QMainWindow):
         self._pending_deletes: dict[str, dict] = {}
         self._delete_message = ""
         self._delete_round = 0
+        # 공유 PC 가 지운 메모를 휴지통에 두는 날 수. 0 이면 휴지통이 없는 옛
+        # 버전의 공유 PC 다(지우면 되살릴 수 없으므로 지우기 전에 묻는다).
+        self._trash_days = 0
+        self._trash_dialog: TrashDialog | None = None
+        # 휴지통에서 되살아나 곧 도착할 메모(메모 id → 되살린 사람).
+        self._restoring: dict[str, str] = {}
         self._announce_timer = QTimer(self)
         self._announce_timer.setSingleShot(True)
         self._announce_timer.setInterval(self._ANNOUNCE_MS)
@@ -335,6 +352,15 @@ class MainWindow(QMainWindow):
         # 메모와 폴더를 한 번이라도 불러왔는가. 그 전에는 맞출 아이콘이 없다.
         self._icons_loaded = False
         self._desktop_grid.changed.connect(self._align_icons)
+        # 아이콘을 바탕화면 아이콘처럼 고르고 함께 다루는 일(ui/icon_select.py).
+        # 바탕화면 빈 곳을 끌어 고르는 것도 여기서 따라간다.
+        self._icon_ctl = IconController(self, self._desktop_grid, self)
+        self._desktop_grid.refreshed.connect(self._icon_ctl.marquee.sync)
+        # 폴더 아이콘을 열면 뜨는 창(폴더 id → 창).
+        self._folder_windows: dict[str, FolderWindow] = {}
+        # 폴더 창에서 꺼내 본 메모. 폴더가 접혀 있어도 이 메모만 바탕화면에
+        # 나와 있다. 닫으면 다시 폴더 안으로 들어간다(이번 실행 동안만).
+        self._peeked: set[str] = set()
         self._desktop_grid.start()
 
         self._build_ui()
@@ -394,6 +420,7 @@ class MainWindow(QMainWindow):
         self._sessions_btn.setFixedSize(44, 44)
         self._sessions_btn.setStyleSheet(square_style)
         self._sessions_btn.clicked.connect(self._open_sessions)
+        self._sessions_btn.setVisible(not self._solo)       # 혼자 쓰면 참가자가 없다
         top_row.addWidget(self._sessions_btn)
 
         self._settings_btn = QToolButton()
@@ -796,6 +823,9 @@ class MainWindow(QMainWindow):
         c.noteShared.connect(self._on_note_shared)
         c.noteEdited.connect(self._on_note_edited)
         c.historyList.connect(self._on_history_list)
+        c.noteRestored.connect(self._on_note_restored)
+        c.trashList.connect(self._on_trash_list)
+        c.trashChanged.connect(self._on_trash_changed)
         c.connectionChanged.connect(self._on_connection_changed)
         c.errorOccurred.connect(self._on_error)
         c.passwordRequired.connect(self._on_password_required)
@@ -1002,34 +1032,49 @@ class MainWindow(QMainWindow):
             self._history_viewer.set_notes(list(self._notes.values()))
 
     def _open_settings(self) -> None:
-        dlg = SettingsDialog(self._settings, role=self._role, parent=self)
+        dlg = SettingsDialog(self._settings, role=self._role, parent=self,
+                             solo=self._solo)
         dlg.backupNowRequested.connect(self.backupRequested.emit)
-        dlg.restoreRequested.connect(self.restoreRequested.emit)
-        dlg.copiesRequested.connect(self.open_copies)
+        dlg.resetConnectionRequested.connect(self._reset_connection)
+        dlg.shareRequested.connect(self._start_sharing)
+        # 아직 저장하지 않은 백업 폴더라도 거기서 찾는다(다른 PC 에서 가져온
+        # 백업 폴더를 가리켜 되살리는 경우).
+        dlg.restoreRequested.connect(lambda: self.open_restore(dlg.backup_folder()))
         dlg.exec()
         self._apply_tray_visibility()
+        nf.set_animation_speed(self._settings.animation_speed)
         # '붙인 메모를 다른 창 위에'와 접힌 모양은 떠 있는 메모에 바로 반영한다.
         for w in self._stickies.values():
             w.refresh_dock_layer()
             w.refresh_fold_face()
 
     def open_copies(self) -> None:
-        """이 PC 에 받아 둔 사본을 열어 본다. 빠진 메모를 가져오거나, 공유 PC 를
-        다시 쓸 수 없을 때 이 PC 가 공유를 이어받는다."""
+        """끊겨 있다는 안내를 눌렀다. 받아 둔 사본을 열어 본다."""
+        self.open_restore()
+
+    def open_restore(self, backup_folder=None) -> None:
+        """백업과 이 PC 에 받아 둔 사본을 열어 본다. 빠진 메모를 가져오거나, 메모
+        전체를 그 내용으로 되돌린다(공유 PC 는 복원, 참여한 PC 는 그것으로 공유를
+        시작한다). 아무것도 없어도 창은 뜬다(파일을 골라 넣을 수 있다)."""
         parent = QApplication.activeModalWidget() or self
-        copies = self._copy_sources()
-        if not copies:
-            confirm.notify(parent, i18n.t("copies.window_title"),
-                           i18n.t("copies.empty"))
-            return
+        host = self._role != "guest"
         dlg = CopiesDialog(
-            copies,
+            self._restore_sources(backup_folder),
             host_notes=dict(self._notes) if self._connected else None,
-            can_takeover=(self._role == "guest"),
+            can_takeover=not host, can_restore=host,
             nickname=self._client.nickname(), parent=parent)
         dlg.importRequested.connect(self._import_from_copy)
         dlg.takeoverRequested.connect(self.takeoverRequested.emit)
+        dlg.restoreRequested.connect(self.restoreRequested.emit)
         dlg.exec()
+
+    def _restore_sources(self, backup_folder=None) -> list:
+        """복원 창에 보여 줄 것들. 공유 PC 에서는 백업이 먼저, 참여한 PC 에서는
+        받아 둔 사본이 먼저다."""
+        folder = backup_folder or self._settings.resolved_backup_dir()
+        backups = [backup_source(path) for path in list_backups(folder)]
+        copies = self._copy_sources()
+        return copies + backups if self._role == "guest" else backups + copies
 
     def _copy_sources(self) -> list:
         """사본 창에 보여 줄 것들. 참여 중인 PC 에서는 이 PC 가 공유 PC 였을 때의
@@ -1318,6 +1363,8 @@ class MainWindow(QMainWindow):
         self._host_nickname = data.get("host", "") or self._host_nickname
         self._host_id = str(data.get("host_id") or "") or self._host_id
         self._locked = data.get("locked") is True
+        days = data.get("trash_days")
+        self._trash_days = days if isinstance(days, int) and days > 0 else 0
         self._heartbeat_ms = int(data.get("heartbeat_ms", 0)) or self._heartbeat_ms
         # 호스트가 보낸 것으로 바꾼다. 사본을 보여 주던 중이었으면 여기서 끝난다.
         self._replica_shown = False
@@ -1966,8 +2013,33 @@ class MainWindow(QMainWindow):
         kept = self._gone_states.pop(note_id, None)
         return kept[0] if kept is not None else None
 
+    def _on_note_restored(self, info: dict) -> None:
+        """휴지통에서 되살아난 메모가 곧 온다(_on_note_created 가 이어서 받는다)."""
+        note_id = str(info.get("note_id") or "")
+        if note_id:
+            self._restoring[note_id] = str(info.get("user") or "")
+
+    def _state_for_restored(self, note: dict, by: str) -> NoteLocalState:
+        """휴지통에서 돌아온 메모를 이 PC 에서 둘 자리. 버리기 전의 자리와 접힘이
+        남아 있으면 그대로 쓴다. 없으면 되살린 사람의 화면에만 띄운다."""
+        kept = self._local.state.take_trashed(note["id"])
+        if kept is not None:
+            return kept
+        state = NoteLocalState()
+        pos = self._new_note_position(
+            int(note.get("width") or config.DEFAULT_NOTE_WIDTH),
+            int(note.get("height") or config.DEFAULT_NOTE_HEIGHT), None)
+        state.x, state.y = pos.x(), pos.y()
+        state.hidden = by != self._client.nickname()
+        return state
+
     def _on_note_created(self, note: dict) -> None:
         back = self._take_gone_state(note["id"])
+        restored_by = self._restoring.pop(note["id"], None)
+        if back is None and restored_by is not None:
+            back = self._state_for_restored(note, restored_by)
+        # 다시 온 메모다. 휴지통으로 갔을 때를 대비해 적어 둔 자리는 이제 쓸 일이 없다.
+        self._local.state.trashed.pop(note["id"], None)
         if back is not None:
             # 새 메모가 아니다. 공개 범위가 바뀌어 지워졌다가 다시 온 같은
             # 메모다. 두던 자리, 크기, 접힘, 숨김을 그대로 되살린다.
@@ -2117,6 +2189,9 @@ class MainWindow(QMainWindow):
         state = self._local.state.notes.get(note_id)
         if state is not None and undoable is None:
             self._gone_states[note_id] = (state, time.monotonic())
+        if self._trash_days and not (gone or {}).get(LOCAL_MARK):
+            # 휴지통에서 되살아나면 두던 자리로 돌아오게 적어 둔다.
+            self._local.state.keep_trashed(note_id)
         self._local.state.remove_note(note_id)
         self._local.save()
         self._apply_search_filter()
@@ -2190,12 +2265,17 @@ class MainWindow(QMainWindow):
         f = self._folders.get(cf)
         if not f:
             return i18n.t("main.folder_all"), "#7B7B7B"
+        # 나만 보는 폴더도 이름만 적는다(단추의 자물쇠가 알려 준다). 이름 뒤에
+        # 붙인 글은 폴더가 아닌 다른 분류처럼 읽혔다.
         name = f.get("name") or i18n.t("main.folder_default_name")
-        label = (i18n.t("main.folder_private_label", name=name)
-                 if f.get("private_owner") else name)
-        return label, f.get("color") or config.DEFAULT_COLOR
+        return name, f.get("color") or config.DEFAULT_COLOR
 
     def _show_folder_selector(self) -> None:
+        menu = self._folder_selector_menu()
+        menu.exec(self._folder_chip.mapToGlobal(
+            QPoint(0, self._folder_chip.height())))
+
+    def _folder_selector_menu(self) -> QMenu:
         menu = QMenu(self._folder_chip)
         add_centered_menu_action(
             menu, svg_icon("folder"), i18n.t("main.folder_all"),
@@ -2211,12 +2291,11 @@ class MainWindow(QMainWindow):
             menu.addSeparator()
             for f in folders:
                 name = f.get("name") or i18n.t("main.folder_default_name")
-                if f.get("private_owner"):
-                    name = i18n.t("main.folder_private_label", name=name)
-                    icon = svg_icon("lock", color="#5B5B5B")
-                else:
-                    color = f.get("color") or config.DEFAULT_COLOR
-                    icon = color_swatch_icon(color)
+                color = f.get("color") or config.DEFAULT_COLOR
+                # 나만 보는 폴더는 폴더 색의 자물쇠로 표시한다. 다른 폴더와 같은
+                # 줄에 같은 꼴(색 표시와 이름)로 놓여 폴더로 읽힌다.
+                icon = (folder_lock_icon(color) if f.get("private_owner")
+                        else color_swatch_icon(color))
                 fid = f["id"]
                 add_centered_menu_action(
                     menu, icon, name,
@@ -2225,8 +2304,12 @@ class MainWindow(QMainWindow):
         add_centered_menu_action(
             menu, svg_icon("plus"), i18n.t("main.menu_new_folder"),
             self._create_folder_dialog)
-        menu.exec(self._folder_chip.mapToGlobal(
-            QPoint(0, self._folder_chip.height())))
+        if self._trash_days and self._connected:
+            menu.addSeparator()
+            add_centered_menu_action(
+                menu, svg_icon("trash"), i18n.t("main.folder_trash"),
+                self.open_trash)
+        return menu
 
     def _show_folder_menu(self) -> None:
         cf = self._current_folder
@@ -2301,7 +2384,11 @@ class MainWindow(QMainWindow):
             self._client.update_folder(f["id"], **kwargs)
 
     def _delete_current_folder(self) -> None:
-        f = self._folders.get(self._current_folder)
+        self._delete_folder(self._current_folder)
+
+    def _delete_folder(self, folder_id: str) -> None:
+        """폴더를 지운다(묻고 나서). 메인 창의 메뉴와 폴더 아이콘의 메뉴가 함께 쓴다."""
+        f = self._folders.get(folder_id)
         if f is None or not self._require_online():
             return
         if not confirm.ask(
@@ -2423,7 +2510,8 @@ class MainWindow(QMainWindow):
         안 되는 글일 수 있으므로 나만 보는 메모로 만든다(공개는 사용자가 바꾼다)."""
         if not self._require_online():
             return
-        if color not in config.COLORS:
+        # 메모 색은 견본 밖의 색일 수도 있다('다른 색'). 색이 아닌 값만 바꾼다.
+        if not QColor(color or "").isValid():
             color = self._settings.default_note_color or config.DEFAULT_COLOR
         width, height = config.DEFAULT_NOTE_WIDTH, config.DEFAULT_NOTE_HEIGHT
         pos = self._new_note_position(width, height, None)
@@ -2827,27 +2915,95 @@ class MainWindow(QMainWindow):
 
     def _bulk_delete(self) -> None:
         ids = [nid for nid in self._selected_notes if nid in self._notes]
+        if self._delete_many(ids):
+            self._exit_selection_mode()
+
+    def _delete_many(self, ids: list[str]) -> bool:
+        """메모 여러 개를 지운다. 지우기를 보냈으면 True."""
         if not ids or not self._require_online():
-            return
+            return False
         # 다른 사람이 편집 중인 메모는 지울 수 없다. 나머지만 지우고 따로 알린다.
         locked = [nid for nid in ids if self._locked_by_other(nid)]
         free = [nid for nid in ids if nid not in locked]
         if not free:
             self._tell_locked(self._locked_by_other(locked[0]))
-            return
-        if not confirm.ask(
+            return False
+        if self._trash_days:
+            # 휴지통으로 간다. 되살릴 수 있으므로 묻지 않는다.
+            self._delete_with_undo(
+                free, i18n.t("main.bulk_trashed", count=len(free)))
+        elif confirm.ask(
                 self, i18n.t("main.msg_bulk_delete_title"),
                 i18n.t("main.msg_bulk_delete_body", count=len(free)),
                 detail=i18n.t("main.msg_delete_scope"),
                 action=i18n.t("common.btn_delete"), danger=True):
-            return
-        self._delete_with_undo(free, i18n.t("main.bulk_deleted", count=len(free)))
-        self._exit_selection_mode()
+            self._delete_with_undo(
+                free, i18n.t("main.bulk_deleted", count=len(free)))
+        else:
+            return False
         if locked:
             confirm.notify(
                 self, i18n.t("main.msg_delete_locked_title"),
                 i18n.t("main.msg_bulk_locked_body", count=len(locked)),
                 icon=QMessageBox.Warning)
+        return True
+
+    def delete_notes(self, note_ids: list[str]) -> None:
+        """고른 메모들을 지운다(바탕화면의 아이콘과 폴더 창이 함께 쓴다)."""
+        ids = [nid for nid in dict.fromkeys(note_ids) if nid in self._notes]
+        if len(ids) == 1:
+            self._delete_note_confirm(ids[0])
+            return
+        # 끊긴 동안 이 PC 에서만 쓴 메모는 이 PC 에서 바로 지운다.
+        local = [nid for nid in ids
+                 if self._notes[nid].get(LOCAL_MARK) == KIND_NEW]
+        for nid in local:
+            self._delete_local_note(nid)
+        self._delete_many([nid for nid in ids if nid not in local])
+
+    # ── 휴지통 ──────────────────────────────────────────────────────────
+
+    def open_trash(self) -> None:
+        """지운 메모를 되살리거나 완전히 지우는 창을 연다."""
+        if not self._trash_days or not self._require_online():
+            return
+        if self._trash_dialog is None:
+            dlg = TrashDialog(self._trash_days, self._settings, self,
+                              icon=self._app_icon)
+            dlg.restoreRequested.connect(self._restore_from_trash)
+            dlg.purgeRequested.connect(self._purge_from_trash)
+            dlg.emptyRequested.connect(self._empty_trash)
+            self._trash_dialog = dlg
+        self._trash_dialog.show()
+        self._trash_dialog.raise_()
+        self._trash_dialog.activateWindow()
+        self._client.get_trash()
+
+    def _on_trash_list(self, notes: list) -> None:
+        if self._trash_dialog is not None:
+            self._trash_dialog.set_notes(notes, self._trash_days or None)
+
+    def _on_trash_changed(self) -> None:
+        # 창을 열어 둔 동안에만 다시 묻는다(목록은 공유 PC 가 들고 있다).
+        if (self._trash_dialog is not None and self._trash_dialog.isVisible()
+                and self._connected):
+            self._client.get_trash()
+
+    def _restore_from_trash(self, note_ids: list) -> None:
+        if not self._require_online():
+            return
+        for nid in note_ids:
+            self._client.restore_note(nid)
+
+    def _purge_from_trash(self, note_ids: list) -> None:
+        if not self._require_online():
+            return
+        for nid in note_ids:
+            self._client.purge_note(nid)
+
+    def _empty_trash(self) -> None:
+        if self._require_online():
+            self._client.empty_trash()
 
     def _exit_selection_mode(self) -> None:
         if not self._selection_mode:
@@ -2958,6 +3114,7 @@ class MainWindow(QMainWindow):
                 continue
             st = self._local.state.get_note_state(nid)
             pending[nid] = {
+                "id": nid,
                 "content": note.get("content") or "",
                 "color": note.get("color") or config.DEFAULT_COLOR,
                 "width": int(note.get("width") or config.DEFAULT_NOTE_WIDTH),
@@ -3001,6 +3158,11 @@ class MainWindow(QMainWindow):
             self._status.showMessage(
                 i18n.t("main.status_offline_no_create"), 5000)
             return
+        if self._trash_days:
+            # 휴지통에서 그 메모를 그대로 되살린다(이력도 이어진다).
+            for snap in snapshots:
+                self._client.restore_note(snap["id"])
+            return
         me = self._client.nickname()
         for snap in snapshots:
             self._recreate_queue.append(snap)
@@ -3036,6 +3198,10 @@ class MainWindow(QMainWindow):
         if holder:
             # 지울 수 없는 까닭을 확인창을 띄우기 전에 알린다.
             self._tell_locked(holder)
+            return
+        if self._trash_days:
+            # 휴지통으로 간다. 되살릴 수 있으므로 묻지 않는다.
+            self._delete_with_undo([note_id], i18n.t("main.status_trashed"))
             return
         # 삭제는 모든 참가자에게서 지워지고 되돌릴 수 없다. 무엇을 지우는지와
         # 그 범위를 적고, 기본 단추는 취소로 둔다.
@@ -3178,6 +3344,7 @@ class MainWindow(QMainWindow):
             w.set_dock_resolver(self._resolve_dock_slot)
             w.set_icon_resolver(self._resolve_icon_pos)
             w.set_drop_probe(self._on_icon_dragged)
+            w.set_icon_controller(self._icon_ctl)
             self._stickies[note_id] = w
 
         st = self._local.state.get_note_state(note_id)
@@ -3248,6 +3415,165 @@ class MainWindow(QMainWindow):
     def _on_fold_changed(self, note_id: str, state: dict) -> None:
         self._local.state.set_note_state(note_id, **state)
         self._local.save()
+        # 펴거나 벽에 붙이면 더는 아이콘이 아니다. 고른 것에서 뺀다.
+        self._icon_ctl.refresh()
+
+    # ── 아이콘 고르기(ui/icon_select.py 의 IconController 가 부른다) ──
+
+    def all_icon_widgets(self) -> dict:
+        """메모 창과 폴더 아이콘 전부(아이콘 모양이 아닌 것도)."""
+        out = {note_key(nid): w for nid, w in self._stickies.items()}
+        out.update({folder_key(fid): icon
+                    for fid, icon in self._folder_icons.items()})
+        return out
+
+    def icon_widgets(self) -> dict:
+        """지금 바탕화면에 아이콘으로 놓여 있는 것들(키 → 창)."""
+        out = {note_key(nid): w for nid, w in self._stickies.items()
+               if w.isVisible() and w.is_desktop_icon()}
+        out.update({folder_key(fid): icon
+                    for fid, icon in self._folder_icons.items()
+                    if icon.isVisible()})
+        return out
+
+    def open_note(self, note_id: str) -> None:
+        w = self._stickies.get(note_id)
+        if w is not None and w.is_folded():
+            w.unfold()
+            # 아이콘은 눌려도 앞으로 나오지 않는다. 펴는 메모는 앞으로 부른다.
+            w.raise_()
+            w.activateWindow()
+
+    def hide_notes(self, note_ids: list[str]) -> None:
+        for nid in note_ids:
+            if nid in self._notes:
+                self._set_note_visibility(nid, False)
+
+    def move_notes_to_folder(self, note_ids: list[str], folder_id: str) -> None:
+        for nid in note_ids:
+            note = self._notes.get(nid)
+            if note is not None and (note.get("folder_id") or None) != folder_id:
+                self._on_card_move_to_folder(nid, folder_id)
+
+    def delete_folder(self, folder_id: str) -> None:
+        self._delete_folder(folder_id)
+
+    def rename_folder_icon(self, folder_id: str) -> None:
+        icon = self._folder_icons.get(folder_id)
+        if icon is not None and icon.isVisible():
+            icon.begin_rename()
+
+    # ── 폴더 창 ─────────────────────────────────────────────────────────
+
+    def _folder_under_window(self, pos: QPoint) -> str:
+        """그 점에 열려 있는 폴더 창의 폴더 id. 없으면 빈 글."""
+        for fid, win in self._folder_windows.items():
+            if win.isVisible() and win.frameGeometry().contains(pos):
+                return fid
+        return ""
+
+    def open_folder_window(self, folder_id: str) -> None:
+        """폴더에 든 메모를 보여 주는 창을 연다(폴더 아이콘을 두 번 눌렀다)."""
+        if folder_id not in self._folders:
+            return
+        win = self._folder_windows.get(folder_id)
+        if win is None:
+            win = FolderWindow(folder_id, self._settings,
+                               wire_card=self._wire_folder_card,
+                               icon=self._app_icon)
+            win.noteActivated.connect(self.peek_note)
+            win.deleteRequested.connect(self.delete_notes)
+            win.visibilityRequested.connect(self._set_notes_visibility)
+            self._folder_windows[folder_id] = win
+            self._fill_folder_window(folder_id)
+            icon = self._folder_icons.get(folder_id)
+            if icon is not None:
+                # 아이콘 옆에서 열린다. 화면 밖으로 나가면 안으로 들인다.
+                area = self._area_at(icon.geometry().center())
+                at = icon.geometry().topRight() + QPoint(12, 0)
+                at.setX(max(area.left(), min(at.x(), area.right() - win.width())))
+                at.setY(max(area.top(), min(at.y(), area.bottom() - win.height() - 40)))
+                win.move(at)
+        else:
+            self._fill_folder_window(folder_id)
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
+    def _folder_items(self, folder_id: str) -> list[dict]:
+        """폴더 창에 보일 그 폴더의 메모들(방금 고친 것부터)."""
+        notes = [self._notes[nid] for nid in self._folder_note_ids(folder_id)]
+        notes.sort(key=lambda n: n.get("updated_at") or 0, reverse=True)
+        return [{
+            "id": note["id"], "title": self._note_title(note),
+            "color": note.get("color") or config.DEFAULT_COLOR,
+            "private": bool(note.get("private_owner")),
+            "hidden": self._local.state.get_note_state(note["id"]).hidden,
+            "content": note.get("content") or "", "note": note,
+        } for note in notes]
+
+    def _fill_folder_window(self, folder_id: str) -> None:
+        win = self._folder_windows.get(folder_id)
+        folder = self._folders.get(folder_id)
+        if win is None or folder is None:
+            return
+        win.set_content(folder.get("name") or "", self._folder_items(folder_id),
+                        self._folder_context_for_cards())
+
+    def _refresh_folder_windows(self) -> None:
+        for fid, win in list(self._folder_windows.items()):
+            if fid not in self._folders:
+                # 폴더가 지워졌다. 창도 없앤다.
+                del self._folder_windows[fid]
+                win.close()
+                win.deleteLater()
+            elif win.isVisible():
+                self._fill_folder_window(fid)
+
+    def _close_folder_windows(self) -> None:
+        windows, self._folder_windows = list(self._folder_windows.values()), {}
+        for win in windows:
+            win.close()
+            win.deleteLater()
+
+    def _wire_folder_card(self, card: NoteCard) -> None:
+        """폴더 창의 카드 한 장. 누르면 그 메모만 꺼내 보고, 나머지는 메인 창의
+        목록에 있는 카드와 똑같이 된다."""
+        card.clicked.connect(self.peek_note)
+        card.toggleVisibility.connect(self._toggle_visibility_from_card)
+        card.deleteRequested.connect(self._delete_note_confirm)
+        card.historyRequested.connect(self._open_history_for)
+        card.privateToggleRequested.connect(self._on_card_private_toggled)
+        card.moveToFolderRequested.connect(self._on_card_move_to_folder)
+
+    def peek_note(self, note_id: str) -> None:
+        """폴더 창에서 메모를 열었다. 폴더가 접혀 있어도 그 메모만 바탕화면에
+        펼쳐 보인다. 닫으면 다시 폴더 안으로 들어간다."""
+        if note_id not in self._notes:
+            return
+        note = self._notes[note_id]
+        state = self._local.state.get_note_state(note_id)
+        if state.hidden or self._folder_closed(note.get("folder_id")):
+            self._peeked.add(note_id)
+        self._sync_note_shown(note_id)
+        w = self._stickies.get(note_id)
+        if w is not None:
+            w.setWindowOpacity(1.0)
+            w.reveal()
+
+    def _set_notes_visibility(self, note_ids: list, visible: bool) -> None:
+        for nid in note_ids:
+            if nid in self._notes:
+                self._peeked.discard(nid)
+                self._set_note_visibility(nid, visible)
+
+    def realign_icons(self) -> None:
+        """진짜 바탕화면 아이콘의 자리가 달라졌을 수 있다. 다시 읽고, 같은 칸에
+        겹친 우리 아이콘은 가까운 빈 칸으로 비킨다."""
+        if self._force_quit:
+            return
+        self._desktop_grid.refresh()
+        self._align_icons()
 
     def _resolve_icon_pos(self, owner_key: str, pos, screen_rect):
         """아이콘 모양으로 접은 메모와 폴더 아이콘이 서로 겹치지 않는 격자
@@ -3305,7 +3631,7 @@ class MainWindow(QMainWindow):
             if w.wants_icon_spot():
                 items.append((w.icon_spot(), "note", nid))
         for fid, icon in self._folder_icons.items():
-            items.append((icon.pos(), "folder", fid))
+            items.append((icon.icon_spot(), "folder", fid))
         items.sort(key=lambda item: (item[0].x(), item[0].y(), item[2]))
         placed: dict[tuple, list[QPoint]] = {}
         moved = False
@@ -3364,7 +3690,8 @@ class MainWindow(QMainWindow):
     def _on_icon_dragged(self, note_id: str, pos: QPoint, dropped: bool) -> bool:
         """아이콘으로 접힌 메모를 끄는 동안과 놓았을 때. 메모 폴더 아이콘 위에
         놓으면 그 폴더로 옮긴다(받았으면 참)."""
-        target = self._folder_under(pos)
+        # 폴더 아이콘 위나, 열어 둔 폴더 창 위에 놓으면 그 폴더로 들어간다.
+        target = self._folder_under(pos) or self._folder_under_window(pos)
         for fid, icon in self._folder_icons.items():
             icon.set_drop_hover(fid == target and not dropped)
         if not dropped or not target:
@@ -3372,6 +3699,8 @@ class MainWindow(QMainWindow):
         note = self._notes.get(note_id) or {}
         if (note.get("folder_id") or None) != target:
             self._on_card_move_to_folder(note_id, target)
+        # 함께 끌던 메모도 그 폴더로 들어간다.
+        self._icon_ctl.dropped_on_folder(note_key(note_id), target)
         return True
 
     # ── 바탕 화면 폴더 아이콘 ───────────────────────────────────────────
@@ -3386,6 +3715,8 @@ class MainWindow(QMainWindow):
 
     def _note_shown(self, note_id: str) -> bool:
         """이 메모가 지금 바탕 화면에 나와야 하는가."""
+        if note_id in self._peeked:
+            return True
         if self._local.state.get_note_state(note_id).hidden:
             return False
         note = self._notes.get(note_id) or {}
@@ -3400,6 +3731,8 @@ class MainWindow(QMainWindow):
             w.fade_to(shown)
         elif shown != w.isVisible():
             w.setVisible(shown)
+        if not shown and note_key(note_id) in self._icon_ctl.selection:
+            self._icon_ctl.selection.toggle(note_key(note_id))
 
     def _folder_note_ids(self, folder_id: str) -> list[str]:
         return [nid for nid, note in self._notes.items()
@@ -3429,8 +3762,11 @@ class MainWindow(QMainWindow):
                     folder.get("color") or config.DEFAULT_COLOR,
                     settings=self._settings)
                 icon.toggled.connect(self._toggle_folder_icon)
+                icon.opened.connect(self.open_folder_window)
+                icon.set_icon_controller(self._icon_ctl)
                 icon.moved.connect(self._on_folder_icon_moved)
                 icon.removeRequested.connect(self._remove_folder_icon)
+                icon.deleteRequested.connect(self._delete_folder)
                 icon.renamed.connect(self._on_folder_icon_renamed)
                 icon.set_slot_resolver(self._resolve_icon_pos)
                 icon.place(state.x, state.y)
@@ -3442,6 +3778,8 @@ class MainWindow(QMainWindow):
                            count=self._folder_note_count(fid))
             if not icon.isVisible():
                 icon.show()
+        self._icon_ctl.refresh()
+        self._refresh_folder_windows()
 
     def _place_folder_icon(self, folder_id: str, at: QPoint | None = None,
                            quiet: bool = False) -> None:
@@ -3548,6 +3886,12 @@ class MainWindow(QMainWindow):
         return free_dock_slot(y, height, screen_rect, spans, side)
 
     def _set_note_visibility(self, note_id: str, visible: bool) -> None:
+        if not visible and note_id in self._peeked:
+            # 폴더 창에서 꺼내 본 메모를 닫았다. 다시 폴더 안으로 들어갈 뿐이고,
+            # 숨긴 메모로 바꾸지는 않는다.
+            self._peeked.discard(note_id)
+            self._sync_note_shown(note_id)
+            return
         self._local.state.set_note_state(note_id, hidden=not visible)
         self._local.save()
         if visible:
@@ -3578,7 +3922,9 @@ class MainWindow(QMainWindow):
 
     def _refresh_status_text(self) -> None:
         """상태줄 오른쪽의 연결 상태, 역할, 닉네임, 접속 인원을 다시 적는다."""
-        if self._connected:
+        if self._connected and self._solo:
+            state, text = "connected", i18n.t("main.state_solo")
+        elif self._connected:
             state, text = "connected", i18n.t("main.state_connected")
         elif self._gate:
             state = "connecting"
@@ -3591,7 +3937,7 @@ class MainWindow(QMainWindow):
         else:
             state, text = "connecting", i18n.t("main.state_connecting")
         detail = self._client.nickname()
-        if self._connected and self._users:
+        if self._connected and self._users and not self._solo:
             detail += "   " + i18n.t("main.status_online_count",
                                      count=len(self._users))
         self._conn_badge.set_state(state, text, detail)
@@ -3647,8 +3993,9 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         self._add_tray_item(menu, svg_icon("window"), i18n.t("main.tray_show_main"),
                             self._show_main_window)
-        self._add_tray_item(menu, svg_icon("users"), i18n.t("main.tray_sessions"),
-                            self._open_sessions)
+        if not self._solo:
+            self._add_tray_item(menu, svg_icon("users"),
+                                i18n.t("main.tray_sessions"), self._open_sessions)
         self._add_tray_item(menu, svg_icon("settings"), i18n.t("main.tray_settings"),
                             self._open_settings)
         menu.addSeparator()
@@ -3720,8 +4067,22 @@ class MainWindow(QMainWindow):
         앱을 종료하거나 현재 세션을 끊지는 않는다."""
         self._local.state.last_mode = ""
         self._local.save()
-        confirm.notify(self, i18n.t("main.msg_reset_connection_title"),
+        confirm.notify(QApplication.activeModalWidget() or self,
+                       i18n.t("main.msg_reset_connection_title"),
                        i18n.t("main.msg_reset_connection_body"))
+
+    def is_solo(self) -> bool:
+        return self._solo
+
+    def _start_sharing(self) -> None:
+        """혼자 쓰던 메모의 공유를 시작한다. 비밀번호를 걸지 묻고, 실제로 바꾸는
+        일(다음부터 공유 PC 로 켜지게 적어 두고 다시 켠다)은 main.py 가 한다."""
+        if not self._solo:
+            return
+        password = password_dialog.ask_share_start(
+            QApplication.activeModalWidget() or self)
+        if password is not None:
+            self.shareRequested.emit(password)
 
     def notify(self, text: str) -> None:
         """화면 오른쪽 아래에 잠깐 알린다(창 밖의 코드가 쓴다)."""
@@ -3740,6 +4101,8 @@ class MainWindow(QMainWindow):
         self._force_quit = True
         self._gate_timer.stop()
         self._desktop_grid.stop()
+        self._icon_ctl.stop()
+        self._close_folder_windows()
         self._flush_pending_edits()
         self._teardown_stickies()
         self._toasts.close_all()

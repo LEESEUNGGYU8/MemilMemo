@@ -1,4 +1,8 @@
 <p align="center">
+  <b>한국어</b> | <a href="README.en.md">English</a> | <a href="README.ja.md">日本語</a>
+</p>
+
+<p align="center">
   <img src="docs/images/icon.png" width="128" alt="메밀메모 아이콘">
 </p>
 

@@ -13,15 +13,20 @@
     fold-steps.png  같은 과정의 정지 그림(GIF 를 못 보는 곳용)
     editing.png     서식·목록·색·이미지 뷰어
     together.png    편집 중 표시, 참가자, 수정 이력
+
+배율 200% 화면으로 따로 찍는 파일(``QT_SCALE_FACTOR=2`` 를 주고 돌린다)
+    desktop-icons.png  아이콘으로 접은 메모와 폴더가 Windows 의 아이콘 옆에 놓인 모습
 """
 from __future__ import annotations
 
 import io
 
-from PySide6.QtCore import QBuffer, QPointF, QRectF, QSize, Qt, QTimer
+from PySide6.QtCore import QBuffer, QPointF, QRect, QRectF, QSize, QSizeF, Qt, QTimer
 from PySide6.QtGui import (
     QColor,
     QFont,
+    QFontDatabase,
+    QFontMetricsF,
     QImage,
     QLinearGradient,
     QPainter,
@@ -99,8 +104,12 @@ def _font(px: int, bold: bool = False) -> QFont:
 class Canvas:
     """배경을 깔고 그 위에 창 그림을 그림자와 함께 올린다."""
 
-    def __init__(self, width: int, height: int, *, desktop: bool = False):
-        self.img = QImage(width, height, QImage.Format_ARGB32_Premultiplied)
+    def __init__(self, width: int, height: int, *, desktop: bool = False,
+                 scale: float = 1.0):
+        # ``scale`` 이 2 면 같은 장면을 두 배 촘촘하게 그린다(자리는 그대로 쓴다).
+        self.img = QImage(int(round(width * scale)), int(round(height * scale)),
+                          QImage.Format_ARGB32_Premultiplied)
+        self.img.setDevicePixelRatio(scale)
         self.w, self.h = width, height
         self.desktop = desktop
         self.p = QPainter(self.img)
@@ -208,6 +217,12 @@ def grab(widget, harness) -> QPixmap:
     return widget.grab()
 
 
+def screen_scale() -> float:
+    """찍는 화면의 배율. ``QT_SCALE_FACTOR=2`` 를 주고 돌리면 2 다."""
+    screen = QApplication.primaryScreen()
+    return float(screen.devicePixelRatio()) if screen is not None else 1.0
+
+
 def grab_popup(trigger, harness) -> QPixmap | None:
     """``exec`` 로 뜨는 메뉴를 찍어 돌려준다."""
     got: list[QPixmap] = []
@@ -268,6 +283,233 @@ def _hero(window, harness) -> None:
     window._remove_folder_icon("f_me")
     deploy.undock()
     for w in (reply, lunch, deploy):
+        w.unfold()
+        w.set_fold_style(nf.FOLD_SLIP)
+        w.setGeometry(homes[w])
+        w.positionChanged.emit(w.note_id, homes[w].x(), homes[w].y())
+    harness.settle(100)
+
+
+# ── Windows 의 아이콘 ───────────────────────────────────────────────────
+# 바탕 화면 장면에 함께 놓는다. 이 PC 의 Windows 가 쓰는 그림과 이름을 묻기만
+# 하고(셸의 그림 목록), 사용자의 바탕화면은 읽지도 찍지도 않는다.
+
+_SHELL_ITEMS = (
+    # (셸에서 부르는 이름, 정해 둔 그림 번호)
+    ("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}", None),   # 내 PC
+    # 휴지통은 찬 모습과 빈 모습이 다르다. 늘 빈 모습(SIID_RECYCLER)을 쓴다.
+    ("::{645FF040-5081-101B-9F08-00AA002F954E}", 31),
+    ("::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}", None),   # 네트워크
+)
+
+
+# 이 PC 의 Windows 는 제 언어의 이름을 준다(내 PC, 휴지통, 네트워크). 다른 언어의
+# 그림을 찍을 때는 그 언어의 Windows 가 쓰는 이름과 글꼴로 바꿔 적는다.
+_SHELL_NAMES = {
+    "en": ("This PC", "Recycle Bin", "Network"),
+    "ja": ("PC", "ごみ箱", "ネットワーク"),
+}
+_SHELL_FONTS = {"en": "Segoe UI", "ja": "Yu Gothic UI"}
+# 화면 없이 그릴 때는 글꼴을 파일로 등록해야 찾아진다(Windows 의 Fonts 폴더).
+_SHELL_FONT_FILES = {"ja": ("YuGothR.ttc", "YuGothM.ttc")}
+
+
+def shell_items() -> list[tuple[QImage, str]]:
+    """Windows 의 아이콘 그림(256픽셀)과 그 이름. 읽지 못하면 빈 목록."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        shell32, ole32 = ctypes.windll.shell32, ctypes.windll.ole32
+        comctl32, user32 = ctypes.windll.comctl32, ctypes.windll.user32
+    except (ImportError, AttributeError, OSError):
+        return []
+
+    class FileInfo(ctypes.Structure):
+        _fields_ = [("hIcon", wintypes.HANDLE), ("iIcon", ctypes.c_int),
+                    ("dwAttributes", wintypes.DWORD),
+                    ("szDisplayName", wintypes.WCHAR * 260),
+                    ("szTypeName", wintypes.WCHAR * 80)]
+
+    class StockInfo(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("hIcon", wintypes.HANDLE),
+                    ("iSysImageIndex", ctypes.c_int), ("iIcon", ctypes.c_int),
+                    ("szPath", wintypes.WCHAR * 260)]
+
+    class Guid(ctypes.Structure):
+        _fields_ = [("a", wintypes.DWORD), ("b", wintypes.WORD),
+                    ("c", wintypes.WORD), ("d", ctypes.c_ubyte * 8)]
+
+    shell32.SHParseDisplayName.argtypes = [
+        wintypes.LPCWSTR, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+        wintypes.ULONG, ctypes.c_void_p]
+    shell32.SHParseDisplayName.restype = ctypes.c_long
+    shell32.SHGetFileInfoW.argtypes = [
+        ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(FileInfo),
+        wintypes.UINT, wintypes.UINT]
+    shell32.SHGetFileInfoW.restype = ctypes.c_void_p
+    shell32.SHGetStockIconInfo.argtypes = [
+        ctypes.c_int, wintypes.UINT, ctypes.POINTER(StockInfo)]
+    shell32.SHGetStockIconInfo.restype = ctypes.c_long
+    shell32.SHGetImageList.argtypes = [
+        ctypes.c_int, ctypes.POINTER(Guid), ctypes.POINTER(ctypes.c_void_p)]
+    shell32.SHGetImageList.restype = ctypes.c_long
+    comctl32.ImageList_GetIcon.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, wintypes.UINT]
+    comctl32.ImageList_GetIcon.restype = ctypes.c_void_p
+    user32.DestroyIcon.argtypes = [ctypes.c_void_p]
+    ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+
+    ole32.CoInitialize(None)
+    images = ctypes.c_void_p()
+    iid = Guid(0x46EB5926, 0x582E, 0x4017, (ctypes.c_ubyte * 8)(
+        0x9F, 0xDF, 0xE8, 0x99, 0x8D, 0xAA, 0x09, 0x50))      # IImageList
+    if shell32.SHGetImageList(4, ctypes.byref(iid),            # SHIL_JUMBO
+                              ctypes.byref(images)) != 0 or not images:
+        return []
+    out: list[tuple[QImage, str]] = []
+    for parsing_name, stock in _SHELL_ITEMS:
+        pidl = ctypes.c_void_p()
+        if shell32.SHParseDisplayName(parsing_name, None, ctypes.byref(pidl),
+                                      0, None) != 0 or not pidl:
+            continue
+        info = FileInfo()
+        # SHGFI_PIDL | SHGFI_SYSICONINDEX | SHGFI_DISPLAYNAME
+        found = shell32.SHGetFileInfoW(pidl, 0, ctypes.byref(info),
+                                       ctypes.sizeof(info), 0x8 | 0x4000 | 0x200)
+        ole32.CoTaskMemFree(pidl)
+        if not found:
+            continue
+        index = info.iIcon
+        if stock is not None:
+            fixed = StockInfo()
+            fixed.cbSize = ctypes.sizeof(fixed)
+            if shell32.SHGetStockIconInfo(stock, 0x4000,       # SHGSI_SYSICONINDEX
+                                          ctypes.byref(fixed)) == 0:
+                index = fixed.iSysImageIndex
+        handle = comctl32.ImageList_GetIcon(images, index, 0x1)   # ILD_TRANSPARENT
+        if not handle:
+            continue
+        image = QImage.fromHICON(handle)
+        user32.DestroyIcon(handle)
+        if not image.isNull():
+            out.append((image, info.szDisplayName))
+    return out
+
+
+def shell_label_font(lang: str = "ko") -> QFont:
+    """Windows 가 바탕화면 아이콘의 이름에 쓰는 글꼴. ``lang`` 이 이 PC 의 언어가
+    아니면 그 언어의 Windows 가 쓰는 글꼴을 먼저 찾는다."""
+    family, px = "", 12
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class LogFont(ctypes.Structure):
+            _fields_ = ([(n, wintypes.LONG) for n in (
+                "lfHeight", "lfWidth", "lfEscapement", "lfOrientation",
+                "lfWeight")] + [(n, ctypes.c_ubyte) for n in (
+                    "lfItalic", "lfUnderline", "lfStrikeOut", "lfCharSet",
+                    "lfOutPrecision", "lfClipPrecision", "lfQuality",
+                    "lfPitchAndFamily")] + [("lfFaceName", wintypes.WCHAR * 32)])
+
+        lf = LogFont()
+        # SPI_GETICONTITLELOGFONT
+        if ctypes.windll.user32.SystemParametersInfoW(
+                0x001F, ctypes.sizeof(lf), ctypes.byref(lf), 0):
+            family, px = lf.lfFaceName, abs(lf.lfHeight) or 12
+    except (ImportError, AttributeError, OSError):
+        pass
+    # 화면 없이 그릴 때는 등록해 둔 글꼴 이름(영문)으로만 찾아진다.
+    wanted = _SHELL_FONTS.get(lang, "")
+    if wanted and wanted not in QFontDatabase.families():
+        import os
+        from pathlib import Path
+        fonts = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+        for file in _SHELL_FONT_FILES.get(lang, ()):
+            if (fonts / file).exists():
+                QFontDatabase.addApplicationFont(str(fonts / file))
+    known = QFontDatabase.families()
+    for name in (wanted, family, "Malgun Gothic", "Segoe UI"):
+        if name and name in known:
+            family = name
+            break
+    f = QFont(family or QApplication.font().family())
+    f.setPixelSize(px)
+    return f
+
+
+def paint_shell_icon(p: QPainter, cell: QRectF, image: QImage, name: str,
+                     font: QFont, scale: float) -> None:
+    """Windows 의 아이콘 하나를 진짜 바탕화면과 같은 자리에 그린다(그림은 칸의
+    가운데 위쪽, 이름은 그 아래에 흰 글자와 번진 그림자)."""
+    p.save()
+    p.setRenderHint(QPainter.SmoothPixmapTransform)
+    p.drawImage(nf.icon_glyph_rect(cell, nf.ICON_DEFAULT, scale), image)
+    fm = QFontMetricsF(font)
+    area = nf.icon_label_rect(cell, nf.ICON_DEFAULT, font, dpr=scale)
+    p.setFont(font)
+    for i, line in enumerate(nf._wrap_label(name, font, area.width())):
+        rect = QRectF(area.left(), area.top() + i * fm.lineSpacing(),
+                      area.width(), fm.lineSpacing())
+        flags = Qt.AlignHCenter | Qt.AlignVCenter
+        p.setPen(QColor(0, 0, 0, 30))
+        for dx in (-1.0, 0.0, 1.0, 2.0):
+            for dy in (-1.0, 0.0, 1.0, 2.0):
+                p.drawText(rect.translated(dx, dy), flags, line)
+        p.setPen(QColor("#FFFFFF"))
+        p.drawText(rect, flags, line)
+    p.restore()
+
+
+def _desktop(window, harness) -> None:
+    """아이콘으로 접은 메모와 폴더가 Windows 의 아이콘과 한 격자에 놓인 모습.
+
+    칸의 크기와 간격, 그림과 이름의 자리는 앱이 진짜 바탕화면에 맞춰 쓰는 값
+    그대로다(``note_fold`` 의 기본 격자: 아이콘 48, 칸 76x100)."""
+    shell = shell_items()
+    if not shell:
+        print("Windows 의 아이콘을 읽지 못해 desktop-icons.png 는 건너뜁니다.")
+        return
+    lang = getattr(getattr(harness, "ARGS", None), "lang", "ko")
+    names = _SHELL_NAMES.get(lang)
+    if names and len(names) == len(shell):
+        shell = [(image, name) for (image, _own), name in zip(shell, names)]
+    st = window._stickies
+    scale = screen_scale()
+    width, height = 664, 328
+    grid = nf.default_icon_grid(QRect(0, 0, width, height))
+
+    icons = (st["n_lunch"], st["n_info"], st["n_deploy"])
+    homes = {w: w.geometry() for w in icons}
+    for w in icons:
+        w.fold(style=nf.FOLD_ICON)
+    # 열어 둔 폴더 하나(그 메모가 보인다)와 접어 둔 폴더 둘.
+    folders = ("f_work", "f_store", "f_me")
+    for fid in folders:
+        window._place_folder_icon(fid)
+    window._set_folder_opened("f_work", True, animate=False)
+    harness.settle(150)
+
+    def cell(col: int, row: int) -> QRectF:
+        return QRectF(QPointF(grid.pos_of(col, row)), QSizeF(grid.cell))
+
+    c = Canvas(width, height, desktop=True, scale=scale)
+    label_font = shell_label_font(lang)
+    for row, (image, name) in enumerate(shell):
+        paint_shell_icon(c.p, cell(0, row), image, name, label_font, scale)
+    for row, w in enumerate(icons):
+        at = cell(1, row)
+        c.place(grab(w, harness), at.x(), at.y(), shadow=False)
+    for row, fid in enumerate(folders):
+        at = cell(2, row)
+        c.place(grab(window._folder_icons[fid], harness), at.x(), at.y(),
+                shadow=False)
+    c.place(grab(st["n_reply"], harness), 292, 24)
+    harness.save(c.finish(), "desktop-icons")
+
+    for fid in folders:
+        window._remove_folder_icon(fid)
+    for w in icons:
         w.unfold()
         w.set_fold_style(nf.FOLD_SLIP)
         w.setGeometry(homes[w])
@@ -574,13 +816,14 @@ def shoot(window, harness) -> None:
     window._settings.fold_animation = False
     window._users = [harness.HOST, harness.USER_A, harness.USER_B]
     window._refresh_status_text()
+    # 아이콘 이름처럼 작은 글자가 주인공인 그림은 배율 200% 화면으로 찍어야
+    # 소개 페이지에서 또렷하다. 나머지 장면은 100% 화면의 크기로 짜여 있다.
+    if screen_scale() > 1.0:
+        scenes = (_desktop,)
+    else:
+        scenes = (_hero, _links, _icons, _views, _fold, _editing, _together)
     try:
-        _hero(window, harness)
-        _links(window, harness)
-        _icons(window, harness)
-        _views(window, harness)
-        _fold(window, harness)
-        _editing(window, harness)
-        _together(window, harness)
+        for scene in scenes:
+            scene(window, harness)
     finally:
         window._settings.fold_animation = animate

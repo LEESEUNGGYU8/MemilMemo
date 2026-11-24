@@ -1,9 +1,10 @@
 """바탕 화면에 두는 메모 폴더 아이콘.
 
-폴더에 든 메모를 한 아이콘으로 접어 둔다. 두 번 누르면 폴더가 열려 그 폴더의
-메모가 바탕 화면에 나타나고, 다시 두 번 누르면 닫혀 아이콘 하나만 남는다.
-어느 폴더를 아이콘으로 둘지와 열림 상태는 이 PC 에만 저장한다(다른 사람의
-바탕 화면은 바뀌지 않는다).
+폴더에 든 메모를 한 아이콘으로 접어 둔다. 진짜 폴더처럼 한 번 누르면 골라지고
+두 번 누르면 그 폴더의 메모를 보여 주는 창이 열린다. 우클릭 메뉴의 '바탕화면에
+펼치기'를 고르면 그 폴더의 메모가 바탕 화면에 나타나고, 다시 고르면 아이콘 하나만
+남는다. 어느 폴더를 아이콘으로 둘지와 펼침 상태는 이 PC 에만 저장한다(다른
+사람의 바탕 화면은 바뀌지 않는다).
 
 크기와 자리는 진짜 바탕화면 아이콘의 칸을 따른다(note_fold.icon_grid). 이름은
 바탕화면 아이콘처럼 그 자리에서 고친다(F2, 우클릭 메뉴, 새로 만든 직후)."""
@@ -16,9 +17,9 @@ from PySide6.QtCore import QEasingCurve, QPoint, QRect, QRectF, Qt, QVariantAnim
 from PySide6.QtGui import QGuiApplication, QMouseEvent, QPainter
 from PySide6.QtWidgets import QApplication, QLineEdit, QMenu, QWidget
 
-from .. import config, i18n
+from .. import config, desktop_icons, i18n
 from . import note_fold as nf
-from . import dwm
+from . import dwm, edit_menu
 from .theme import COLOR_FOCUS, LIGHT_MENU_QSS
 
 # 폴더 이름의 길이 상한(이름을 그 자리에서 고칠 때).
@@ -78,9 +79,11 @@ class _NameEdit(QLineEdit):
 
 
 class FolderIconWidget(QWidget):
-    toggled = Signal(str)                 # folder_id: 열림/닫힘을 바꿔 달라
+    toggled = Signal(str)                 # folder_id: 바탕화면에 펼침/접음을 바꿔 달라
+    opened = Signal(str)                  # folder_id: 폴더 창을 열어 달라
     moved = Signal(str, int, int)         # folder_id, x, y
     removeRequested = Signal(str)         # folder_id: 아이콘을 치워 달라
+    deleteRequested = Signal(str)         # folder_id: 폴더를 지워 달라
     renamed = Signal(str, str)            # folder_id, 새 이름
 
     def __init__(self, folder_id: str, name: str, color: str, *,
@@ -106,6 +109,11 @@ class FolderIconWidget(QWidget):
         self._slot_resolver = None
         self._slide: QVariantAnimation | None = None
         self._edit: _NameEdit | None = None
+        # 바탕화면 아이콘처럼 고르고 함께 끄는 일을 맡는 곳(ui/icon_select.py).
+        self._icon_ctl = None
+        self._selected = False
+        self._marquee_tint: QRectF | None = None
+        self._origin = QPoint()
         self.setToolTip(self._name)
         self._fit()
 
@@ -138,6 +146,61 @@ class FolderIconWidget(QWidget):
 
     def owner_key(self) -> str:
         return "folder:" + self.folder_id
+
+    # ── 바탕화면 아이콘처럼 고르기(ui/icon_select.py) ──
+
+    def set_icon_controller(self, controller) -> None:
+        self._icon_ctl = controller
+
+    def icon_key(self) -> str:
+        return self.owner_key()
+
+    def set_icon_selected(self, on: bool) -> None:
+        if bool(on) != self._selected:
+            self._selected = bool(on)
+            self.update()
+
+    def set_marquee(self, rect: QRect | None) -> None:
+        """바탕화면에서 끌어 고르는 사각형(화면 좌표). 끝나면 None."""
+        tint = None
+        if rect is not None and self.isVisible():
+            hit = rect.intersected(self.geometry())
+            if not hit.isEmpty():
+                tint = QRectF(hit.translated(-self.pos()))
+        if tint != self._marquee_tint:
+            self._marquee_tint = tint
+            self.update()
+
+    def icon_hit(self, rect: QRect) -> bool:
+        """그 사각형(화면 좌표)이 이 아이콘의 그림이나 이름에 닿는가."""
+        if not self.isVisible():
+            return False
+        local = QRectF(rect.translated(-self.pos()))
+        return any(local.intersects(r) for r in nf.icon_hit_rects(
+            QRectF(self.rect()), self._name, self.font(), self._grid().icon,
+            self.devicePixelRatioF()))
+
+    def place_icon(self, pos: QPoint) -> None:
+        """그 자리에 그대로 놓는다(끌기 전의 자리로 돌려보낼 때)."""
+        self._slide_to(QPoint(pos))
+        self.moved.emit(self.folder_id, pos.x(), pos.y())
+
+    def snap_icon(self) -> QPoint:
+        """지금 있는 곳에서 가장 가까운 빈 칸에 놓는다. 그 자리를 돌려준다."""
+        target = self._snapped(self.pos())
+        self._fit(target + QPoint(8, 8))
+        self._slide_to(target)
+        self.moved.emit(self.folder_id, target.x(), target.y())
+        return target
+
+    def icon_spot(self) -> QPoint:
+        """아이콘이 놓인 자리. 미끄러져 가는 중이면 가서 놓일 자리."""
+        slide = self._slide
+        if slide is not None and slide.state() == QVariantAnimation.Running:
+            end = slide.endValue()
+            if isinstance(end, QPoint):
+                return QPoint(end)
+        return self.pos()
 
     # ── 자리 ────────────────────────────────────────────────────────────
 
@@ -191,7 +254,7 @@ class FolderIconWidget(QWidget):
         anim = QVariantAnimation(self)
         anim.setStartValue(self.pos())
         anim.setEndValue(pos)
-        anim.setDuration(nf.SLIDE_MS)
+        anim.setDuration(nf.anim_ms(nf.SLIDE_MS))
         anim.setEasingCurve(QEasingCurve.OutCubic)
         anim.valueChanged.connect(
             lambda v: self.move(v) if isinstance(v, QPoint) else None)
@@ -257,7 +320,10 @@ class FolderIconWidget(QWidget):
         if event.button() == Qt.LeftButton:
             self._press = event.globalPosition().toPoint()
             self._grab = self._press - self.frameGeometry().topLeft()
+            self._origin = QPoint(self.pos())
             self._dragging = False
+            if self._icon_ctl is not None:
+                self._icon_ctl.pressed(self.icon_key(), event.modifiers())
         event.accept()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
@@ -269,7 +335,13 @@ class FolderIconWidget(QWidget):
                     event.accept()
                     return
                 self._dragging = True
+                if self._icon_ctl is not None:
+                    self._icon_ctl.drag_began(self.icon_key())
             self.move(gp - self._grab)
+            if self._icon_ctl is not None:
+                # 고른 아이콘 여럿 가운데 하나를 끌면 나머지도 함께 움직인다.
+                self._icon_ctl.drag_moved(self.icon_key(),
+                                          self.pos() - self._origin, gp)
         event.accept()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
@@ -278,25 +350,52 @@ class FolderIconWidget(QWidget):
             self._press = None
             self._dragging = False
             if dragged:
-                target = self._snapped(self.pos())
-                self._fit(target + QPoint(8, 8))
-                self._slide_to(target)
-                self.moved.emit(self.folder_id, target.x(), target.y())
+                if (self._icon_ctl is not None and self._icon_ctl.dropped_on_real(
+                        self.icon_key(), event.globalPosition().toPoint())):
+                    # 진짜 바탕화면의 휴지통이나 폴더 위에 놓았다. 제자리로 돌아간다.
+                    target = QPoint(self._origin)
+                    self.place_icon(target)
+                else:
+                    target = self.snap_icon()
+                if self._icon_ctl is not None:
+                    self._icon_ctl.drag_ended(self.icon_key(), True,
+                                              target - self._origin)
+            else:
+                if self._icon_ctl is not None:
+                    self._icon_ctl.clicked(self.icon_key())
+                plain = not (event.modifiers()
+                             & (Qt.ControlModifier | Qt.ShiftModifier))
+                if (plain and self._edit is None
+                        and desktop_icons.single_click_opens()):
+                    # Windows 를 '한 번 클릭해서 열기'로 쓰는 사용자다.
+                    self.opened.emit(self.folder_id)
         event.accept()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.LeftButton and self._edit is None:
             self._press = None
-            self.toggled.emit(self.folder_id)
+            self.opened.emit(self.folder_id)
         event.accept()
+
+    def nativeEvent(self, event_type, message):  # noqa: N802
+        # 바탕화면 아이콘으로 놓인 동안에는 눌려도 키보드를 가져가지 않는다. 진짜
+        # 아이콘과 함께 고를 수 있게 키보드는 바탕화면이 쥐고 있어야 한다.
+        if self._icon_ctl is not None and self._edit is None and nf.is_mouse_activate(message):
+            return True, nf.MA_NOACTIVATE
+        return super().nativeEvent(event_type, message)
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key_F2:
             self.begin_rename()
             event.accept()
             return
+        if (self._icon_ctl is not None and self._edit is None
+                and self._icon_ctl.key(self.icon_key(), event.key(),
+                                       event.modifiers())):
+            event.accept()
+            return
         if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
-            self.toggled.emit(self.folder_id)
+            self.opened.emit(self.folder_id)
             event.accept()
             return
         super().keyPressEvent(event)
@@ -312,8 +411,17 @@ class FolderIconWidget(QWidget):
         super().leaveEvent(event)
 
     def contextMenuEvent(self, event) -> None:
+        # 메뉴는 앞에 나온 창에서 띄워야 다른 곳을 눌렀을 때 닫힌다.
+        self.activateWindow()
+        if (self._icon_ctl is not None
+                and self._icon_ctl.menu(self.icon_key(), event.globalPos())):
+            # 여러 개를 골라 둔 상태다. 고른 것 전체에 쓰는 메뉴가 떴다.
+            event.accept()
+            return
         menu = QMenu(self)
         menu.setStyleSheet(LIGHT_MENU_QSS)
+        window = menu.addAction(i18n.t("icons.menu_open"))
+        window.triggered.connect(lambda: self.opened.emit(self.folder_id))
         toggle = menu.addAction(
             i18n.t("foldericon.menu_close") if self._opened
             else i18n.t("foldericon.menu_open"))
@@ -324,7 +432,10 @@ class FolderIconWidget(QWidget):
         remove = menu.addAction(i18n.t("foldericon.menu_remove"))
         remove.triggered.connect(
             lambda: self.removeRequested.emit(self.folder_id))
-        menu.exec(event.globalPos())
+        delete = menu.addAction(i18n.t("main.menu_folder_delete"))
+        delete.triggered.connect(
+            lambda: self.deleteRequested.emit(self.folder_id))
+        edit_menu.run_menu(menu, event.globalPos())
         event.accept()
 
     # ── 표시 ────────────────────────────────────────────────────────────
@@ -342,5 +453,7 @@ class FolderIconWidget(QWidget):
                              count=self._count,
                              hover=self._hover or self._drop_hover,
                              font=self.font(), icon=self._grid().icon,
-                             label=self._edit is None)
+                             label=self._edit is None,
+                             selected=self._selected,
+                             tint=self._marquee_tint)
         painter.end()

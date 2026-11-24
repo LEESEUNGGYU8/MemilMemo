@@ -93,17 +93,26 @@ def test_icon_faces_paint_and_keep_cell_hittable(qapp):
     # 그림 둘레의 빈 곳도 완전히 투명하지 않아야 마우스가 뒤 창으로 빠지지 않는다.
     assert img.pixelColor(8, 30).alpha() >= 1
 
-    # 마우스를 올려도 둘레에 판을 깔지 않는다. 그림만 밝아진다.
+    # 마우스를 올리면 진짜 바탕화면 아이콘처럼 뒤에 옅은 판이 깔린다. 그림은
+    # 그대로다. 고르면 판이 더 짙어진다.
     plain = img.pixelColor(glyph)
     img.fill(Qt.transparent)
     p = QPainter(img)
     nf.paint_icon(p, cell, "#FFE066", "주간 회의 메모", hover=True,
                   font=qapp.font())
     p.end()
-    assert img.pixelColor(8, 30).alpha() <= 2
-    assert img.pixelColor(2, 2).alpha() <= 2
-    lit = img.pixelColor(glyph)
-    assert lit.alpha() == 255 and lit.lightness() > plain.lightness()
+    hot = img.pixelColor(8, 30).alpha()
+    assert hot > 2
+    assert img.pixelColor(glyph) == plain
+    # 판은 이름의 끝까지만이다. 칸의 맨 아래는 비어 있다.
+    assert img.pixelColor(8, CELL.height() - 2).alpha() <= 2
+
+    img.fill(Qt.transparent)
+    p = QPainter(img)
+    nf.paint_icon(p, cell, "#FFE066", "주간 회의 메모", selected=True,
+                  font=qapp.font())
+    p.end()
+    assert img.pixelColor(8, 30).alpha() > hot
 
     img.fill(Qt.transparent)
     p = QPainter(img)
@@ -371,14 +380,17 @@ def test_folder_icon_widget_signals(qapp):
     icon.show()
     qapp.processEvents()
     toggled: list[str] = []
+    opened: list[str] = []
     moved: list[tuple] = []
     icon.toggled.connect(toggled.append)
+    icon.opened.connect(opened.append)
     icon.moved.connect(lambda *a: moved.append(a))
     assert icon.size() == CELL and icon.toolTip() == "업무"
     QTest.mouseClick(icon, Qt.LeftButton, Qt.NoModifier, QPoint(40, 30))
-    assert toggled == []                      # 한 번 눌러서는 열리지 않는다.
+    assert opened == []                       # 한 번 눌러서는 열리지 않는다.
     _dclick(icon, QPoint(40, 30))
-    assert toggled == ["f1"]
+    # 두 번 누르면 폴더 창이 열린다. 바탕화면에 펼치는 것은 메뉴에서 한다.
+    assert opened == ["f1"] and toggled == []
     icon.set_state(opened=True, count=3)
     assert icon.is_opened()
 

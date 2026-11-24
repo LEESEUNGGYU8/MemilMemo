@@ -30,6 +30,7 @@ from PySide6.QtGui import (
     QTransform,
 )
 
+from . import native_plate
 from .icons import svg_icon
 from .rich_text import data_url_image, is_marker_url
 from .theme import text_color_for_bg
@@ -93,11 +94,49 @@ FOLD_MS = 460
 UNFOLD_MS = 400
 SLIDE_MS = 200
 TAB_HOVER_MS = 140
+FADE_MS = 170
+
+# 움직임의 빠르기(설정의 '움직임 속도'). 2 면 걸리는 시간이 절반이다.
+_animation_speed = 1.0
+
+
+def set_animation_speed(speed) -> None:
+    global _animation_speed
+    try:
+        value = float(speed)
+    except (TypeError, ValueError):
+        value = 1.0
+    _animation_speed = value if 0.1 <= value <= 10.0 else 1.0
+
+
+def animation_speed() -> float:
+    return _animation_speed
+
+
+def anim_ms(ms: int) -> int:
+    """움직임 하나에 걸리는 시간을 지금의 빠르기에 맞춘다."""
+    return max(1, int(round(ms / _animation_speed)))
 
 _A_END = 0.36
 _B_END = 0.68
 # 접히는 면에 드리우는 그늘의 가장 짙은 값(0~255).
 _FLAP_SHADE = 84
+
+
+MA_NOACTIVATE = 3
+_WM_MOUSEACTIVATE = 0x0021
+
+
+def is_mouse_activate(message) -> bool:
+    """창이 받은 메시지가 '마우스로 눌렸으니 앞으로 나올까'를 묻는 것인가
+    (nativeEvent 가 넘겨준 것을 그대로 받는다)."""
+    if platform.system() != "Windows":
+        return False
+    try:
+        from ctypes import wintypes
+        return wintypes.MSG.from_address(int(message)).message == _WM_MOUSEACTIVATE
+    except (TypeError, ValueError, OSError):
+        return False
 
 
 def system_animations_enabled() -> bool:
@@ -720,9 +759,11 @@ def icon_label_rect(cell: QRectF, icon: float | None = None,
 
 def paint_icon_label(p: QPainter, cell: QRectF, text: str,
                      font: QFont | None = None,
-                     icon: float | None = None) -> None:
+                     icon: float | None = None,
+                     ink: QColor | None = None) -> None:
     """아이콘 아래의 이름. 어떤 바탕 화면 위에서도 읽히도록 흰 글자에 어두운
-    테두리 그림자를 두른다(Windows 바탕화면 아이콘 이름과 같은 방식)."""
+    테두리 그림자를 두른다(Windows 바탕화면 아이콘 이름과 같은 방식). ``ink`` 를
+    주면 그 색으로 그림자 없이 그린다(창 안의 밝은 바탕에 놓일 때)."""
     f = icon_label_font(font if font is not None else p.font())
     fm = QFontMetricsF(f)
     area = icon_label_rect(cell, icon, f, dpr=_device_scale(p))
@@ -734,6 +775,10 @@ def paint_icon_label(p: QPainter, cell: QRectF, text: str,
     for i, line in enumerate(lines):
         rect = QRectF(area.left(), area.top() + i * fm.lineSpacing(),
                       area.width(), fm.lineSpacing())
+        if ink is not None:
+            p.setPen(ink)
+            p.drawText(rect, Qt.AlignHCenter | Qt.AlignVCenter, line)
+            continue
         p.setPen(QColor(0, 0, 0, 120))
         for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (0, 2)):
             p.drawText(rect.translated(dx, dy),
@@ -774,37 +819,104 @@ def _paint_glyph(p: QPainter, rect: QRectF, hover: bool, draw) -> None:
     p.drawPixmap(area.topLeft(), layer)
 
 
+def icon_plate_rect(cell: QRectF, text: str, font: QFont | None = None,
+                    icon: float | None = None, dpr: float = 1.0) -> QRectF:
+    """아이콘을 고르거나 마우스를 올렸을 때 깔리는 판의 자리. 진짜 바탕화면
+    아이콘의 항목 자리와 같다: 칸의 폭 그대로, 칸의 위에서 이름의 끝까지."""
+    f = icon_label_font(font)
+    fm = QFontMetricsF(f)
+    area = icon_label_rect(cell, icon, f, dpr=dpr)
+    lines = max(1, len(_wrap_label(text, f, area.width())))
+    bottom = area.top() + lines * fm.lineSpacing() + 2.0 / (dpr or 1.0)
+    return QRectF(cell.left(), cell.top(), cell.width(),
+                  min(cell.height(), bottom - cell.top()))
+
+
+def icon_hit_rects(cell: QRectF, text: str, font: QFont | None = None,
+                   icon: float | None = None, dpr: float = 1.0) -> list[QRectF]:
+    """아이콘이 실제로 차지하는 자리(그림과 이름). 바탕화면에서 끌어 고르는
+    사각형이 여기에 닿으면 고른 것이다(칸 전체가 아니다)."""
+    f = icon_label_font(font)
+    fm = QFontMetricsF(f)
+    area = icon_label_rect(cell, icon, f, dpr=dpr)
+    lines = _wrap_label(text, f, area.width())
+    rects = [icon_glyph_rect(cell, icon, dpr)]
+    if lines:
+        width = min(area.width(), max(fm.horizontalAdvance(ln) for ln in lines) + 4.0)
+        rects.append(QRectF(area.center().x() - width / 2.0, area.top(), width,
+                            len(lines) * fm.lineSpacing()))
+    return rects
+
+
+def _paint_icon_plate(p: QPainter, cell: QRectF, text: str, *, selected: bool,
+                      hover: bool, active: bool, font: QFont | None,
+                      icon: float | None,
+                      theme: str = native_plate.DESKTOP) -> None:
+    if not (selected or hover):
+        return
+    dpr = _device_scale(p)
+    native_plate.paint(
+        p, icon_plate_rect(cell, text, font if font is not None else p.font(),
+                           icon, dpr),
+        native_plate.SELECTED if selected else native_plate.HOT, dpr,
+        # 다른 창을 쓰는 동안에는 고른 표시를 옅게 둔다.
+        opacity=1.0 if (active or not selected) else 0.55, theme=theme)
+
+
+def _paint_marquee_tint(p: QPainter, tint: QRectF | None) -> None:
+    """바탕화면에서 끌어 고르는 사각형이 지나는 자리를 그 색으로 덮는다. 사각형은
+    탐색기가 우리 창의 뒤에 그리므로, 그림 위로 지나가는 부분은 여기서 그린다."""
+    if tint is None or tint.isEmpty():
+        return
+    p.save()
+    p.setCompositionMode(QPainter.CompositionMode_SourceAtop)
+    p.fillRect(tint, QColor(0, 120, 215, 56))
+    p.restore()
+
+
 def paint_icon(p: QPainter, cell: QRectF, color: str, title: str, *,
                private: bool = False, hover: bool = False,
                font: QFont | None = None,
                thumb: QPixmap | None = None,
-               icon: float | None = None) -> None:
+               icon: float | None = None, selected: bool = False,
+               active: bool = True, tint: QRectF | None = None,
+               ink: QColor | None = None) -> None:
     """접힌 메모를 바탕화면 아이콘 모양으로 그린다. ``icon`` 은 그림의 한 변이다
-    (바탕화면 아이콘의 크기)."""
+    (바탕화면 아이콘의 크기). 고르거나 마우스를 올리면 진짜 아이콘처럼 뒤에 판이
+    깔린다. ``ink`` 를 주면 창 안에 놓인 아이콘으로 그린다(이름은 그 색, 판은
+    탐색기 창의 것)."""
     p.save()
     p.setRenderHint(QPainter.Antialiasing)
-    _paint_icon_hit_area(p, cell)
+    if ink is None:
+        _paint_icon_hit_area(p, cell)
+    _paint_icon_plate(p, cell, title, selected=selected, hover=hover,
+                      active=active, font=font, icon=icon,
+                      theme=(native_plate.DESKTOP if ink is None
+                             else native_plate.WINDOW))
     glyph = note_glyph_rect(icon_glyph_rect(cell, icon, _device_scale(p)))
-    _paint_glyph(p, glyph, hover, lambda q: paint_note_glyph(
-        q, glyph, color, private=private, thumb=thumb))
-    paint_icon_label(p, cell, title, font, icon)
+    paint_note_glyph(p, glyph, color, private=private, thumb=thumb)
+    paint_icon_label(p, cell, title, font, icon, ink)
+    _paint_marquee_tint(p, tint)
     p.restore()
 
 
 def paint_folder_icon(p: QPainter, cell: QRectF, color: str, name: str, *,
                       opened: bool = False, count: int = 0,
                       hover: bool = False, font: QFont | None = None,
-                      icon: float | None = None, label: bool = True) -> None:
+                      icon: float | None = None, label: bool = True,
+                      selected: bool = False, active: bool = True,
+                      tint: QRectF | None = None) -> None:
     """메모 폴더를 바탕화면 아이콘 모양으로 그린다. 오른쪽 아래 숫자는 그
     폴더에 든 메모 수다. ``label`` 이 거짓이면 이름을 그리지 않는다(이름을 고치는
     칸이 그 자리에 떠 있을 때)."""
     p.save()
     p.setRenderHint(QPainter.Antialiasing)
     _paint_icon_hit_area(p, cell)
+    _paint_icon_plate(p, cell, name, selected=selected, hover=hover,
+                      active=active, font=font, icon=icon)
     box = icon_glyph_rect(cell, icon, _device_scale(p))
     glyph = folder_glyph_rect(box)
-    _paint_glyph(p, glyph, hover, lambda q: paint_folder_glyph(
-        q, glyph, color, opened=opened))
+    paint_folder_glyph(p, glyph, color, opened=opened)
     # 아주 작은 아이콘에는 숫자를 얹을 자리가 없다(그림을 다 가린다).
     if count > 0 and box.width() >= 24:
         k = max(0.75, min(2.2, box.width() / ICON_DEFAULT))
@@ -825,6 +937,7 @@ def paint_folder_icon(p: QPainter, cell: QRectF, color: str, name: str, *,
         p.drawText(badge, Qt.AlignCenter, text)
     if label:
         paint_icon_label(p, cell, name, font, icon)
+    _paint_marquee_tint(p, tint)
     p.restore()
 
 

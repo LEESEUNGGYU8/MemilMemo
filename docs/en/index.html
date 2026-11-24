@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MemilMemo</title>
+<meta name="description" content="Desktop notes shared across your office PCs. Notes sync inside your local network only, never over the internet.">
+<meta name="theme-color" content="#FFF8DC">
+<meta property="og:type" content="website">
+<meta property="og:title" content="MemilMemo">
+<meta property="og:description" content="Desktop notes shared across your office PCs. Notes sync inside your local network only, never over the internet.">
+<meta property="og:image" content="https://leeseunggyu8.github.io/MemilMemo/images/en/hero.png">
+<meta property="og:url" content="https://leeseunggyu8.github.io/MemilMemo/en/">
+<meta property="og:locale" content="en_US">
+<link rel="canonical" href="https://leeseunggyu8.github.io/MemilMemo/en/">
+<link rel="alternate" hreflang="ko" href="https://leeseunggyu8.github.io/MemilMemo/">
+<link rel="alternate" hreflang="en" href="https://leeseunggyu8.github.io/MemilMemo/en/">
+<link rel="alternate" hreflang="ja" href="https://leeseunggyu8.github.io/MemilMemo/ja/">
+<link rel="alternate" hreflang="x-default" href="https://leeseunggyu8.github.io/MemilMemo/en/">
+<link rel="icon" type="image/png" href="../images/icon-64.png">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css">
+<!-- The look is shared by the three language pages: assets/site.css. -->
+<link rel="stylesheet" href="../assets/site.css">
+<script>document.documentElement.classList.add("js");</script>
+</head>
+<body>
+  <!-- Buttons and the resize grip of the app's note window, used by the cards under "Getting started". -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <symbol id="i-color" viewBox="0 0 18 18"><circle cx="9" cy="9" r="7" fill="var(--memo)" stroke="rgba(0,0,0,0.43)"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2" fill="none"/><path d="M12 7v5l3 2" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></symbol>
+    <symbol id="i-fold" viewBox="0 0 24 24"><path d="M5 7.5h10.5L20.5 12.5V15.5a1.5 1.5 0 0 1-1.5 1.5H5a1.5 1.5 0 0 1-1.5-1.5V9A1.5 1.5 0 0 1 5 7.5z" stroke="currentColor" stroke-width="2" fill="none" stroke-linejoin="round"/><path d="M15.5 7.5v5h5" stroke="currentColor" stroke-width="2" fill="none" stroke-linejoin="round"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.5" fill="currentColor"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/><circle cx="19" cy="12" r="1.5" fill="currentColor"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+    <symbol id="i-grip" viewBox="0 0 22 22"><path d="M17 13l-4 4M17 8.5 8.5 17M17 4 4 17" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2" fill="none"/><path d="M12 11v6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="7.6" r="1.3" fill="currentColor"/></symbol>
+  </svg>
+  <div class="wrap">
+    <header>
+      <a class="brand" href="./" aria-label="MemilMemo home">
+        <img src="../images/icon-64.png" alt="" width="36" height="36">
+        <span>MemilMemo</span>
+      </a>
+      <nav aria-label="Sections">
+        <a href="#features">Features</a>
+        <a href="#faq">FAQ</a>
+        <a href="https://github.com/LEESEUNGGYU8/MemilMemo">GitHub</a>
+      </nav>
+      <nav class="langs" aria-label="Language">
+        <a href="../" lang="ko" hreflang="ko">한국어</a>
+        <a href="./" lang="en" hreflang="en" aria-current="true">English</a>
+        <a href="../ja/" lang="ja" hreflang="ja">日本語</a>
+      </nav>
+    </header>
+
+    <main>
+      <div class="hero">
+        <div>
+          <h1><span class="nb">Desktop notes</span> <span class="nb mark">shared across</span> <span class="nb">your office PCs</span></h1>
+          <p class="lead"><span class="nb">Notes sync inside your local network only,</span> <span class="nb">never over the internet.</span></p>
+          <div class="cta">
+            <a class="download" href="https://github.com/LEESEUNGGYU8/MemilMemo/releases/latest/download/MemilMemo-Setup.exe">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11"/><path d="m7 11 5 5 5-5"/><path d="M5 20h14"/></svg>
+              Download latest version
+            </a>
+            <!-- The badge artwork is Microsoft's, used as given (no recoloring, same proportions). -->
+            <a class="store" href="https://apps.microsoft.com/detail/9MVF2H21PKRJ?referrer=appbadge&amp;mode=full">
+              <img src="https://get.microsoft.com/images/en-us%20dark.svg" width="161" height="44" alt="Get it from Microsoft Store">
+            </a>
+          </div>
+        </div>
+        <div class="vis">
+          <!-- assets/scene.js draws the moving scene here. Its text is at the bottom of this file. -->
+          <figure class="shot" id="scene" role="img" aria-label="Two PCs using the same notes together, then one desktop where notes fold into slips and icons, dock to the screen edge, and drop into a folder">
+            <noscript><img src="../images/en/hero.png" width="1600" height="790" alt="Notes on the desktop and the main window"></noscript>
+          </figure>
+          <ol class="trail" id="trail" aria-hidden="true">
+            <li>Sharing</li>
+            <li>To-do check</li>
+            <li>Fold into a slip</li>
+            <li>Dock to the edge</li>
+            <li>Fold into an icon</li>
+            <li>Drag to select</li>
+            <li>Drop into a folder</li>
+            <li>Unfold</li>
+          </ol>
+        </div>
+      </div>
+
+      <section aria-labelledby="start">
+        <h2 id="start" class="reveal">Getting started</h2>
+        <ol class="steps">
+          <li class="memo reveal">
+            <div class="memo-bar" aria-hidden="true"><svg><use href="#i-color"/></svg><svg><use href="#i-clock"/></svg><svg><use href="#i-fold"/></svg><svg><use href="#i-more"/></svg><svg><use href="#i-close"/></svg></div>
+            <div class="memo-text"><b>Install</b><span>Download the setup file and run it.</span></div>
+            <svg class="memo-grip" aria-hidden="true"><use href="#i-grip"/></svg>
+          </li>
+          <li class="memo reveal" style="--d:.07s">
+            <div class="memo-bar" aria-hidden="true"><svg><use href="#i-color"/></svg><svg><use href="#i-clock"/></svg><svg><use href="#i-fold"/></svg><svg><use href="#i-more"/></svg><svg><use href="#i-close"/></svg></div>
+            <div class="memo-text"><b>Start sharing</b><span>Start sharing on one PC.</span></div>
+            <svg class="memo-grip" aria-hidden="true"><use href="#i-grip"/></svg>
+          </li>
+          <li class="memo reveal" style="--d:.14s">
+            <div class="memo-bar" aria-hidden="true"><svg><use href="#i-color"/></svg><svg><use href="#i-clock"/></svg><svg><use href="#i-fold"/></svg><svg><use href="#i-more"/></svg><svg><use href="#i-close"/></svg></div>
+            <div class="memo-text"><b>Join</b><span>Join from the other PCs with the sharing PC's address.</span></div>
+            <svg class="memo-grip" aria-hidden="true"><use href="#i-grip"/></svg>
+          </li>
+        </ol>
+        <p class="note reveal"><span class="note-face"><svg aria-hidden="true"><use href="#i-info"/></svg><span>If Windows shows "Windows protected your PC", select <b class="nb">More info → Run anyway</b>.</span></span></p>
+      </section>
+
+      <section aria-labelledby="features" id="features-section">
+        <h2 id="features" class="reveal">Key features</h2>
+
+        <div class="feature reveal">
+          <div class="text">
+            <h3>Real-time edit history and restore</h3>
+            <p>Shows who is editing a note, and restores any earlier point from the edit history.</p>
+          </div>
+          <figure class="shot"><img src="../images/en/together.png" width="1700" height="700" loading="lazy" alt="The Participants window, the Edit history window, and a note someone else is editing"></figure>
+        </div>
+
+        <div class="feature flip reveal">
+          <div class="text">
+            <h3>Folding notes and docking to the screen edge</h3>
+            <p>Fold a note into a slip or an icon, and drag it to the screen edge to dock it as a tab. Unfold it and it returns to where it was.</p>
+          </div>
+          <figure class="shot"><img src="../images/en/fold.gif" width="560" height="380" loading="lazy" alt="A note folding into a slip and docking to the screen edge as a tab"></figure>
+        </div>
+
+        <div class="feature reveal">
+          <div class="text">
+            <h3>Folding into desktop icons</h3>
+            <p>Notes and folders folded into icons line up with your other desktop icons, at the same size and spacing.</p>
+          </div>
+          <figure class="shot"><img src="../images/en/desktop-icons.png" width="1328" height="656" loading="lazy" alt="Note icons and folder icons at the same size beside the This PC, Recycle Bin and Network icons, with an open note next to them"></figure>
+        </div>
+
+        <div class="feature flip reveal">
+          <div class="text">
+            <h3>Shortcut links to files and folders</h3>
+            <p>Put files and folders from a shared folder into a note as links, each marked with an icon for its type.</p>
+          </div>
+          <figure class="shot"><img src="../images/en/links.png" width="1120" height="470" loading="lazy" alt="A note with links marked by file type icons, and the link window"></figure>
+        </div>
+
+        <div class="feature reveal">
+          <div class="text">
+            <h3>To-do lists and formatting</h3>
+            <p>Supports checkboxes, bullets, text color, highlighting, and images.</p>
+          </div>
+          <figure class="shot"><img src="../images/en/editing.png" width="1400" height="600" loading="lazy" alt="A note being edited, the formatting menus, and the image viewer"></figure>
+        </div>
+
+        <dl class="more">
+          <div class="reveal"><dt>Folders and search</dt><dd>Sort notes into folders and search their text.</dd></div>
+          <div class="reveal" style="--d:.05s"><dt>Private</dt><dd>Show a note or a folder only to yourself.</dd></div>
+          <div class="reveal" style="--d:.1s"><dt>List views</dt><dd>Choose a list or a grid, in three densities.</dd></div>
+          <div class="reveal"><dt>Automatic backup and restore</dt><dd>Backs up on the schedule you set, and restores from a backup.</dd></div>
+          <div class="reveal" style="--d:.05s"><dt>Quick new notes</dt><dd>Create a note from the desktop right-click menu or the taskbar. Right-click a file to create a note that links to it.</dd></div>
+          <div class="reveal" style="--d:.1s"><dt>Languages</dt><dd>The app is available in Korean, English, and Japanese.</dd></div>
+        </dl>
+      </section>
+
+      <section class="faq" aria-labelledby="faq">
+        <h2 id="faq" class="reveal">Frequently asked questions</h2>
+        <div class="reveal">
+          <details>
+            <summary>Internet connection</summary>
+            <p>MemilMemo does not use the internet for its normal work. An internet connection is needed only to check for new versions and to update.</p>
+          </details>
+          <details>
+            <summary>Where notes are stored</summary>
+            <p>The PC that starts sharing keeps the originals, and each PC that joins keeps a copy of part of the notes. No note data is stored on an outside server.</p>
+          </details>
+          <details>
+            <summary>When the sharing PC is off</summary>
+            <p>The other PCs can still write new notes and edit existing ones, working from their copies. When the sharing PC is back on, they reconnect and sync automatically.</p>
+          </details>
+          <details>
+            <summary>Firewall prompt</summary>
+            <p>On the PC that starts sharing, Windows Firewall may ask whether to allow access. Allow it for private networks.</p>
+          </details>
+          <details>
+            <summary>Cost</summary>
+            <p>MemilMemo is freeware. It has no in-app ads, no paid features, and no requests for payment.</p>
+          </details>
+          <details>
+            <summary>Supported systems</summary>
+            <p>MemilMemo runs on PCs with Windows 10 or 11.</p>
+          </details>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span>MemilMemo</span>
+      <a href="https://github.com/LEESEUNGGYU8/MemilMemo/releases">Release notes</a>
+      <a href="https://github.com/LEESEUNGGYU8/MemilMemo/issues">Support</a>
+      <a href="https://github.com/LEESEUNGGYU8/MemilMemo/blob/main/LICENSE.txt">License</a>
+      <a href="privacy.html">Privacy Policy</a>
+    </footer>
+  </div>
+
+<script>
+// Text shown inside the scene at the top. assets/scene.js draws the shapes and the motion.
+window.MEMIL_SCENE = {
+  me: "Mia", peer: "Leo",
+  pcMe: "Mia's PC", pcPeer: "Leo's PC", lan: "Local network",
+  editing: "Editing", editingBy: "Leo is editing",
+  newNote: "Add New Note", newFolder: "Add New Note Folder",
+  icons: { pc: "This PC", bin: "Recycle Bin", net: "Network", folder: "Work", info: "Office Info" },
+  lunch: {
+    title: "Lunch Orders",
+    lines: ["Sandwich 2 (Mia, Emma)", "Ordering at 11:40"],
+    added: "Pasta 1 (Leo)",
+  },
+  todo: {
+    title: "This Week's To-Do",
+    lines: ["Send out invoices", "Print shipping labels", "File delivery notes", "Order printer toner"],
+  },
+};
+</script>
+<script src="../assets/scene.js" defer></script>
+<script src="../assets/site.js" defer></script>
+</body>
+</html>

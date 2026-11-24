@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from typing import Callable
@@ -25,11 +26,13 @@ from ..protocol import (
     MSG_CREATE_NOTE,
     MSG_DELETE_FOLDER,
     MSG_DELETE_NOTE,
+    MSG_EMPTY_TRASH,
     MSG_ERROR,
     MSG_FOLDER_CREATED,
     MSG_FOLDER_DELETED,
     MSG_FOLDER_UPDATED,
     MSG_GET_HISTORY,
+    MSG_GET_TRASH,
     MSG_HELLO,
     MSG_HISTORY_APPENDED,
     MSG_HISTORY_LIST,
@@ -41,9 +44,13 @@ from ..protocol import (
     MSG_NOTE_DELETED,
     MSG_NOTE_UPDATED,
     MSG_PING,
+    MSG_PURGE_NOTE,
     MSG_RELEASE_LOCK,
+    MSG_RESTORE_NOTE,
     MSG_SET_NOTE_FOLDER,
     MSG_SET_NOTE_PRIVACY,
+    MSG_TRASH_CHANGED,
+    MSG_TRASH_LIST,
     MSG_UPDATE_FOLDER,
     MSG_UPDATE_NOTE,
     MSG_USER_JOINED,
@@ -82,6 +89,9 @@ AUTH_WAIT_MAX_SECONDS = 600
 # 답을 이만큼 보내지 못하고 쌓아 둔 상대의 이력 요청은 받지 않는다. 이력은
 # 통째로 보내므로, 요청만 되풀이해도 공유 PC 의 메모리가 답으로 찬다.
 MAX_QUEUED_REPLY = 8 * 1024 * 1024
+
+# 휴지통에서 보관 기간이 지난 메모를 찾아 지우는 간격.
+TRASH_SWEEP_MS = 60 * 60 * 1000
 
 LocalSubscriber = Callable[[str, dict], None]
 
@@ -128,18 +138,35 @@ class HostServer(QObject):
         self._idle_reap_timer = QTimer(self)
         self._idle_reap_timer.timeout.connect(self._on_idle_reap)
 
+        # 휴지통에서 오래된 메모를 걷어 낸다(켤 때 한 번, 그 뒤로 한 시간마다).
+        self._trash_timer = QTimer(self)
+        self._trash_timer.timeout.connect(self.purge_old_trash)
+
     def start(self, port: int) -> bool:
         if not self._server.listen(QHostAddress.Any, port):
             self.serverError.emit(self._server.errorString())
             return False
         self._heartbeat_timer.start(self.heartbeat_ms)
         self._idle_reap_timer.start(30_000)
+        self._trash_timer.start(TRASH_SWEEP_MS)
+        self.purge_old_trash()
         self.serverStarted.emit(self._server.serverPort())
         return True
+
+    def start_local(self) -> None:
+        """포트를 열지 않고 시작한다(혼자 쓰기). 메모는 공유 PC 처럼 이 PC 에 두고
+        이 PC 의 화면만 붙는다. 다른 PC 는 들어올 수 없다."""
+        self._idle_reap_timer.start(30_000)
+        self._trash_timer.start(TRASH_SWEEP_MS)
+        self.purge_old_trash()
+
+    def is_listening(self) -> bool:
+        return self._server.isListening()
 
     def stop(self) -> None:
         self._heartbeat_timer.stop()
         self._idle_reap_timer.stop()
+        self._trash_timer.stop()
         for sock in list(self._sessions):
             sock.disconnectFromHost()
             sock.deleteLater()
@@ -421,6 +448,14 @@ class HostServer(QObject):
             self._handle_folder_delete(session, d.get("id", ""))
         elif t == MSG_GET_HISTORY:
             self._handle_get_history(session, d.get("note_id"))
+        elif t == MSG_GET_TRASH:
+            self._handle_get_trash(session)
+        elif t == MSG_RESTORE_NOTE:
+            self._handle_restore(session, d.get("id", ""))
+        elif t == MSG_PURGE_NOTE:
+            self._handle_purge(session, d.get("id", ""))
+        elif t == MSG_EMPTY_TRASH:
+            self._handle_empty_trash(session)
 
     def _handle_hello(self, session: _Session, nickname: str,
                       d: dict | None = None) -> None:
@@ -551,6 +586,9 @@ class HostServer(QObject):
             host_id=self.repo.host_id(),
             # 암호가 걸린 공유인가, 그리고 이 공유 PC 도 암호를 안다는 증명.
             locked=self.auth is not None,
+            # 지운 메모를 휴지통에 두는 날 수. 이 값이 없는 공유 PC(옛 버전)는
+            # 휴지통이 없어, 지우면 되살릴 수 없다.
+            trash_days=config.TRASH_KEEP_DAYS,
             **({"auth": proof} if proof else {}),
         ))
 
@@ -695,7 +733,8 @@ class HostServer(QObject):
             self._send_to(session, make(MSG_ERROR, message="not allowed"))
             return
         entry = self.history.record_delete(existing, session.nickname)
-        self.repo.soft_delete_note(note_id, session.nickname)
+        # 지운 메모는 휴지통으로 간다. 옛 버전의 참여자가 지워도 같다.
+        self.repo.trash_note(note_id, session.nickname)
         self.locks.release(note_id, session.nickname)
         self._forget_held(note_id)
         self._broadcast_for_owner(
@@ -703,6 +742,79 @@ class HostServer(QObject):
         self._broadcast_for_owner(
             make(MSG_HISTORY_APPENDED, entry=entry.to_dict()),
             private_owner=owner)
+        self._broadcast(make(MSG_TRASH_CHANGED))
+
+    # ── 휴지통 ──────────────────────────────────────────────────────────
+
+    def _may_touch_trashed(self, session: _Session, note_id) -> Note | None:
+        """그 참가자가 휴지통의 그 메모를 다룰 수 있으면 메모를, 아니면 None.
+        남이 혼자 보던 메모는 휴지통에서도 그 사람만 본다."""
+        if not isinstance(note_id, str) or not self.repo.in_trash(note_id):
+            return None
+        note = self.repo.get_note(note_id)
+        if note is None:
+            return None
+        owner = self._effective_owner_for_note(note)
+        if owner and owner != session.nickname:
+            self._send_to(session, make(MSG_ERROR, message="not allowed"))
+            return None
+        return note
+
+    def _handle_get_trash(self, session: _Session) -> None:
+        if (session.socket is not None
+                and session.socket.bytesToWrite() > MAX_QUEUED_REPLY):
+            return      # 앞서 보낸 답도 아직 받아 가지 않았다
+        items = []
+        for note, deleted_at, deleted_by in self.repo.list_trash():
+            if self._effective_owner_for_note(note) in (None, session.nickname):
+                item = note.to_dict()
+                item["deleted_at"] = deleted_at
+                item["deleted_by"] = deleted_by
+                items.append(item)
+        self._send_to(session, make(MSG_TRASH_LIST, notes=items,
+                                     keep_days=config.TRASH_KEEP_DAYS))
+
+    def _handle_restore(self, session: _Session, note_id) -> None:
+        if self._may_touch_trashed(session, note_id) is None:
+            return
+        note = self.repo.restore_note(note_id, session.nickname)
+        if note is None:
+            return
+        owner = self._effective_owner_for_note(note)
+        entry = self.history.record_restore(note, session.nickname)
+        # 옛 버전의 참여자에게는 새로 생긴 메모로 보인다(같은 id 로 돌아온다).
+        created = make(MSG_NOTE_CREATED, note=note.to_dict())
+        created.data["restored_by"] = session.nickname
+        self._broadcast_for_owner(created, private_owner=owner)
+        appended = make(MSG_HISTORY_APPENDED, entry=entry.to_dict())
+        appended.data["quiet"] = True
+        self._broadcast_for_owner(appended, private_owner=owner)
+        self._broadcast(make(MSG_TRASH_CHANGED))
+
+    def _handle_purge(self, session: _Session, note_id) -> None:
+        if self._may_touch_trashed(session, note_id) is None:
+            return
+        if self.repo.purge_note(note_id):
+            self._broadcast(make(MSG_TRASH_CHANGED))
+
+    def _handle_empty_trash(self, session: _Session) -> None:
+        """그 참가자에게 보이는 휴지통의 메모를 모두 지운다."""
+        changed = False
+        for note, _at, _by in self.repo.list_trash():
+            if self._effective_owner_for_note(note) in (None, session.nickname):
+                changed = self.repo.purge_note(note.id) or changed
+        if changed:
+            self._broadcast(make(MSG_TRASH_CHANGED))
+
+    def purge_old_trash(self) -> None:
+        """보관 기간이 지난 휴지통의 메모를 메모 파일에서 지운다."""
+        cutoff = now_ms() - config.TRASH_KEEP_DAYS * 24 * 60 * 60 * 1000
+        try:
+            gone = self.repo.purge_trash(cutoff)
+        except sqlite3.Error:
+            return          # 파일이 잠겨 있다. 다음 차례에 다시 한다
+        if gone:
+            self._broadcast(make(MSG_TRASH_CHANGED))
 
     def _handle_set_folder(self, session: _Session, note_id: str,
                             folder_id: str | None) -> None:

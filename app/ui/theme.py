@@ -125,6 +125,14 @@ _COLOR_NAMES = {
     "#FFD9A6": lambda: i18n.t("color.orange"),
     "#F5F5F5": lambda: i18n.t("color.white"),
     "#3A3A3A": lambda: i18n.t("color.dark"),
+    "#FFF3B0": lambda: i18n.t("color.cream"),
+    "#FFAD9B": lambda: i18n.t("color.coral"),
+    "#D7F29B": lambda: i18n.t("color.lime"),
+    "#A6E8E0": lambda: i18n.t("color.mint"),
+    "#C4CBFF": lambda: i18n.t("color.periwinkle"),
+    "#E8D5BC": lambda: i18n.t("color.beige"),
+    "#CFD8DC": lambda: i18n.t("color.gray"),
+    "#2E4057": lambda: i18n.t("color.navy"),
 }
 
 

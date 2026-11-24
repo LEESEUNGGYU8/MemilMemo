@@ -7,14 +7,12 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
-    QDoubleSpinBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
     QLayout,
     QLineEdit,
     QPushButton,
-    QSpinBox,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -24,6 +22,7 @@ from .. import config, i18n
 from ..network.discovery import Searcher
 from ..share_auth import clean_password
 from .icons import svg_icon
+from .number_field import DecimalField, IntField, with_unit
 from .password_dialog import password_field
 from .theme import COLOR_FOCUS, COLOR_TEXT_SUBTLE, refresh_style
 
@@ -33,7 +32,7 @@ MAX_FOUND_ROWS = 5
 
 @dataclass
 class ConnectionChoice:
-    mode: str               # 'host' | 'guest'
+    mode: str               # 'host' | 'guest' | 'solo'(공유하지 않고 혼자 쓴다)
     nickname: str
     port: int
     host_ip: str = ""
@@ -157,21 +156,30 @@ class ConnectDialog(QDialog):
                                       i18n.t("connect.role_host_subtitle"))
         self._btn_guest = _RoleButton(i18n.t("connect.role_guest_title"),
                                        i18n.t("connect.role_guest_subtitle"))
+        # 공유하지 않고 혼자 쓴다. 메모는 공유 PC 처럼 이 PC 에 두고 포트는 열지
+        # 않는다. 나중에 설정에서 공유를 시작할 수 있다.
+        self._btn_solo = _RoleButton(i18n.t("connect.role_solo_title"),
+                                     i18n.t("connect.role_solo_subtitle"))
         self._btn_host.setChecked(True)
         self._btn_host.clicked.connect(lambda: self._set_mode(0))
         self._btn_guest.clicked.connect(lambda: self._set_mode(1))
+        self._btn_solo.clicked.connect(lambda: self._set_mode(2))
         # 나란히 두면 영어·일본어에서 글자가 잘렸다. 위아래로 쌓는다.
         root.addWidget(self._btn_host)
         root.addWidget(self._btn_guest)
+        root.addWidget(self._btn_solo)
 
         nick = (last_nickname or "").strip() or default_nickname()
         self._advanced_rows: list[tuple[QFormLayout, QWidget]] = []
         self._mode = 0
         self._host_form = self._build_host_form(nick)
         self._guest_form = self._build_guest_form(nick, last_ip, last_port)
+        self._solo_form = self._build_solo_form(nick)
         root.addWidget(self._host_form)
         root.addWidget(self._guest_form)
+        root.addWidget(self._solo_form)
         self._guest_form.hide()
+        self._solo_form.hide()
 
         # 포트와 연결 확인 주기는 거의 손댈 일이 없다. 접어 둔다.
         self._advanced_btn = QToolButton()
@@ -209,8 +217,12 @@ class ConnectDialog(QDialog):
         self._mode = idx
         self._btn_host.setChecked(idx == 0)
         self._btn_guest.setChecked(idx == 1)
+        self._btn_solo.setChecked(idx == 2)
         self._host_form.setVisible(idx == 0)
         self._guest_form.setVisible(idx == 1)
+        self._solo_form.setVisible(idx == 2)
+        # 혼자 쓸 때는 포트도 연결 확인 주기도 없다.
+        self._advanced_btn.setVisible(idx != 2)
         if idx == 1:
             self._searcher.search()
 
@@ -264,23 +276,18 @@ class ConnectDialog(QDialog):
         form = self._form(w)
         self._host_nickname = QLineEdit(nickname)
         self._host_nickname.setMaxLength(config.MAX_NICKNAME_LENGTH)
-        self._host_port = QSpinBox()
-        self._host_port.setRange(1, 65535)
+        self._host_port = IntField(1, 65535)
         self._host_port.setValue(config.DEFAULT_PORT)
-        # 밀리초가 아니라 초로 적는다(3000 ms → 3초).
-        self._host_heartbeat = QDoubleSpinBox()
-        self._host_heartbeat.setDecimals(1)
-        self._host_heartbeat.setRange(0.5, 60.0)
-        self._host_heartbeat.setSingleStep(0.5)
-        self._host_heartbeat.setSuffix(i18n.t("connect.unit_seconds"))
+        # 밀리초가 아니라 초로 적는다(3000 ms → 3초). 단위는 칸 밖에 적는다.
+        self._host_heartbeat = DecimalField(0.5, 60.0, 0.5)
         self._host_heartbeat.setValue(config.DEFAULT_HEARTBEAT_MS / 1000)
         form.addRow(i18n.t("connect.field_nickname"), self._host_nickname)
         # 비워 두면 비밀번호 없이 공유한다.
         self._host_password = password_field(i18n.t("connect.password_placeholder"))
         form.addRow(i18n.t("connect.field_password"), self._host_password)
         self._add_advanced(form, i18n.t("connect.field_port"), self._host_port)
-        self._add_advanced(form, i18n.t("connect.field_heartbeat"),
-                           self._host_heartbeat)
+        self._add_advanced(form, i18n.t("connect.field_heartbeat"), with_unit(
+            self._host_heartbeat, i18n.t("connect.unit_seconds")))
         return w
 
     def _build_guest_form(self, nickname: str, last_ip: str,
@@ -291,8 +298,7 @@ class ConnectDialog(QDialog):
         self._guest_nickname.setMaxLength(config.MAX_NICKNAME_LENGTH)
         self._guest_ip = QLineEdit(last_ip)
         self._guest_ip.setPlaceholderText(i18n.t("connect.host_ip_placeholder"))
-        self._guest_port = QSpinBox()
-        self._guest_port.setRange(1, 65535)
+        self._guest_port = IntField(1, 65535)
         self._guest_port.setValue(last_port)
         form.addRow(i18n.t("connect.field_nickname"), self._guest_nickname)
         form.addRow(i18n.t("connect.field_host_ip"), self._guest_ip)
@@ -311,8 +317,21 @@ class ConnectDialog(QDialog):
         self._add_advanced(form, i18n.t("connect.field_port"), self._guest_port)
         return w
 
+    def _build_solo_form(self, nickname: str) -> QWidget:
+        w = QWidget()
+        form = self._form(w)
+        self._solo_nickname = QLineEdit(nickname)
+        self._solo_nickname.setMaxLength(config.MAX_NICKNAME_LENGTH)
+        form.addRow(i18n.t("connect.field_nickname"), self._solo_nickname)
+        return w
+
     def accept(self) -> None:
-        if self._mode == 0:
+        if self._mode == 2:
+            nick = (self._solo_nickname.text().strip() or default_nickname()
+                    or "host")
+            self._choice = ConnectionChoice(mode="solo", nickname=nick,
+                                            port=config.DEFAULT_PORT)
+        elif self._mode == 0:
             nick = (self._host_nickname.text().strip() or default_nickname()
                     or "host")
             self._choice = ConnectionChoice(

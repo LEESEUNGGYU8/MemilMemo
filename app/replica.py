@@ -101,7 +101,10 @@ class CopyInfo:
     host_id: str
     note_count: int
     # "copy": 공유 PC 에서 받아 둔 사본. "host": 이 PC 가 공유 PC 였을 때의 메모 파일.
+    # "backup": 공유 PC 의 메모 파일을 떠 둔 백업(백업 폴더의 것이나 사용자가 고른 파일).
     kind: str = "copy"
+    # 사용자가 직접 고르거나 끌어다 놓은 파일인가.
+    picked: bool = False
 
 
 def read_copy(path: Path | str) -> tuple[list[dict[str, Any]], list[dict[str, Any]],
@@ -189,9 +192,66 @@ def read_host_database(path: Path | str, nickname: str
 def read_source(info: CopyInfo, nickname: str = ""
                 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, str]]:
     """목록의 한 줄(``list_copies`` 가 돌려준 것)을 읽는다."""
-    if info.kind == "host":
+    if info.kind in ("host", "backup"):
         return read_host_database(info.path, nickname)
     return read_copy(info.path)
+
+
+def file_kind(path: Path | str) -> str:
+    """그 파일이 무엇인가: "backup"(공유 PC 의 메모 파일이나 그 백업), "copy"(참여한
+    PC 가 받아 둔 사본), 둘 다 아니면 빈 글. 파일은 읽기만 한다."""
+    from .database import _open_readonly, check_database
+
+    path = Path(path)
+    if not path.is_file() or check_database(path):
+        return ""
+    try:
+        conn = _open_readonly(path)
+        try:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(notes)")}
+            tables = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error):
+        return ""
+    if {"id", "content", "color", "version", "deleted"} <= columns:
+        return "backup"
+    if {"id", "data"} <= columns and {"folders", "meta"} <= tables:
+        return "copy"
+    return ""
+
+
+def backup_source(path: Path | str, *, picked: bool = False) -> CopyInfo:
+    """백업 파일 하나를 목록의 한 줄로. 메모는 고를 때 읽는다(개수는 -1)."""
+    from .backup import backup_time
+
+    path = Path(path)
+    return CopyInfo(path=path, current=False,
+                    synced_at=int(backup_time(path) * 1000), host="", nickname="",
+                    host_id="", note_count=-1, kind="backup", picked=picked)
+
+
+def source_from_file(path: Path | str) -> CopyInfo | None:
+    """사용자가 고른 파일을 목록의 한 줄로. 메모 백업도 사본도 아니면 None."""
+    path = Path(path)
+    kind = file_kind(path)
+    if kind == "backup":
+        return backup_source(path, picked=True)
+    if kind != "copy":
+        return None
+    try:
+        notes, _folders, meta = read_copy(path)
+    except (OSError, sqlite3.Error):
+        return None
+    try:
+        synced = int(meta.get("synced_at") or 0)
+    except ValueError:
+        synced = 0
+    return CopyInfo(path=path, current=False, synced_at=synced,
+                    host=meta.get("host", ""), nickname=meta.get("nickname", ""),
+                    host_id=meta.get("host_id", ""), note_count=len(notes),
+                    picked=True)
 
 
 def list_copies(replica_path: Path | str, host_db: Path | str | None = None,
@@ -331,6 +391,48 @@ def build_host_database(copy_path: Path | str, db_path: Path | str,
         repo.set_took_over_from(meta.get("host_id", ""))
     finally:
         repo.close()
+    kept = set_aside(db_path, "before-takeover")
+    os.replace(fresh, db_path)
+    return kept
+
+
+def build_host_database_from_backup(backup_path: Path | str,
+                                    db_path: Path | str) -> Path | None:
+    """백업 파일의 내용으로 공유 PC 의 메모 파일을 새로 만든다(참여하던 PC 가 그
+    백업으로 공유를 시작한다).
+
+    고른 파일을 그대로 쓰지 않는다. 그 내용을 떠서 새 파일을 만든다. 이 PC 에 메모
+    파일이 이미 있으면 지우지 않고 옆으로 옮겨 두고, 그 경로를 돌려준다. 새 파일은
+    다른 메모 묶음으로 알아보게 식별값을 새로 받는다(옛 내용으로 돌아간 것이므로,
+    참여한 PC 들이 가진 더 새로운 사본을 덮어쓰지 않게 한다)."""
+    from .backup import set_aside
+    from .database import SqliteRepository, check_database, snapshot_database
+
+    backup_path, db_path = Path(backup_path), Path(db_path)
+    if file_kind(backup_path) != "backup":
+        raise ValueError("not a backup")
+    fresh = db_path.with_name(db_path.name + ".new")
+    if fresh.exists():
+        fresh.unlink()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        snapshot_database(backup_path, fresh)
+        problem = check_database(fresh)
+        if problem:
+            raise ValueError(problem)
+        # 옛 버전의 백업일 수 있다. 빠진 표와 열을 채우고 식별값을 새로 받는다.
+        repo = SqliteRepository(fresh)
+        try:
+            repo.renew_host_id()
+        finally:
+            repo.close()
+    except Exception:
+        if fresh.exists():
+            try:
+                fresh.unlink()
+            except OSError:
+                pass
+        raise
     kept = set_aside(db_path, "before-takeover")
     os.replace(fresh, db_path)
     return kept

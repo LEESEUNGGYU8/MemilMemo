@@ -50,7 +50,18 @@ CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS trash (
+  note_id    TEXT PRIMARY KEY,
+  deleted_at INTEGER NOT NULL,
+  deleted_by TEXT NOT NULL DEFAULT ''
+);
 """
+# 휴지통은 표를 따로 둔다. notes 에 열을 더하면 옛 버전이 그 파일을 읽다가
+# 죽는다(모르는 열을 Note 에 그대로 넘긴다). 표가 하나 더 있는 것은 옛 버전이
+# 보지 않는다. 휴지통에 든 메모는 notes 에 deleted = 1 로 남아 있고, 이 표에는
+# 언제 누가 버렸는지만 적는다. 이 표에 없는 지운 메모(이 기능이 생기기 전에 지운
+# 것, 옛 버전이 지운 것)는 휴지통에 보이지 않고 저절로 지워지지도 않는다.
 
 # 인덱스를 테이블 생성과 분리해 둔다.
 # 구버전 notes 테이블에는 folder_id 컬럼이 없어,
@@ -290,6 +301,85 @@ class SqliteRepository:
         )
         self._conn.commit()
         return self.get_note(note_id)
+
+    # ── 휴지통 ──────────────────────────────────────────────────────────
+
+    def trash_note(self, note_id: str, user: str) -> Note | None:
+        """메모를 휴지통으로 옮긴다(지운 것으로 표시하고 언제 누가 버렸는지 적는다)."""
+        note = self.soft_delete_note(note_id, user)
+        if note is None:
+            return None
+        self._conn.execute(
+            "INSERT OR REPLACE INTO trash (note_id, deleted_at, deleted_by)"
+            " VALUES (?, ?, ?)", (note_id, now_ms(), user or ""))
+        self._conn.commit()
+        return note
+
+    def list_trash(self) -> list[tuple[Note, int, str]]:
+        """휴지통에 든 메모와 버린 때, 버린 사람(방금 버린 것부터)."""
+        rows = self._conn.execute(
+            "SELECT n.*, t.deleted_at AS trash_at, t.deleted_by AS trash_by"
+            " FROM trash t JOIN notes n ON n.id = t.note_id"
+            " WHERE n.deleted = 1 ORDER BY t.deleted_at DESC").fetchall()
+        out: list[tuple[Note, int, str]] = []
+        for row in rows:
+            data = dict(row)
+            at, by = int(data.pop("trash_at")), str(data.pop("trash_by") or "")
+            out.append((Note(**data), at, by))
+        return out
+
+    def in_trash(self, note_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM trash t JOIN notes n ON n.id = t.note_id"
+            " WHERE t.note_id = ? AND n.deleted = 1", (note_id,)).fetchone()
+        return row is not None
+
+    def restore_note(self, note_id: str, user: str) -> Note | None:
+        """휴지통의 메모를 되살린다. 들어 있던 폴더가 그사이 지워졌으면 미분류로
+        돌아온다."""
+        if not self.in_trash(note_id):
+            return None
+        note = self.get_note(note_id)
+        folder_id = note.folder_id if note is not None else None
+        if folder_id:
+            folder = self.get_folder(folder_id)
+            if folder is None or folder.deleted:
+                folder_id = None
+        self._conn.execute(
+            """UPDATE notes SET deleted = 0, folder_id = ?, updated_by = ?,
+                                updated_at = ?, version = version + 1
+               WHERE id = ? AND deleted = 1""",
+            (folder_id, user, now_ms(), note_id))
+        self._conn.execute("DELETE FROM trash WHERE note_id = ?", (note_id,))
+        self._conn.commit()
+        return self.get_note(note_id)
+
+    def purge_note(self, note_id: str) -> bool:
+        """휴지통의 메모를 메모 파일에서 지운다(이력도 함께). 되돌릴 수 없다.
+
+        휴지통에 든 것만 지운다. 살아 있는 메모는 어떤 경우에도 지우지 않는다."""
+        if not self.in_trash(note_id):
+            return False
+        self._conn.execute(
+            "DELETE FROM note_history WHERE note_id = ?", (note_id,))
+        self._conn.execute(
+            "DELETE FROM notes WHERE id = ? AND deleted = 1", (note_id,))
+        self._conn.execute("DELETE FROM trash WHERE note_id = ?", (note_id,))
+        self._conn.commit()
+        return True
+
+    def purge_trash(self, before_ms: int) -> list[str]:
+        """``before_ms`` 보다 먼저 버린 메모를 메모 파일에서 지운다. 지운 메모의 id."""
+        # 되살아난 메모의 낡은 줄(옛 버전이 이 파일을 쓰는 동안 생길 수 있다)을
+        # 먼저 걷어 낸다. 그런 줄을 믿고 살아 있는 메모를 지우면 안 된다.
+        self._conn.execute(
+            "DELETE FROM trash WHERE note_id NOT IN"
+            " (SELECT id FROM notes WHERE deleted = 1)")
+        self._conn.commit()
+        ids = [str(r[0]) for r in self._conn.execute(
+            "SELECT note_id FROM trash WHERE deleted_at < ?",
+            (int(before_ms),)).fetchall()]
+        return [nid for nid in ids if self.purge_note(nid)]
 
     def set_note_folder(self, note_id: str, folder_id: str | None,
                         user: str) -> Note | None:

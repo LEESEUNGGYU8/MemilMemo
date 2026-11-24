@@ -9,7 +9,7 @@ from . import packaging
 APP_NAME = "SyncNotes"
 # 앱 버전의 단일 출처. 자동 업데이트가 이 값을 GitHub 릴리스 태그와 비교한다.
 # 메밀메모로 이름을 바꾸면서 1.0.0 부터 다시 센다(SyncNotes 는 1.0.7 까지였다).
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 # 닉네임의 길이 상한. 참여한 PC 마다 이 이름을 적어 두므로 끝없이 길면 안 된다.
 MAX_NICKNAME_LENGTH = 64
 
@@ -52,6 +52,9 @@ FONT_PATH_JP = _FONT_DIR / "PretendardJPVariable.ttf"
 FONT_FALLBACK_FAMILY = "Pretendard"
 ICON_PATH = RESOURCE_DIR / "Image" / "Icon.png"
 
+# 메모 색. 앞의 여덟은 처음부터 있던 색이고, 뒤의 여덟은 1.0.4 에서 더했다. 고르는
+# 자리에서는 여덟 칸씩 두 줄로 놓여, 더한 색이 비슷한 옛 색의 바로 아래에 온다
+# (노랑 아래 크림, 검정 아래 남색). 옛 버전은 모르는 색도 그대로 칠한다.
 COLORS = [
     "#FFE066",
     "#FFB3BA",
@@ -61,7 +64,16 @@ COLORS = [
     "#FFD9A6",
     "#F5F5F5",
     "#3A3A3A",
+    "#FFF3B0",
+    "#FFAD9B",
+    "#D7F29B",
+    "#A6E8E0",
+    "#C4CBFF",
+    "#E8D5BC",
+    "#CFD8DC",
+    "#2E4057",
 ]
+COLOR_COLUMNS = 8
 DEFAULT_COLOR = COLORS[0]
 
 DEFAULT_HEARTBEAT_MS = 3000
@@ -86,6 +98,9 @@ RESIZE_GRIP_SIZE = 12
 CORNER_RADIUS = 12
 
 LOCK_IDLE_TIMEOUT_MS = 5 * 60 * 1000
+
+# 지운 메모는 휴지통에 이만큼 두었다가 메모 파일에서 지운다.
+TRASH_KEEP_DAYS = 30
 
 
 def _real_profile() -> str | None:

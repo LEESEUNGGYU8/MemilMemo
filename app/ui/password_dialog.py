@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 
 from .. import i18n
 from ..share_auth import MAX_PASSWORD_LENGTH, clean_password
+from . import confirm
 from .icons import svg_icon
 from .theme import COLOR_TEXT_SUBTLE, refresh_style
 
@@ -123,4 +124,61 @@ def ask(parent: QWidget | None, *, wrong: bool = False, wait: int = 0) -> str | 
     return dialog.password() or None
 
 
-__all__ = ["PasswordDialog", "ask", "password_field"]
+class ShareStartDialog(QDialog):
+    """혼자 쓰던 메모의 공유를 시작한다. 비밀번호는 걸어도 되고 안 걸어도 된다."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle(i18n.t("settings.btn_share_start"))
+        self.setFixedWidth(_WIDTH)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 18, 20, 14)
+        root.setSpacing(10)
+        body = QLabel()
+        body.ensurePolished()
+        # 문장이 끝나는 곳에서 줄을 나눈다(낱말 몇 개만 다음 줄로 넘어가지 않게).
+        body.setText(confirm.break_lines(i18n.t("share.body"), body.font(),
+                                         _WIDTH - 40))
+        root.addWidget(body)
+        self._field = password_field(i18n.t("connect.password_placeholder"))
+        self._field.setAccessibleName(i18n.t("connect.field_password"))
+        line = QHBoxLayout()
+        line.setSpacing(10)
+        line.addWidget(QLabel(i18n.t("connect.field_password")))
+        line.addWidget(self._field, 1)
+        root.addLayout(line)
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        buttons.addStretch(1)
+        ok = QPushButton(i18n.t("copies.takeover_action"))
+        ok.setMinimumWidth(104)
+        ok.setCursor(Qt.PointingHandCursor)
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton(i18n.t("common.btn_cancel"))
+        cancel.setProperty("secondary", True)
+        refresh_style(cancel)
+        cancel.setMinimumWidth(104)
+        cancel.setCursor(Qt.PointingHandCursor)
+        cancel.setAutoDefault(False)
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(ok)
+        buttons.addWidget(cancel)
+        root.addLayout(buttons)
+
+    def password(self) -> str:
+        return clean_password(self._field.text())
+
+
+def ask_share_start(parent: QWidget | None) -> str | None:
+    """공유를 시작할지 묻는다. 시작하면 걸 비밀번호(안 걸면 빈 글), 그만두면 None
+    (시험에서는 이 함수를 바꿔 끼운다)."""
+    dialog = ShareStartDialog(parent)
+    try:
+        return dialog.password() if dialog.exec() == QDialog.Accepted else None
+    finally:
+        dialog.deleteLater()
+
+
+__all__ = ["PasswordDialog", "ShareStartDialog", "ask", "ask_share_start",
+           "password_field"]

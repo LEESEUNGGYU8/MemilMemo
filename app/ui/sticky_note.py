@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import platform
+import re
 from typing import Any
 
 from PySide6.QtCore import (
@@ -44,15 +45,15 @@ from PySide6.QtWidgets import (
     QWidgetAction,
 )
 
-from .. import config, html_guard, i18n
+from .. import config, desktop_icons, html_guard, i18n
 from .. import file_links as fl
 from ..image_export import (
     open_data_url_externally, parse_data_url, sniff_extension,
 )
 from ..settings import IMAGE_VIEWER_SYSTEM
-from . import dwm, edit_menu
+from . import dwm, edit_menu, font_colors
 from . import note_fold as nf
-from .icons import color_swatch_icon, svg_icon
+from .icons import color_swatch_icon, svg_icon, text_color_icon
 from .image_viewer import ImageViewerWindow
 from .link_dialog import LinkDialog, kind_label
 from .link_icons import link_icon
@@ -60,13 +61,10 @@ from .link_open import open_link, reveal_in_folder
 from .menu_item import add_centered_menu_action
 from .note_card import note_title_and_lines
 from .rich_text import (
-    BULLET_ARROW,
-    BULLET_CIRCLE,
     BULLET_CODES,
-    BULLET_INFO,
-    BULLET_SQUARE,
     CHECKBOX_HEIGHT,
     CHECKBOX_WIDTH,
+    LEVEL_PROP,
     LINK_COLOR_DARK,
     LINK_COLOR_LIGHT,
     MARKER_ARROW,
@@ -75,17 +73,21 @@ from .rich_text import (
     MARKER_CIRCLE,
     MARKER_CODES,
     MARKER_INFO,
-    MARKER_MARGIN,
     MARKER_NONE,
+    MARKER_NUMBER,
     MARKER_PROP,
     MARKER_SQUARE,
+    MAX_LEVEL,
+    NUMBER_ANCHOR,
+    SPACING_PROP,
     RichTextEdit,
-    bullet_qicon,
-    checkbox_qicon,
+    copied_format,
     data_url_image,
+    list_menu_icon,
     html_to_plain,
     marker_code_for_url,
     marker_url_for_code,
+    set_copied_format,
     strip_link_icons,
 )
 from .theme import RoundedScrollBar, color_name
@@ -192,16 +194,6 @@ HIGHLIGHT_COLORS = [
     "#D1C4E9",
 ]
 DEFAULT_HIGHLIGHT_COLOR = HIGHLIGHT_COLORS[0]
-
-FONT_COLORS = [
-    "#1F1F1F",
-    "#D64545",
-    "#E8830C",
-    "#1F8A4C",
-    "#1D6FD6",
-    "#7A3FCB",
-    "#C2185B",
-]
 
 
 class _NoteGrip(QSizeGrip):
@@ -472,6 +464,8 @@ class StickyNoteWidget(QWidget):
 
         self._font_color_btn = _make_format_button(
             svg_icon("text_color"), i18n.t("sticky.tip_font_color"))
+        # 단추에 그려 둔 (글자색, 띠의 색). 같으면 다시 그리지 않는다.
+        self._font_icon_state: tuple | None = None
         self._font_color_btn.clicked.connect(self._show_font_color_menu)
 
         self._highlight_btn = _make_format_button(
@@ -481,25 +475,20 @@ class StickyNoteWidget(QWidget):
         self._list_btn = _make_format_button(
             svg_icon("list"), i18n.t("sticky.tip_list"), True)
         self._list_menu = QMenu(self._list_btn)
-        add_centered_menu_action(
-            self._list_menu, bullet_qicon(BULLET_CIRCLE),
-            i18n.t("sticky.menu_circle"),
-            lambda: self._apply_bullet_marker(MARKER_CIRCLE))
-        add_centered_menu_action(
-            self._list_menu, bullet_qicon(BULLET_SQUARE),
-            i18n.t("sticky.menu_square"),
-            lambda: self._apply_bullet_marker(MARKER_SQUARE))
-        add_centered_menu_action(
-            self._list_menu, bullet_qicon(BULLET_ARROW),
-            i18n.t("sticky.menu_arrow"),
-            lambda: self._apply_bullet_marker(MARKER_ARROW))
-        add_centered_menu_action(
-            self._list_menu, bullet_qicon(BULLET_INFO),
-            i18n.t("sticky.menu_info"),
-            lambda: self._apply_bullet_marker(MARKER_INFO))
+        # 네모는 단계에 따라 기호가 바뀌는 기본 목록이다(■ ○ – ·).
+        for code, key in ((MARKER_SQUARE, "sticky.menu_square"),
+                          (MARKER_CIRCLE, "sticky.menu_circle"),
+                          (MARKER_ARROW, "sticky.menu_arrow"),
+                          (MARKER_INFO, "sticky.menu_info")):
+            add_centered_menu_action(
+                self._list_menu, list_menu_icon(code), i18n.t(key),
+                lambda _checked=False, c=code: self._apply_bullet_marker(c))
         self._list_menu.addSeparator()
         add_centered_menu_action(
-            self._list_menu, checkbox_qicon(False),
+            self._list_menu, list_menu_icon(MARKER_NUMBER),
+            i18n.t("sticky.menu_number"), self._apply_number_marker)
+        add_centered_menu_action(
+            self._list_menu, list_menu_icon(MARKER_CHECK0),
             i18n.t("sticky.menu_checkbox"),
             self._apply_checkbox_marker)
         self._list_menu.addSeparator()
@@ -555,6 +544,10 @@ class StickyNoteWidget(QWidget):
         # 링크 위에서 손가락 커서와 말풍선을 보이려면 누르지 않은 움직임도 받아야 한다.
         self._text.viewport().setMouseTracking(True)
         self._link_press: str | None = None
+        # 방금 저절로 목록으로 바뀐 줄의 자리, 그때 쳤던 글자, 바뀐 직후의 문서 판.
+        # 바로 Backspace 를 누르면 그 글자로 되돌린다. 다른 키를 누르거나 그 뒤로
+        # 글이 바뀌었으면(한글은 키 이벤트 없이 들어온다) 되돌리지 않는다.
+        self._auto_list_undo: tuple[int, str, int] | None = None
 
         # 다른 사람이 편집 중인 메모를 고치려다 거절됐을 때 잠깐 뜨는 알림.
         # 예전에는 남이 편집하는 내내 본문을 덮어 읽지도 못하게 했다.
@@ -622,6 +615,13 @@ class StickyNoteWidget(QWidget):
         # 아이콘으로 접힌 메모를 끌 때, 그 아래에 받아 줄 것(메모 폴더 아이콘)이
         # 있는지 묻는 함수와 끌기 시작한 자리.
         self._drop_probe = None
+        # 아이콘으로 접혀 있는 동안 바탕화면 아이콘처럼 고르고 함께 끄는 일을
+        # 맡는 곳(ui/icon_select.py 의 IconController). 없으면 혼자 움직인다.
+        self._icon_ctl = None
+        self._group_drag = False
+        self._icon_selected = False
+        # 바탕화면에서 끌어 고르는 사각형이 이 아이콘 위를 지나는 부분.
+        self._marquee_tint: QRectF | None = None
         self._drag_origin: QPoint | None = None
         # 끄는 동안 벽에 닿아 있는가(붙어 있던 탭을 끌기 시작했으면 처음부터 참).
         self._drag_at_wall = False
@@ -699,9 +699,27 @@ class StickyNoteWidget(QWidget):
             length += 1
         return (code, length)
 
+    @staticmethod
+    def _leading_number(block) -> int:
+        """블록이 번호 표시가 붙은 '1.' 로 시작하면 지울 글자 수(번호와 뒤의 빈칸
+        하나), 아니면 0."""
+        it = block.begin()
+        if it.atEnd():
+            return 0
+        # Qt 는 이름 붙은 앵커를 읽을 때 그 이름을 뒤따르는 글의 첫 글자에만 붙인다.
+        # 그래서 표시는 첫 조각에서 보고, 번호는 줄의 글자에서 읽는다.
+        if NUMBER_ANCHOR not in it.fragment().charFormat().anchorNames():
+            return 0
+        text = block.text()
+        found = re.match(r"\d{1,4}\.", text)
+        if not found:
+            return 0
+        return found.end() + (1 if text[found.end():found.end() + 1] == " " else 0)
+
     def _convert_loaded_markers(self) -> None:
-        """저장본의 인라인 마커 이미지(+뒤 공백)를 블록 마커 속성으로 바꾼다.
-        구버전 인라인 이미지 저장본도 이렇게 현재 모델로 흡수한다."""
+        """저장본을 화면용으로 바꾼다: 줄 앞의 마커 그림(+뒤 공백)과 번호 글자를
+        블록 마커 속성으로, 블록의 들여쓰기 값을 단계로. 구버전 인라인 이미지
+        저장본도 이렇게 현재 모델로 흡수한다."""
         doc = self._text.document()
         positions = []
         block = doc.begin()
@@ -709,14 +727,27 @@ class StickyNoteWidget(QWidget):
             positions.append(block.position())
             block = block.next()
         for pos in reversed(positions):
-            code, length = self._leading_marker(doc.findBlock(pos))
+            block = doc.findBlock(pos)
+            saved_level = block.blockFormat().indent()
+            code, length = self._leading_marker(block)
             if code == MARKER_NONE:
-                continue
+                length = self._leading_number(block)
+                if length:
+                    code = MARKER_NUMBER
             bc = QTextCursor(doc)
-            bc.setPosition(pos)
-            bc.setPosition(pos + length, QTextCursor.KeepAnchor)
-            bc.removeSelectedText()
-            self._set_block_marker(doc.findBlock(pos), code)
+            if code != MARKER_NONE:
+                bc.setPosition(pos)
+                bc.setPosition(pos + length, QTextCursor.KeepAnchor)
+                bc.removeSelectedText()
+                self._text.set_block_marker(doc.findBlock(pos), code, saved_level)
+            if saved_level:
+                # 단계는 따로 적어 두고 Qt 의 들여쓰기(한 단계 40픽셀)는 쓰지 않는다.
+                # 목록이 아닌 줄에 남은 값은 옛 버전에서 목록을 풀며 남긴 것이다.
+                flat = QTextBlockFormat()
+                flat.setIndent(0)
+                bc.setPosition(pos)
+                bc.mergeBlockFormat(flat)
+        self._text.restyle_lists()
 
     def _marker_save_html(self) -> str:
         """블록 마커를 인라인 이미지로 되살린 HTML 을 만든다. 저장 형식은
@@ -725,21 +756,46 @@ class StickyNoteWidget(QWidget):
         clone = self._text.document().clone()
         # 링크 아이콘 자리는 화면용이라 저장하지 않는다(위치 계산 전에 뺀다).
         strip_link_icons(clone)
+        numbers = self._text.list_numbers(clone)
         positions = []
         block = clone.begin()
         while block.isValid():
-            positions.append(
-                (block.position(),
-                 block.blockFormat().intProperty(MARKER_PROP)))
+            bf = block.blockFormat()
+            code = bf.intProperty(MARKER_PROP)
+            level = (max(0, min(MAX_LEVEL, bf.intProperty(LEVEL_PROP)))
+                     if code in MARKER_CODES else 0)
+            positions.append((block.position(), code, level,
+                              numbers.get(block.blockNumber(), 1),
+                              bf.hasProperty(SPACING_PROP)))
             block = block.next()
-        for pos, code in reversed(positions):
+        for pos, code, level, number, spaced in reversed(positions):
             cur = QTextCursor(clone)
             cur.setPosition(pos)
-            # 저장 형식엔 여백 대신 인라인 이미지를 둔다.
-            no_margin = QTextBlockFormat()
-            no_margin.setLeftMargin(0.0)
-            cur.mergeBlockFormat(no_margin)
-            if code in MARKER_CODES:
+            # 저장 형식엔 여백 대신 인라인 이미지를 두고, 단계는 블록의 들여쓰기
+            # 값으로 적는다(옛 버전이 고쳐 저장해도 그 값은 남는다). 서식 사이에
+            # 넣은 위 간격은 화면용이라 뺀다.
+            saved = QTextBlockFormat()
+            saved.setLeftMargin(0.0)
+            saved.setIndent(level)
+            if spaced:
+                saved.setTopMargin(0.0)
+            cur.mergeBlockFormat(saved)
+            if code == MARKER_NUMBER:
+                # 번호는 글자로 적는다. 옛 버전에서는 '1. 내용'으로 보인다.
+                lead = QTextCursor(clone)
+                lead.setPosition(pos)
+                if clone.findBlock(pos).length() > 1:
+                    lead.setPosition(pos + 1)
+                    plain = RichTextEdit._plain_format(lead.charFormat())
+                else:
+                    plain = RichTextEdit._plain_format(lead.blockCharFormat())
+                label = QTextCharFormat(plain)
+                label.setAnchor(True)
+                label.setAnchorNames([NUMBER_ANCHOR])
+                label.setFontUnderline(False)
+                cur.insertText(f"{number}.", label)
+                cur.insertText(" ", plain)
+            elif code in MARKER_CODES:
                 cur.insertImage(self._make_marker_image_format(code))
                 cur.insertText("  ")
         return clone.toHtml()
@@ -1202,37 +1258,119 @@ class StickyNoteWidget(QWidget):
         if self._edit_mode:
             self._commit_and_release()
 
+    def _recent_note_colors(self) -> list[str]:
+        return font_colors.clean_recents(
+            getattr(self._settings, "recent_note_colors", []))
+
+    def _remember_color(self, name: str, color: QColor) -> None:
+        """'다른 색'에서 고른 색을 최근 색으로 남긴다(``name`` 은 설정의 이름)."""
+        settings = self._settings
+        if settings is None or not hasattr(settings, name):
+            return
+        setattr(settings, name, font_colors.remember(
+            font_colors.clean_recents(getattr(settings, name)), color))
+        try:
+            settings.save()
+        except OSError:
+            pass
+
+    def _ask_color(self, title: str, initial: QColor,
+                   recents: list[str]) -> QColor | None:
+        """색 고르는 창을 띄운다. 창이 뜨면 메모가 비활성화된다. 그때 편집이 끝나
+        버리지 않게 막는다."""
+        self._opening_dialog = True
+        try:
+            return font_colors.ask_color(self, title, initial, recents)
+        finally:
+            QTimer.singleShot(0, self._end_opening_dialog)
+
     def _show_color_menu(self) -> None:
         if not self._edit_mode:
             self._request_edit()
             return
+        choice: dict = {}
         menu = QMenu(self)
         container = QWidget(menu)
-        grid = QGridLayout(container)
-        grid.setContentsMargins(6, 6, 6, 6)
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(6, 6, 6, 4)
+        outer.setSpacing(4)
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
         grid.setHorizontalSpacing(6)
         grid.setVerticalSpacing(6)
-        for index, hex_color in enumerate(config.COLORS):
-            r, c = divmod(index, 4)
+        current = (self.color or "").upper()
+
+        def swatch(hex_color: str, tip: str) -> QToolButton:
             btn = QToolButton(container)
             btn.setFixedSize(28, 28)
             btn.setIcon(color_swatch_icon(hex_color, 22))
             btn.setIconSize(QSize(22, 22))
             btn.setCursor(Qt.PointingHandCursor)
             btn.setFocusPolicy(Qt.NoFocus)
-            btn.setToolTip(color_name(hex_color))
+            btn.setToolTip(tip)
+            btn.setAccessibleName(tip)
+            # 지금 메모의 색에는 테두리를 두른다.
+            btn.setCheckable(True)
+            btn.setChecked(hex_color.upper() == current)
             btn.setStyleSheet(
-                "QToolButton { border: none; padding: 2px; border-radius: 6px; background: transparent; }"
+                "QToolButton { border: 2px solid transparent; padding: 1px; "
+                "border-radius: 7px; background: transparent; }"
                 "QToolButton:hover { background: rgba(0,0,0,0.08); }"
+                "QToolButton:checked { border: 2px solid #1F1F1F; }"
             )
             btn.clicked.connect(
-                lambda _checked=False, c=hex_color, m=menu: (self._set_color(c), m.close()))
-            grid.addWidget(btn, r, c)
+                lambda _checked=False, c=hex_color, m=menu:
+                    (choice.update(color=c), m.close()))
+            return btn
+
+        for index, hex_color in enumerate(config.COLORS):
+            grid.addWidget(swatch(hex_color, color_name(hex_color)),
+                           *divmod(index, config.COLOR_COLUMNS))
+        outer.addLayout(grid)
+        # '다른 색'에서 고른 색들.
+        recents = [c for c in self._recent_note_colors()
+                   if c not in config.COLORS][:config.COLOR_COLUMNS]
+        if recents:
+            outer.addWidget(font_colors.caption(i18n.t("sticky.font_color_recent")))
+            line = QHBoxLayout()
+            line.setContentsMargins(0, 0, 0, 0)
+            line.setSpacing(6)
+            for hex_color in recents:
+                line.addWidget(swatch(hex_color, hex_color))
+            line.addStretch(1)
+            outer.addLayout(line)
+        outer.addWidget(font_colors.rule(container))
+        foot = QHBoxLayout()
+        foot.setContentsMargins(0, 0, 0, 0)
+        foot.addStretch(1)
+        more = font_colors.more_button(container)
+        more.clicked.connect(
+            lambda _checked=False, m=menu: (choice.update(more=True), m.close()))
+        foot.addWidget(more)
+        outer.addLayout(foot)
         action = QWidgetAction(menu)
         action.setDefaultWidget(container)
         menu.addAction(action)
-        _wire_swatch_keys(menu, container, columns=4)
-        menu.exec(self._color_btn.mapToGlobal(QPoint(0, self._color_btn.height())))
+        _wire_swatch_keys(menu, container, columns=config.COLOR_COLUMNS)
+        edit_menu.run_menu(
+            menu, self._color_btn.mapToGlobal(QPoint(0, self._color_btn.height())))
+        menu.deleteLater()
+        if choice.get("more"):
+            self._pick_note_color()
+        elif "color" in choice:
+            self._set_color(choice["color"])
+
+    def _pick_note_color(self) -> None:
+        """견본에 없는 메모 색을 고른다. 색상 코드를 쳐 넣을 수도 있다."""
+        if not self._edit_mode:
+            return
+        color = self._ask_color(i18n.t("sticky.tip_color"), QColor(self.color),
+                                self._recent_note_colors())
+        if color is None or not self._edit_mode:
+            return
+        self._set_color(font_colors.code_of(color))
+        if font_colors.code_of(color) not in config.COLORS:
+            self._remember_color("recent_note_colors", color)
 
     def _show_highlight_menu(self) -> None:
         if not self._edit_mode:
@@ -1363,8 +1501,41 @@ class StickyNoteWidget(QWidget):
                 i18n.t("sticky.menu_copy_all"),
                 lambda: QApplication.clipboard().setText(plain),
                 enabled=bool(plain))
+        # 서식 복사: 글자 서식 전체와 글머리 기호를 떠서 다른 메모에도 입힌다.
+        # 뜨는 것은 보기 상태에서도 되고, 입히는 것은 편집 중일 때만 된다.
+        menu.addSeparator()
+        add_centered_menu_action(
+            menu, svg_icon("brush", color=ink), i18n.t("sticky.menu_format_copy"),
+            lambda: self._copy_format(pos))
+        if self._edit_mode:
+            ready = copied_format() is not None
+            add_centered_menu_action(
+                menu, svg_icon("brush", color=ink if ready else "#B0B0B0"),
+                i18n.t("sticky.menu_format_paste"),
+                lambda: self._paste_format(pos), enabled=ready)
         edit_menu.run_menu(menu, global_pos)
         menu.deleteLater()
+
+    def _format_cursor(self, pos: QPoint | None) -> QTextCursor:
+        """서식을 뜨거나 입힐 자리. 고른 글이 있으면 그것, 없으면 누른 자리다."""
+        cursor = self._text.textCursor()
+        if not cursor.hasSelection() and pos is not None:
+            cursor = self._text.cursorForPosition(pos)
+        return cursor
+
+    def _copy_format(self, pos: QPoint | None = None) -> None:
+        set_copied_format(self._text.format_at(self._format_cursor(pos)))
+
+    def _paste_format(self, pos: QPoint | None = None) -> None:
+        clip = copied_format()
+        if clip is None or not self._edit_mode:
+            return
+        self._text.paste_format(clip, self._format_cursor(pos))
+        # 이 메모의 바탕에서 보이지 않는 색이면 읽히는 밝기로 옮기고, 링크의
+        # 밑줄과 색은 링크의 것으로 되돌린다.
+        self._keep_text_readable(join_previous=True)
+        self._text.sync_link_icons(join_previous=True)
+        self._refresh_format_buttons()
 
     def _save_image(self, url: str) -> None:
         """본문의 이미지를 파일로 저장한다."""
@@ -1434,7 +1605,7 @@ class StickyNoteWidget(QWidget):
         self._italic_btn.setIcon(svg_icon("italic", color=fg))
         self._underline_btn.setIcon(svg_icon("underline", color=fg))
         self._strike_btn.setIcon(svg_icon("strike", color=fg))
-        self._font_color_btn.setIcon(svg_icon("text_color", color=fg))
+        self._refresh_font_color_icon()
         self._highlight_btn.setIcon(svg_icon("highlight", color=fg))
         self._list_btn.setIcon(svg_icon("list", color=fg))
         self._image_btn.setIcon(svg_icon("attach", color=fg))
@@ -1517,101 +1688,89 @@ class StickyNoteWidget(QWidget):
         self._apply_highlight(None if already_highlighted
                               else DEFAULT_HIGHLIGHT_COLOR)
 
+    def _recent_inks(self) -> list[str]:
+        return font_colors.clean_recents(
+            getattr(self._settings, "recent_font_colors", []))
+
+    def _font_color_panel(self) -> "font_colors.FontColorPanel":
+        return font_colors.FontColorPanel(
+            QColor(_text_color_for_bg(self.color)), self._current_ink(),
+            self._recent_inks())
+
     def _show_font_color_menu(self) -> None:
         if not self._edit_mode:
             self._request_edit()
             return
+        where = self._font_color_btn.mapToGlobal(
+            QPoint(0, self._font_color_btn.height()))
+        choice: dict = {}
         menu = QMenu(self)
-        container = QWidget(menu)
-        outer = QVBoxLayout(container)
-        outer.setContentsMargins(6, 6, 6, 6)
-        outer.setSpacing(4)
-        grid = QGridLayout()
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(6)
-        grid.setVerticalSpacing(6)
-        for index, hex_color in enumerate(FONT_COLORS):
-            r, c = divmod(index, 4)
-            btn = QToolButton(container)
-            btn.setFixedSize(28, 28)
-            btn.setIcon(color_swatch_icon(hex_color, 22))
-            btn.setIconSize(QSize(22, 22))
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setFocusPolicy(Qt.NoFocus)
-            btn.setStyleSheet(
-                "QToolButton { border: none; padding: 2px; "
-                "border-radius: 6px; background: transparent; }"
-                "QToolButton:hover { background: rgba(0,0,0,0.08); }")
-            btn.clicked.connect(
-                lambda _checked=False, c=hex_color, m=menu:
-                    (self._apply_font_color(c), m.close()))
-            grid.addWidget(btn, r, c)
-        outer.addLayout(grid)
-
-        divider = QFrame(container)
-        divider.setFrameShape(QFrame.HLine)
-        divider.setStyleSheet("color: rgba(0,0,0,0.08);")
-        outer.addWidget(divider)
-
-        default_btn = QToolButton(container)
-        default_btn.setText(i18n.t("sticky.font_color_default"))
-        default_btn.setIcon(color_swatch_icon(_text_color_for_bg(self.color), 18))
-        default_btn.setIconSize(QSize(18, 18))
-        default_btn.setCursor(Qt.PointingHandCursor)
-        default_btn.setFocusPolicy(Qt.NoFocus)
-        default_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        default_btn.setFixedHeight(26)
-        default_btn.setStyleSheet(
-            "QToolButton { border: none; padding: 2px 6px; "
-            "border-radius: 6px; background: transparent; "
-            "color: #1F1F1F; font-size: 12px; text-align: left; }"
-            "QToolButton:hover { background: rgba(0,0,0,0.08); }")
-        default_btn.clicked.connect(
-            lambda _checked=False, m=menu:
-                (self._apply_font_color(None), m.close()))
-        outer.addWidget(default_btn)
-
+        panel = self._font_color_panel()
+        panel.picked.connect(
+            lambda ink, m=menu: (choice.update(ink=ink), m.close()))
+        panel.moreRequested.connect(
+            lambda m=menu: (choice.update(more=True), m.close()))
         action = QWidgetAction(menu)
-        action.setDefaultWidget(container)
+        action.setDefaultWidget(panel)
         menu.addAction(action)
-        _wire_swatch_keys(menu, container, columns=4)
-        menu.exec(self._font_color_btn.mapToGlobal(
-            QPoint(0, self._font_color_btn.height())))
+        menu.aboutToShow.connect(
+            lambda w=panel.first_focus(): QTimer.singleShot(0, w.setFocus))
+        edit_menu.run_menu(menu, where)
+        menu.deleteLater()
+        if choice.get("more"):
+            self._pick_font_color()
+        elif "ink" in choice:
+            self._apply_font_color(choice["ink"])
 
-    def _apply_font_color(self, color: str | None) -> None:
+    def _pick_font_color(self) -> None:
+        """견본에 없는 글자 색을 고른다. 색상 코드를 쳐 넣을 수도 있다. 고른 색은
+        최근 색으로 남는다."""
+        if not self._edit_mode:
+            return
+        start = self._current_ink() or QColor(_text_color_for_bg(self.color))
+        ink = self._ask_color(i18n.t("sticky.tip_font_color"), start,
+                              self._recent_inks())
+        if ink is None or not self._edit_mode:
+            return
+        self._text.setFocus(Qt.OtherFocusReason)
+        self._apply_font_color(ink)
+        if not font_colors.in_palette(ink):
+            self._remember_color("recent_font_colors", ink)
+
+    def _apply_font_color(self, color) -> None:
+        """``None`` 은 기본 색이다. 색을 정해 두지 않은 글자로 돌려, 메모 색을
+        바꾸면 글자도 따라가게 한다(Qt 는 저장 HTML 에서 이를 통째로 생략한다)."""
         if not self._edit_mode:
             return
         fmt = QTextCharFormat()
         if color is None:
-            fmt.setForeground(QBrush(QColor(_text_color_for_bg(self.color))))
+            fmt.setForeground(QBrush(Qt.NoBrush))
         else:
             fmt.setForeground(QBrush(QColor(color)))
         self._merge_char_format(fmt)
+        # 이 바탕에서 보이지 않는 색을 골랐으면 고른 자리에서 바로 읽히는 밝기로
+        # 옮긴다(나중에 메모를 다시 그릴 때 갑자기 바뀌지 않게).
+        self._keep_text_readable(join_previous=True)
         self._refresh_format_buttons()
 
     def _toggle_list(self) -> None:
         if not self._edit_mode:
             return
-        self._apply_bullet_marker(MARKER_CIRCLE)
+        self._apply_bullet_marker(MARKER_SQUARE)
 
     def _marker_code(self, block) -> int:
         return block.blockFormat().intProperty(MARKER_PROP)
 
-    def _set_block_marker(self, block, code: int) -> None:
-        """블록 마커를 설정/해제한다. 마커가 있으면 본문을 마커 폭만큼 들여
-        paintEvent 가 여백에 글리프를 그릴 자리를 비운다. 블록 포맷에 두므로
-        undo 로 되돌릴 수 있고, 줄 분할 시 여백과 함께 상속돼 리스트가
-        자연히 이어진다."""
+    def _set_block_marker(self, block, code: int,
+                          level: int | None = None) -> None:
+        """블록 마커를 설정/해제한다. 마커가 있으면 본문을 기호 칸만큼 들여
+        paintEvent 가 여백에 기호를 그릴 자리를 비운다. 블록 포맷에 두므로
+        undo 로 되돌릴 수 있고, 줄 분할 시 여백·단계와 함께 상속돼 리스트가
+        자연히 이어진다. ``level`` 을 주면 단계도 함께 정한다."""
         if not block.isValid():
             return
-        new_bf = QTextBlockFormat()
-        if code in MARKER_CODES:
-            new_bf.setProperty(MARKER_PROP, code)
-            new_bf.setLeftMargin(MARKER_MARGIN)
-        else:
-            new_bf.setProperty(MARKER_PROP, MARKER_NONE)
-            new_bf.setLeftMargin(0.0)
-        QTextCursor(block).mergeBlockFormat(new_bf)
+        self._text.set_block_marker(block, code, level)
+        self._text.restyle_lists(join_previous=True)
         self._text.viewport().update()
 
     def _strip_block_marker(self, block) -> None:
@@ -1670,6 +1829,37 @@ class StickyNoteWidget(QWidget):
         self._apply_marker_to_selection(
             MARKER_CHECK0,
             is_member=lambda c: c in (MARKER_CHECK0, MARKER_CHECK1))
+
+    def _apply_number_marker(self) -> None:
+        """선택한 줄이 모두 번호 줄이면 제거하고, 아니면 번호 목록으로 만든다."""
+        if not self._edit_mode:
+            return
+        self._apply_marker_to_selection(
+            MARKER_NUMBER, is_member=lambda c: c == MARKER_NUMBER)
+
+    def _change_level(self, delta: int) -> bool:
+        """선택한 목록 줄들을 한 단계 안으로(+1) 또는 밖으로(-1) 옮긴다.
+        목록 줄이 하나도 없으면 False(키를 평소대로 처리하게 한다)."""
+        doc = self._text.document()
+        blocks = [doc.findBlock(pos) for pos in self._selected_block_positions()]
+        items = [b for b in blocks if self._marker_code(b) in MARKER_CODES]
+        if not items:
+            return False
+        cursor = self._text.textCursor()
+        cursor.beginEditBlock()
+        try:
+            for block in items:
+                level = self._text.block_level(block)
+                target = max(0, min(MAX_LEVEL, level + delta))
+                if target != level:
+                    self._text.set_block_marker(
+                        doc.findBlock(block.position()),
+                        self._marker_code(block), target)
+            self._text.restyle_lists()
+        finally:
+            cursor.endEditBlock()
+        self._text.viewport().update()
+        return True
 
     def _remove_list_markers(self) -> None:
         if not self._edit_mode:
@@ -1732,6 +1922,7 @@ class StickyNoteWidget(QWidget):
         if not block.isValid() or not block.next().isValid():
             return
         code = self._marker_code(block)
+        level = self._text.block_level(block)
         snap = QTextCursor(doc)
         snap.setPosition(block.position())
         snap.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
@@ -1746,7 +1937,7 @@ class StickyNoteWidget(QWidget):
         end.movePosition(QTextCursor.End)
         end.insertBlock()
         end.insertFragment(fragment)
-        self._set_block_marker(end.block(), code)
+        self._set_block_marker(end.block(), code, level)
         # 다음 키 입력이 방금 체크한 줄의 편집을 이어가도록 커서를 옮긴다.
         self._text.setTextCursor(end)
 
@@ -1760,6 +1951,23 @@ class StickyNoteWidget(QWidget):
         self._strike_btn.setChecked(current.fontStrikeOut())
         self._list_btn.setChecked(
             self._marker_code(self._text.textCursor().block()) in MARKER_CODES)
+        self._refresh_font_color_icon()
+
+    def _current_ink(self) -> QColor | None:
+        """커서가 있는 글자에 따로 정해 둔 색. 기본 색이면 None."""
+        fmt = self._text.currentCharFormat()
+        if not fmt.hasProperty(QTextFormat.ForegroundBrush):
+            return None
+        return font_colors.explicit_ink(fmt)
+
+    def _refresh_font_color_icon(self) -> None:
+        """글자 색 단추 아래의 띠를 지금 글자의 색으로 칠한다."""
+        fg = _text_color_for_bg(self.color)
+        ink = self._current_ink() if self._edit_mode else None
+        bar = ink.name() if ink is not None else fg
+        if (fg, bar) != self._font_icon_state:
+            self._font_icon_state = (fg, bar)
+            self._font_color_btn.setIcon(text_color_icon(fg, bar))
 
     def _show_attach_menu(self) -> None:
         if not self._edit_mode:
@@ -1909,12 +2117,16 @@ class StickyNoteWidget(QWidget):
             if event.key() == Qt.Key_Escape and self._edit_mode:
                 self._commit_and_release()
                 return True
+            if self._edit_mode and self._handle_list_key(event):
+                return True
             # Shift/Ctrl+Enter 는 자동 글머리 없이 soft break·명시적
             # 커밋을 할 수 있도록 기본 동작에 맡긴다.
             if (event.key() in (Qt.Key_Return, Qt.Key_Enter)
                     and self._edit_mode
                     and not (event.modifiers() &
                               (Qt.ShiftModifier | Qt.ControlModifier))):
+                # 방금 친 주소는 줄을 바꾸기 전에 링크로 만든다.
+                self._text.linkify_before_cursor()
                 if self._handle_marker_enter():
                     return True
         return super().eventFilter(obj, event)
@@ -2003,6 +2215,79 @@ class StickyNoteWidget(QWidget):
     def _on_image_viewer_destroyed(self, *_args) -> None:
         self._image_viewer = None
 
+    # 줄 맨 앞에서 치고 빈칸을 띄우면 목록으로 바뀌는 글자.
+    _AUTO_LISTS = {"-": MARKER_SQUARE, "[]": MARKER_CHECK0, "[ ]": MARKER_CHECK0}
+
+    def _handle_list_key(self, event) -> bool:
+        """편집 중의 키 가운데 목록과 링크에 딸린 것을 처리한다. 처리했으면 True."""
+        key = event.key()
+        mods = event.modifiers() & (Qt.ShiftModifier | Qt.ControlModifier
+                                    | Qt.AltModifier | Qt.MetaModifier)
+        undo, self._auto_list_undo = self._auto_list_undo, None
+        cursor = self._text.textCursor()
+        if key == Qt.Key_Tab and not mods:
+            return self._change_level(+1)
+        if key == Qt.Key_Backtab and mods in (Qt.ShiftModifier, Qt.NoModifier):
+            return self._change_level(-1)
+        if key == Qt.Key_Backspace and not mods and not cursor.hasSelection():
+            block = cursor.block()
+            if cursor.position() != block.position():
+                return False
+            code = self._marker_code(block)
+            if code not in MARKER_CODES:
+                return False
+            if (undo is not None and undo[0] == block.position()
+                    and undo[2] == self._text.document().revision()):
+                # 방금 저절로 바뀐 목록: 쳤던 글자로 되돌린다.
+                cursor.beginEditBlock()
+                try:
+                    self._set_block_marker(block, MARKER_NONE)
+                    cursor.insertText(undo[1])
+                finally:
+                    cursor.endEditBlock()
+                self._text.setTextCursor(cursor)
+            elif self._text.block_level(block) > 0:
+                self._set_block_marker(block, code,
+                                       self._text.block_level(block) - 1)
+            else:
+                self._set_block_marker(block, MARKER_NONE)
+            self._refresh_format_buttons()
+            return True
+        if key == Qt.Key_Space and not mods and not cursor.hasSelection():
+            if self._auto_list(cursor):
+                return True
+            # 방금 친 주소를 링크로 만들고, 빈칸은 평소대로 들어가게 둔다.
+            self._text.linkify_before_cursor()
+        return False
+
+    def _auto_list(self, cursor: QTextCursor) -> bool:
+        """글 줄의 맨 앞에서 '-', '[]', '1.' 을 치고 빈칸을 누르면 목록으로 바꾼다."""
+        block = cursor.block()
+        if self._marker_code(block) in MARKER_CODES:
+            return False
+        typed = block.text()[:cursor.position() - block.position()]
+        code = self._AUTO_LISTS.get(typed)
+        if code is None:
+            found = re.fullmatch(r"(\d{1,3})\.", typed)
+            # 이 줄이 받게 될 번호를 쳤을 때만 바꾼다('1.', 또는 앞 번호의 다음 수).
+            if not found or int(found.group(1)) != self._text.next_number_for(block):
+                return False
+            code = MARKER_NUMBER
+        cursor.beginEditBlock()
+        try:
+            cursor.setPosition(block.position())
+            cursor.setPosition(block.position() + len(typed), QTextCursor.KeepAnchor)
+            cursor.removeSelectedText()
+            self._set_block_marker(cursor.block(), code, 0)
+        finally:
+            cursor.endEditBlock()
+        self._text.setTextCursor(cursor)
+        # 바로 Backspace 를 누르면 쳤던 글자(빈칸까지)로 돌아간다.
+        self._auto_list_undo = (cursor.block().position(), typed + " ",
+                                self._text.document().revision())
+        self._refresh_format_buttons()
+        return True
+
     def _handle_marker_enter(self) -> bool:
         """마커만 있는 빈 줄에서 Enter 면 마커를 없애 리스트를 끝낸다.
         체크박스는 다음 줄을 '미체크'로 잇는다. 글머리는 기본 Enter 가 새 블록
@@ -2015,7 +2300,12 @@ class StickyNoteWidget(QWidget):
         if code not in MARKER_CODES:
             return False
         if not block.text().strip():
-            self._set_block_marker(block, MARKER_NONE)
+            # 딸린 줄이면 한 단계 밖으로, 1단계 줄이면 목록을 끝낸다.
+            level = self._text.block_level(block)
+            if level > 0:
+                self._set_block_marker(block, code, level - 1)
+            else:
+                self._set_block_marker(block, MARKER_NONE)
             self._refresh_format_buttons()
             return True
         if code in (MARKER_CHECK0, MARKER_CHECK1):
@@ -2041,6 +2331,8 @@ class StickyNoteWidget(QWidget):
                 self._slip_grab = (self._slip_press
                                    - self.frameGeometry().topLeft())
                 self._slip_dragging = False
+                if self._icon_ctl is not None and self.is_desktop_icon():
+                    self._icon_ctl.pressed(self.icon_key(), event.modifiers())
             event.accept()
             return
         if (event.button() == Qt.LeftButton
@@ -2084,8 +2376,16 @@ class StickyNoteWidget(QWidget):
                     self._end_slip_drag()
                 elif not self._icon_mode():
                     # 쪽지와 탭은 한 번 누르면 펴진다. 아이콘 모양은 바탕화면
-                    # 아이콘처럼 두 번 눌러야 펴진다.
+                    # 아이콘처럼 한 번 누르면 골라지고 두 번 눌러야 펴진다.
                     self.unfold()
+                else:
+                    if self._icon_ctl is not None:
+                        self._icon_ctl.clicked(self.icon_key())
+                    plain = not (event.modifiers()
+                                 & (Qt.ControlModifier | Qt.ShiftModifier))
+                    if plain and desktop_icons.single_click_opens():
+                        # Windows 를 '한 번 클릭해서 열기'로 쓰는 사용자다.
+                        self.unfold()
             event.accept()
             return
         if self._drag_offset is not None:
@@ -2111,6 +2411,9 @@ class StickyNoteWidget(QWidget):
                 and event.button() == Qt.LeftButton):
             self._slip_press = None
             self.unfold()
+            # 아이콘은 눌려도 앞으로 나오지 않는다. 펴는 메모는 앞으로 부른다.
+            self.raise_()
+            self.activateWindow()
             event.accept()
             return
         # 메모 위쪽 줄을 두 번 누르면 접는다(창 제목 줄을 두 번 누르는 것과 같은 자리).
@@ -2124,7 +2427,19 @@ class StickyNoteWidget(QWidget):
             return
         super().mouseDoubleClickEvent(event)
 
+    def nativeEvent(self, event_type, message):  # noqa: N802
+        # 바탕화면 아이콘으로 놓인 동안에는 눌려도 키보드를 가져가지 않는다. 진짜
+        # 아이콘과 함께 고를 수 있게 키보드는 바탕화면이 쥐고 있어야 한다.
+        if self._icon_ctl is not None and self.is_desktop_icon() and nf.is_mouse_activate(message):
+            return True, nf.MA_NOACTIVATE
+        return super().nativeEvent(event_type, message)
+
     def keyPressEvent(self, event) -> None:
+        if (self._icon_ctl is not None and self.is_desktop_icon()
+                and self._icon_ctl.key(self.icon_key(), event.key(),
+                                       event.modifiers())):
+            event.accept()
+            return
         if (self._folded and not self._fold_busy()
                 and event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space)):
             self.unfold()
@@ -2165,6 +2480,14 @@ class StickyNoteWidget(QWidget):
         if not self._folded or self._fold_busy():
             super().contextMenuEvent(event)
             return
+        if self._icon_ctl is not None and self.is_desktop_icon():
+            # 메뉴는 앞에 나온 창에서 띄워야 다른 곳을 눌렀을 때 닫힌다.
+            self.activateWindow()
+        if (self._icon_ctl is not None and self.is_desktop_icon()
+                and self._icon_ctl.menu(self.icon_key(), event.globalPos())):
+            # 여러 개를 골라 둔 상태다. 고른 것 전체에 쓰는 메뉴가 떴다.
+            event.accept()
+            return
         menu = edit_menu.new_menu(self)
         ink = "#3A3A3A"
         add_centered_menu_action(
@@ -2186,6 +2509,9 @@ class StickyNoteWidget(QWidget):
         add_centered_menu_action(
             menu, svg_icon("eye_off", color=ink), i18n.t("sticky.more_hide"),
             lambda: self.hideRequested.emit(self.note_id))
+        add_centered_menu_action(
+            menu, svg_icon("trash", color=ink), i18n.t("common.btn_delete"),
+            lambda: self.deleteRequested.emit(self.note_id))
         edit_menu.run_menu(menu, event.globalPos())
         menu.deleteLater()
         event.accept()
@@ -2317,6 +2643,51 @@ class StickyNoteWidget(QWidget):
                       else self._open_pos) + QPoint(8, 8)
         return nf.icon_grid(self._screen_rect_at(at))
 
+    # ── 바탕화면 아이콘처럼 고르기(ui/icon_select.py) ──
+
+    def set_icon_controller(self, controller) -> None:
+        self._icon_ctl = controller
+
+    def icon_key(self) -> str:
+        return "note:" + self.note_id
+
+    def is_desktop_icon(self) -> bool:
+        """지금 바탕화면 아이콘 모양으로 놓여 있는가."""
+        return (self._folded and not self._dock and not self._fold_busy()
+                and self._icon_mode())
+
+    def set_icon_selected(self, on: bool) -> None:
+        if bool(on) != self._icon_selected:
+            self._icon_selected = bool(on)
+            self.update()
+
+    def set_marquee(self, rect: QRect | None) -> None:
+        """바탕화면에서 끌어 고르는 사각형(화면 좌표). 끝나면 None."""
+        tint = None
+        if rect is not None and self.isVisible() and self.is_desktop_icon():
+            hit = rect.intersected(self.geometry())
+            if not hit.isEmpty():
+                tint = QRectF(hit.translated(-self.pos()))
+        if tint != self._marquee_tint:
+            self._marquee_tint = tint
+            self.update()
+
+    def icon_hit(self, rect: QRect) -> bool:
+        """그 사각형(화면 좌표)이 이 아이콘의 그림이나 이름에 닿는가."""
+        if not self.isVisible() or not self.is_desktop_icon():
+            return False
+        local = QRectF(rect.translated(-self.pos()))
+        return any(local.intersects(r) for r in nf.icon_hit_rects(
+            QRectF(self.rect()), self._title(), self.font(),
+            self._icon_grid().icon, self.devicePixelRatioF()))
+
+    def place_icon(self, pos: QPoint) -> None:
+        self.move_icon(QPoint(pos))
+
+    def snap_icon(self) -> None:
+        """지금 있는 곳에서 가장 가까운 빈 칸에 놓는다."""
+        self.move_icon(self._resolve_icon_pos(self.pos()))
+
     def wants_icon_spot(self) -> bool:
         """아이콘 모양으로 접혀 있거나, 접으면 아이콘이 될 자리를 가진 메모인가."""
         return (not self._dock and self._style_pref() == nf.FOLD_ICON
@@ -2325,6 +2696,8 @@ class StickyNoteWidget(QWidget):
     def icon_spot(self) -> QPoint:
         """아이콘이 놓인(놓일) 자리."""
         if self._folded and not self._dock and not self._fold_busy():
+            if self._geo_anim is not None and self._fold_at:
+                return QPoint(self._fold_pos)       # 그리로 미끄러져 가는 중이다
             return self.pos()
         return QPoint(self._fold_pos if self._fold_at else self._open_pos)
 
@@ -2413,7 +2786,7 @@ class StickyNoteWidget(QWidget):
         anim = QVariantAnimation(self)
         anim.setStartValue(float(start))
         anim.setEndValue(float(end))
-        anim.setDuration(170)
+        anim.setDuration(nf.anim_ms(nf.FADE_MS))
         anim.valueChanged.connect(lambda v: self.setWindowOpacity(float(v)))
 
         def finished() -> None:
@@ -2747,6 +3120,11 @@ class StickyNoteWidget(QWidget):
         self._slip_dragging = True
         self._drag_origin = None if self._dock else QPoint(self.pos())
         self._drag_at_wall = bool(self._dock)
+        # 고른 아이콘 여럿 가운데 하나를 끌면 나머지도 함께 움직인다.
+        self._group_drag = (self._icon_ctl is not None and not self._dock
+                            and self._icon_mode())
+        if self._group_drag:
+            self._icon_ctl.drag_began(self.icon_key())
         cur = self.size()
         target = self._face_size()
         if cur != target:
@@ -2786,6 +3164,17 @@ class StickyNoteWidget(QWidget):
         self._drag_dock = side
         self.setGeometry(rect)
         self.update()
+        if self._group_drag and self._drag_origin is not None:
+            self._icon_ctl.drag_moved(self.icon_key(),
+                                      rect.topLeft() - self._drag_origin, gp)
+
+    def _end_group_drag(self, moved: bool) -> None:
+        if self._group_drag:
+            self._group_drag = False
+            delta = None
+            if moved and self._drag_origin is not None and self._fold_at:
+                delta = self._fold_pos - self._drag_origin
+            self._icon_ctl.drag_ended(self.icon_key(), moved, delta)
 
     def _end_slip_drag(self) -> None:
         side = self._drag_dock
@@ -2797,13 +3186,21 @@ class StickyNoteWidget(QWidget):
                 along = self._tab_along(side, self._drag_cursor)
             self._dock_to(side, along, QRect(self._drag_avail))
             self._slide_to(self._tab_rect(self._slip_hover))
+            # 벽에 탭으로 붙었다. 함께 끌던 아이콘은 제자리로 돌려보낸다.
+            self._end_group_drag(False)
         else:
             was_docked, self._dock = bool(self._dock), nf.DOCK_NONE
             pos = self.pos()
             if self._icon_mode():
-                if self._probe_drop(self._drag_cursor, True):
+                took = self._probe_drop(self._drag_cursor, True)
+                if not took and self._group_drag:
+                    # 진짜 바탕화면의 휴지통이나 폴더 아이콘 위에 놓았는가.
+                    took = self._icon_ctl.dropped_on_real(
+                        self.icon_key(), self._drag_cursor)
+                if took:
                     # 메모 폴더 아이콘 위에 놓았다(그 폴더로 들어갔다). 아이콘은
-                    # 끌기 전의 자리로 돌아간다.
+                    # 끌기 전의 자리로 돌아간다. Windows 휴지통에 놓았을 때도
+                    # 같다(메모는 곧 메모 휴지통으로 간다).
                     back = self._drag_origin
                     if back is None or was_docked:
                         back = self._resolve_icon_pos(pos)
@@ -2814,6 +3211,7 @@ class StickyNoteWidget(QWidget):
                     self._refresh_face_tip()
                     self.update()
                     self._emit_fold_state()
+                    self._end_group_drag(True)
                     return
                 # 바탕화면 아이콘처럼 격자에 맞추고, 다른 아이콘과 겹치면 비켜 놓는다.
                 pos = self._resolve_icon_pos(pos)
@@ -2824,6 +3222,7 @@ class StickyNoteWidget(QWidget):
         self._refresh_face_tip()
         self.update()
         self._emit_fold_state()
+        self._end_group_drag(True)
 
     def _refresh_face_tip(self) -> None:
         """아이콘과 위아래 탭은 제목이 잘릴 수 있어 말풍선으로 전체를 보인다."""
@@ -2886,7 +3285,7 @@ class StickyNoteWidget(QWidget):
         anim = QVariantAnimation(self)
         anim.setStartValue(float(start))
         anim.setEndValue(float(end))
-        anim.setDuration(int(ms))
+        anim.setDuration(nf.anim_ms(ms))
         anim.valueChanged.connect(self._on_fold_tick)
         anim.finished.connect(self._on_fold_anim_finished)
         self._fold_anim = anim
@@ -2927,7 +3326,7 @@ class StickyNoteWidget(QWidget):
         anim = QVariantAnimation(self)
         anim.setStartValue(self.geometry())
         anim.setEndValue(rect)
-        anim.setDuration(int(ms))
+        anim.setDuration(nf.anim_ms(ms))
         anim.setEasingCurve(QEasingCurve.OutCubic)
         anim.valueChanged.connect(self._on_geo_tick)
         anim.finished.connect(self._on_geo_finished)
@@ -3115,6 +3514,11 @@ class StickyNoteWidget(QWidget):
                 self._fold_pos = rect.topLeft()
                 self.setGeometry(rect)
                 self._emit_fold_state()
+        elif (self._folded and self._fold_at and self._icon_mode()
+              and not self._fold_busy() and self.pos() != self._fold_pos):
+            # 감춰진 동안 옮긴 자리(폴더에 넣느라 끌려갔다가 돌아온 아이콘)는
+            # 창에 닿지 않았을 수 있다. 다시 나타날 때 적어 둔 자리에 놓는다.
+            self.move(self._fold_pos)
         # 가장자리에 붙은 탭은 다른 창 위에, 나머지는 바탕 화면 쪽(맨 아래)에 둔다.
         self._apply_z_order(initial=True)
 
@@ -3156,7 +3560,9 @@ class StickyNoteWidget(QWidget):
                               self._title(), private=bool(self.private_owner),
                               hover=self._slip_hover, font=self.font(),
                               thumb=self._fold_thumb(),
-                              icon=self._icon_grid().icon)
+                              icon=self._icon_grid().icon,
+                              selected=self._icon_selected,
+                              tint=self._marquee_tint)
             else:
                 nf.paint_slip(painter, QRectF(self.rect()), self.color,
                               self._title(), dock=dock,

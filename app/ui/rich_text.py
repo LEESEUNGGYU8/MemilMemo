@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -19,6 +21,7 @@ from PySide6.QtGui import (
     QBrush,
     QColor,
     QFont,
+    QFontInfo,
     QFontMetricsF,
     QIcon,
     QImage,
@@ -28,6 +31,8 @@ from PySide6.QtGui import (
     QPainterPath,
     QPen,
     QPixmap,
+    QSyntaxHighlighter,
+    QTextBlockFormat,
     QTextCharFormat,
     QTextCursor,
     QTextDocument,
@@ -38,6 +43,7 @@ from PySide6.QtWidgets import QLabel, QTextEdit
 
 from .. import config, html_guard
 from .. import file_links as fl
+from . import font_colors
 from .link_icons import link_icon_pixmap
 from .safe_text import SafeTextDocument, is_plain_raster
 
@@ -344,9 +350,169 @@ MARKER_ARROW = 3
 MARKER_INFO = 4
 MARKER_CHECK0 = 5
 MARKER_CHECK1 = 6
-MARKER_CODES = frozenset({1, 2, 3, 4, 5, 6})
+MARKER_NUMBER = 7
+MARKER_CODES = frozenset({1, 2, 3, 4, 5, 6, 7})
 BULLET_CODES = frozenset({1, 2, 3, 4})
+CHECK_CODES = frozenset({MARKER_CHECK0, MARKER_CHECK1})
+# 옛 버전이 쓰던 고정 여백. 지금은 글자 크기에 맞춰 잰다(marker_column).
 MARKER_MARGIN = float(CHECKBOX_WIDTH + 7)
+
+# 목록의 단계(0~3). 블록 포맷의 커스텀 속성에 두고, 저장할 때는 블록의
+# 들여쓰기 값(-qt-block-indent)으로 적는다. 옛 버전은 그 값을 그대로 물려 저장하므로
+# 옛 버전이 고쳐 저장해도 단계가 남는다(왼쪽 여백으로 적으면 옛 버전이 읽는 순간 지운다).
+LEVEL_PROP = QTextFormat.UserProperty + 3
+MAX_LEVEL = 3
+# Tab 한 번에 들어가는 폭(글자 크기에 대한 비율). 한글 한 글자의 절반이다.
+LEVEL_STEP = 0.5
+# 이 편집기가 서식 사이에 넣은 위 간격(px). 화면에만 쓰고 저장할 때 뺀다.
+SPACING_PROP = QTextFormat.UserProperty + 4
+
+# 번호 목록은 줄 앞에 '1. ' 을 글자로 적어 저장하고, 번호 글자에 이 이름의
+# 앵커를 붙여 번호 목록임을 표시한다. 옛 버전에는 보통 글자로 보이고, 앵커가 있으면
+# 옛 버전이 늘 HTML 로 저장하므로 번호와 단계가 함께 남는다.
+NUMBER_ANCHOR = "memil-num"
+
+# 서식 사이의 간격(기본 글자 크기에 대한 비율). 앞 줄과 이 줄의 종류로 정한다.
+# 글과 글 사이, 빈 줄의 앞뒤에는 넣지 않는다.
+GAP_IMAGE = 0.45        # 그림의 위와 아래
+GAP_LIST_START = 0.32   # 글 다음에 목록이 시작될 때
+GAP_LIST_END = 0.45     # 목록 다음에 글이 올 때
+GAP_ITEM = 0.14         # 목록의 줄과 줄
+GAP_GROUP = 0.34        # 딸린 줄들 다음에 오는 1단계 줄
+
+(SHAPE_DOT, SHAPE_RING, SHAPE_DASH, SHAPE_MIDDOT, SHAPE_SQUARE, SHAPE_ARROW,
+ SHAPE_INFO) = range(1, 8)
+# 네모 목록은 단계에 따라 기호가 바뀐다(■ ○ – ·). 나머지 기호는 그대로다.
+OUTLINE_SHAPES = (SHAPE_SQUARE, SHAPE_RING, SHAPE_DASH, SHAPE_MIDDOT)
+
+
+def marker_column(em: float) -> float:
+    """기호가 들어가는 칸의 폭(px). 글자 크기를 따른다."""
+    return float(max(18, round(em * 1.62)))
+
+
+def marker_shape(code: int, level: int) -> int:
+    if code == MARKER_SQUARE:
+        return OUTLINE_SHAPES[max(0, min(level, len(OUTLINE_SHAPES) - 1))]
+    return {MARKER_CIRCLE: SHAPE_DOT, MARKER_ARROW: SHAPE_ARROW,
+            MARKER_INFO: SHAPE_INFO}.get(code, 0)
+
+
+def marker_ink(light: bool) -> QColor:
+    return QColor("#F2F2F2") if light else QColor("#2F2F2F")
+
+
+def draw_marker_shape(p: QPainter, shape: int, cx: float, cy: float, em: float,
+                      ink: QColor) -> None:
+    """글머리 기호를 도형으로 그린다. 그림을 늘려 그리지 않으므로 글자 크기와
+    화면 배율이 달라도 또렷하다."""
+    p.save()
+    p.setRenderHint(QPainter.Antialiasing, True)
+    if shape == SHAPE_DOT:
+        r = max(2.4, em * 0.205)
+        p.setPen(Qt.NoPen)
+        p.setBrush(ink)
+        p.drawEllipse(QPointF(cx, cy), r, r)
+    elif shape == SHAPE_RING:
+        w = max(1.2, em * 0.088)
+        r = max(2.4, em * 0.205) - w / 2
+        p.setPen(QPen(ink, w))
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(QPointF(cx, cy), r, r)
+    elif shape == SHAPE_DASH:
+        w = max(1.3, em * 0.095)
+        half = max(2.6, em * 0.215)
+        p.setPen(QPen(ink, w, Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(QPointF(cx - half, cy), QPointF(cx + half, cy))
+    elif shape == SHAPE_MIDDOT:
+        r = max(1.5, em * 0.115)
+        p.setPen(Qt.NoPen)
+        p.setBrush(ink)
+        p.drawEllipse(QPointF(cx, cy), r, r)
+    elif shape == SHAPE_SQUARE:
+        s = max(5.0, em * 0.42)
+        p.setPen(Qt.NoPen)
+        p.setBrush(ink)
+        p.drawRoundedRect(QRectF(cx - s / 2, cy - s / 2, s, s),
+                          em * 0.07, em * 0.07)
+    elif shape == SHAPE_ARROW:
+        w = max(1.4, em * 0.115)
+        hw, hh = em * 0.17, em * 0.27
+        p.setPen(QPen(ink, w, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.setBrush(Qt.NoBrush)
+        path = QPainterPath(QPointF(cx - hw, cy - hh))
+        path.lineTo(QPointF(cx + hw, cy))
+        path.lineTo(QPointF(cx - hw, cy + hh))
+        p.drawPath(path)
+    elif shape == SHAPE_INFO:
+        r = em * 0.37
+        p.setPen(QPen(ink, max(1.2, em * 0.093)))
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(QPointF(cx, cy), r, r)
+        p.setPen(Qt.NoPen)
+        p.setBrush(ink)
+        dot = max(0.8, em * 0.058)
+        p.drawEllipse(QPointF(cx, cy - em * 0.155), dot, dot)
+        stem_w, stem_h = max(1.2, em * 0.087), em * 0.215
+        p.drawRoundedRect(QRectF(cx - stem_w / 2, cy - em * 0.04, stem_w, stem_h),
+                          em * 0.04, em * 0.04)
+    p.restore()
+
+
+def draw_checkbox(p: QPainter, checked: bool, cx: float, cy: float, em: float,
+                  light: bool) -> None:
+    """할 일의 상자를 글자 크기에 맞춰 그린다."""
+    side = max(11.0, em * 0.88)
+    rect = QRectF(cx - side / 2, cy - side / 2, side, side)
+    radius = side * 0.27
+    ink = marker_ink(light)
+    p.save()
+    p.setRenderHint(QPainter.Antialiasing, True)
+    if checked:
+        p.setPen(Qt.NoPen)
+        p.setBrush(ink)
+        p.drawRoundedRect(rect, radius, radius)
+        p.setPen(QPen(QColor("#2F2F2F") if light else QColor("#FFFFFF"),
+                      max(1.6, side * 0.135), Qt.SolidLine, Qt.RoundCap,
+                      Qt.RoundJoin))
+        x0, y0 = rect.left(), rect.top()
+        path = QPainterPath(QPointF(x0 + side * 0.25, y0 + side * 0.53))
+        path.lineTo(QPointF(x0 + side * 0.43, y0 + side * 0.71))
+        path.lineTo(QPointF(x0 + side * 0.76, y0 + side * 0.31))
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(path)
+    else:
+        w = max(1.4, side * 0.11)
+        p.setPen(QPen(QColor("#D0D0D0") if light else QColor("#5C5C5C"), w))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(rect.adjusted(w / 2, w / 2, -w / 2, -w / 2),
+                          radius, radius)
+    p.restore()
+
+
+def list_menu_icon(code: int) -> QIcon:
+    """목록 메뉴에 넣을 16픽셀 아이콘. 배율이 높은 화면용 그림도 함께 넣는다."""
+    icon = QIcon()
+    for dpr in (1.0, 2.0):
+        pix = QPixmap(int(16 * dpr), int(16 * dpr))
+        pix.setDevicePixelRatio(dpr)
+        pix.fill(Qt.transparent)
+        p = QPainter(pix)
+        if code == MARKER_NUMBER:
+            font = QFont(p.font())
+            font.setPixelSize(12)
+            font.setBold(True)
+            p.setFont(font)
+            p.setPen(marker_ink(False))
+            p.drawText(QRectF(0, 0, 16, 16), Qt.AlignCenter, "1.")
+        elif code in CHECK_CODES:
+            draw_checkbox(p, code == MARKER_CHECK1, 8, 8, 15.0, False)
+        else:
+            draw_marker_shape(p, marker_shape(code, 0), 8, 8, 17.0,
+                              marker_ink(False))
+        p.end()
+        icon.addPixmap(pix)
+    return icon
 
 _CODE_TO_BULLET = {
     MARKER_CIRCLE: BULLET_CIRCLE, MARKER_SQUARE: BULLET_SQUARE,
@@ -434,6 +600,33 @@ def contrast_ratio(a: QColor, b: QColor) -> float:
 # 이보다 낮으면 글자가 사실상 보이지 않는다. 사용자가 고른 옅은 색(2~4:1)까지
 # 바꾸지는 않는다.
 MIN_READABLE_CONTRAST = 2.0
+
+
+@dataclass(frozen=True)
+class CopiedFormat:
+    """'서식 복사'로 떠 둔 것: 글자 서식 전체와 그 줄의 글머리 기호."""
+    bold: bool = False
+    italic: bool = False
+    underline: bool = False
+    strike: bool = False
+    size: float = 0.0           # 0 이면 기본 크기
+    ink: str = ""               # 빈 글이면 기본 색
+    highlight: str = ""         # 빈 글이면 형광펜 없음
+    marker: int = 0             # 목록이 아니면 MARKER_NONE
+    level: int = 0
+
+
+# 떠 둔 서식은 메모끼리 옮길 수 있게 프로그램 하나에 한 벌만 둔다(끄면 사라진다).
+_copied_format: CopiedFormat | None = None
+
+
+def copied_format() -> CopiedFormat | None:
+    return _copied_format
+
+
+def set_copied_format(value: CopiedFormat | None) -> None:
+    global _copied_format
+    _copied_format = value
 
 
 def marker_url_for_code(code: int) -> str | None:
@@ -614,6 +807,56 @@ class _MarkerAwareDocument(SafeTextDocument):
         return super().loadResource(resource_type, name)
 
 
+class _DoneHighlighter(QSyntaxHighlighter):
+    """끝낸 할 일의 글자를 흐리게 하고 줄을 긋는다. 화면에만 입히는 서식이라
+    문서(저장 내용, 되돌리기)는 바뀌지 않는다."""
+
+    def __init__(self, document: QTextDocument):
+        super().__init__(document)
+        self._light = False
+
+    def set_light(self, light: bool) -> None:
+        if bool(light) != self._light:
+            self._light = bool(light)
+            self.rehighlight()
+
+    def highlightBlock(self, text: str) -> None:  # noqa: N802
+        if not text:
+            return
+        block = self.currentBlock()
+        if block.blockFormat().intProperty(MARKER_PROP) != MARKER_CHECK1:
+            return
+        ink = QColor("#FFFFFF") if self._light else QColor("#1F1F1F")
+        ink.setAlphaF(0.46)
+        fmt = QTextCharFormat()
+        fmt.setForeground(ink)
+        fmt.setFontStrikeOut(True)
+        self.setFormat(0, len(text), fmt)
+
+
+# 치거나 붙여 넣으면 링크로 바꾸는 주소의 머리, 주소 끝에서 떼어 내는 문장 부호.
+_AUTO_LINK_HEADS = ("http://", "https://", "www.", "file:")
+_AUTO_LINK_TAIL = ".,;:!?)]}>'\"」』）"
+_WORD = re.compile(r"\S+")
+
+
+def auto_link_target(word: str) -> tuple[str, str] | None:
+    """``word`` 가 웹 주소나 file: 주소면 ``(링크로 삼을 글자, href)``."""
+    if not word.lower().startswith(_AUTO_LINK_HEADS):
+        return None
+    text = word.rstrip(_AUTO_LINK_TAIL)
+    href = fl.parse_target(text)
+    if not href or not fl.is_supported(href):
+        return None
+    if fl.is_web(href):
+        from urllib.parse import urlsplit
+        if not urlsplit(href).netloc.strip("."):
+            return None                     # 'http://' 처럼 머리만 있는 것
+    elif len(fl.href_to_path(href) or "") < 3:
+        return None
+    return text, href
+
+
 class RichTextEdit(QTextEdit):
     imageInserted = Signal()
 
@@ -635,6 +878,9 @@ class RichTextEdit(QTextEdit):
         self._link_syncing = False
         self._link_sync_pending = False
         self._undo_cmd_added = False
+        # 목록의 여백과 서식 사이 간격을 맞추는 중인가(restyle_lists).
+        self._restyling = False
+        self._done = _DoneHighlighter(self.document())
         self.document().undoCommandAdded.connect(self._on_undo_command_added)
         self.cursorPositionChanged.connect(self._leave_link_format_at_edges)
 
@@ -770,7 +1016,13 @@ class RichTextEdit(QTextEdit):
             cursor.beginEditBlock()
             try:
                 if has_text:
+                    start = cursor.selectionStart()
                     cursor.insertText(text)
+                    end = cursor.position()
+                    added = self.linkify_range(start, end)
+                    if added:
+                        cursor.setPosition(end + added)
+                        self.setTextCursor(cursor)
                 if has_image:
                     if has_text:
                         cursor.insertText("\n")
@@ -1044,6 +1296,122 @@ class RichTextEdit(QTextEdit):
         if light != self._marker_light:
             self._marker_light = light
             self.viewport().update()
+        self._done.set_light(light)
+
+    # ── 서식 복사 ────────────────────────────────────────────────────────
+
+    def format_at(self, cursor: QTextCursor) -> CopiedFormat:
+        """그 자리 글자의 서식과 그 줄의 글머리 기호. 고른 글이 있으면 그 첫 글자,
+        없으면 커서 바로 뒤의 글자를 본다. 링크의 밑줄과 색은 링크의 것이라
+        서식으로 치지 않는다."""
+        doc = self.document()
+        probe = QTextCursor(cursor)
+        if probe.hasSelection():
+            start, end = probe.selectionStart(), probe.selectionEnd()
+            probe.setPosition(min(start + 1, end))
+        else:
+            block = probe.block()
+            if probe.position() < block.position() + block.length() - 1:
+                probe.setPosition(probe.position() + 1)
+        fmt = probe.charFormat()
+        if fmt.isImageFormat() or fmt.hasProperty(LINK_ICON_PROP):
+            fmt = QTextCharFormat()
+        link = fmt.isAnchor()
+        ink = fmt.foreground()
+        mark = fmt.background()
+        block = doc.findBlock(probe.position())
+        code = block.blockFormat().intProperty(MARKER_PROP)
+        if code == MARKER_CHECK1:
+            code = MARKER_CHECK0            # 끝낸 표시는 서식이 아니다
+        return CopiedFormat(
+            bold=fmt.fontWeight() > QFont.Normal,
+            italic=fmt.fontItalic(),
+            underline=fmt.fontUnderline() and not link,
+            strike=fmt.fontStrikeOut(),
+            size=float(fmt.fontPointSize() or 0.0),
+            ink=(ink.color().name() if not link and ink.style() != Qt.NoBrush
+                 and fmt.hasProperty(QTextFormat.ForegroundBrush) else ""),
+            highlight=(mark.color().name() if mark.style() != Qt.NoBrush
+                       and mark.color().alpha() > 0 else ""),
+            marker=code if code in MARKER_CODES else MARKER_NONE,
+            level=self.block_level(block))
+
+    @staticmethod
+    def _dressed(fmt: QTextCharFormat, clip: CopiedFormat) -> QTextCharFormat:
+        """``fmt`` 의 글자 서식을 떠 둔 서식으로 바꾼 것. 링크는 링크로 남는다."""
+        out = QTextCharFormat(fmt)
+        out.setFontWeight(QFont.Bold if clip.bold else QFont.Normal)
+        out.setFontItalic(clip.italic)
+        out.setFontStrikeOut(clip.strike)
+        if clip.size > 0:
+            out.setFontPointSize(clip.size)
+        else:
+            out.clearProperty(QTextFormat.FontPointSize)
+            out.clearProperty(QTextFormat.FontPixelSize)
+        if clip.highlight:
+            out.setBackground(QBrush(QColor(clip.highlight)))
+        else:
+            out.clearBackground()
+        if not fmt.isAnchor():
+            out.setFontUnderline(clip.underline)
+            if clip.ink:
+                out.setForeground(QBrush(QColor(clip.ink)))
+            else:
+                out.clearForeground()
+        return out
+
+    def paste_format(self, clip: CopiedFormat, cursor: QTextCursor) -> None:
+        """떠 둔 서식을 고른 글에 입힌다. 고른 글이 없으면 커서가 놓인 낱말에
+        입힌다. 글머리 기호는 떠 둔 줄이 목록이었을 때만 그 줄들에 입힌다(목록이
+        아닌 줄에서 뜬 서식이 있던 글머리 기호를 지우지 않는다). 되돌리기 한 번에
+        함께 돌아간다."""
+        doc = self.document()
+        target = QTextCursor(cursor)
+        if not target.hasSelection():
+            target.select(QTextCursor.WordUnderCursor)
+        start, end = target.selectionStart(), target.selectionEnd()
+        spots: list[tuple[int, int, QTextCharFormat]] = []
+        block = doc.findBlock(start)
+        while block.isValid() and block.position() <= end:
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                it += 1
+                if not frag.isValid():
+                    continue
+                a = max(start, frag.position())
+                b = min(end, frag.position() + frag.length())
+                fmt = frag.charFormat()
+                if a < b and not fmt.isImageFormat() \
+                        and not fmt.hasProperty(LINK_ICON_PROP):
+                    spots.append((a, b, fmt))
+            block = block.next()
+        edit = QTextCursor(doc)
+        edit.beginEditBlock()
+        try:
+            for a, b, fmt in spots:
+                edit.setPosition(a)
+                edit.setPosition(b, QTextCursor.KeepAnchor)
+                edit.setCharFormat(self._dressed(fmt, clip))
+            if clip.marker in MARKER_CODES:
+                first, last = doc.findBlock(start), doc.findBlock(end)
+                positions = []
+                block = first
+                while block.isValid():
+                    positions.append(block.position())
+                    if block.position() >= last.position():
+                        break
+                    block = block.next()
+                for position in positions:
+                    self.set_block_marker(doc.findBlock(position), clip.marker,
+                                          clip.level)
+                self.restyle_lists(join_previous=False)
+        finally:
+            edit.endEditBlock()
+        if not spots:
+            # 빈 줄이다. 이제부터 치는 글자가 그 서식을 갖게 한다.
+            self.setCurrentCharFormat(self._dressed(self.currentCharFormat(), clip))
+        self.viewport().update()
 
     def ensure_readable(self, note_bg: QColor, default_fg: QColor,
                         join_previous: bool = False) -> bool:
@@ -1071,15 +1439,21 @@ class RichTextEdit(QTextEdit):
                 brush = fmt.background()
                 marked = (brush.style() != Qt.NoBrush
                           and brush.color().alpha() > 0)
-                explicit = fmt.hasProperty(QTextFormat.ForegroundBrush)
+                # 글자 색을 '기본 색'으로 돌려 둔 것은 색을 정한 것이 아니다.
+                explicit = (fmt.hasProperty(QTextFormat.ForegroundBrush)
+                            and fmt.foreground().style() != Qt.NoBrush)
                 if not (marked or explicit):
                     continue
                 bg = brush.color() if marked else note_bg
                 fg = fmt.foreground().color() if explicit else default_fg
                 if contrast_ratio(fg, bg) >= MIN_READABLE_CONTRAST:
                     continue
-                better = (dark if contrast_ratio(dark, bg)
-                          >= contrast_ratio(white, bg) else white)
+                if explicit:
+                    # 색을 정해 둔 글자는 같은 색조에서 읽히는 밝기로 옮긴다.
+                    better = font_colors.rescue(fg, bg)
+                else:
+                    better = (dark if contrast_ratio(dark, bg)
+                              >= contrast_ratio(white, bg) else white)
                 fixes.append((frag.position(), frag.length(), better))
             block = block.next()
         if not fixes:
@@ -1236,6 +1610,8 @@ class RichTextEdit(QTextEdit):
             return
         self._undo_cmd_added = False
         self.sync_link_icons(join_previous=True)
+        # 줄이 생기거나 글자 크기가 바뀌면 목록의 여백과 간격도 달라진다.
+        self.restyle_lists(join_previous=True)
 
     def _leave_link_format_at_edges(self) -> None:
         """링크 끝에서 이어 치는 글자가 링크에 딸려 가지 않게 하고, 아이콘 자리
@@ -1301,6 +1677,282 @@ class RichTextEdit(QTextEdit):
                                    link_icon_pixmap(kind, size, dpr))
             block = block.next()
         return painter
+
+    # ── 목록: 단계, 번호, 여백과 간격 ────────────────────────────────────
+
+    def _em_of(self, fmt: QTextCharFormat) -> float:
+        """이 서식의 글자 크기(px)."""
+        pt = fmt.fontPointSize()
+        if pt <= 0:
+            pt = self.document().defaultFont().pointSizeF()
+        if pt <= 0:
+            return float(QFontInfo(self.document().defaultFont()).pixelSize())
+        return pt * self.logicalDpiY() / 72.0
+
+    def base_em(self) -> float:
+        return self._em_of(QTextCharFormat())
+
+    def _lead_format(self, block) -> QTextCharFormat:
+        """그 줄의 첫 글자 서식(그림과 링크 아이콘 자리는 건너뛴다)."""
+        it = block.begin()
+        while not it.atEnd():
+            frag = it.fragment()
+            it += 1
+            if not frag.isValid():
+                continue
+            fmt = frag.charFormat()
+            if not fmt.isImageFormat() and not fmt.hasProperty(LINK_ICON_PROP):
+                return fmt
+        return block.charFormat()
+
+    def block_em(self, block) -> float:
+        return self._em_of(self._lead_format(block))
+
+    @staticmethod
+    def block_marker(block) -> int:
+        return block.blockFormat().intProperty(MARKER_PROP)
+
+    @staticmethod
+    def block_level(block) -> int:
+        bf = block.blockFormat()
+        if bf.intProperty(MARKER_PROP) not in MARKER_CODES:
+            return 0
+        return max(0, min(MAX_LEVEL, bf.intProperty(LEVEL_PROP)))
+
+    def _number_layout(self, doc: QTextDocument | None = None
+                       ) -> tuple[dict[int, int], dict[int, int]]:
+        """번호 목록의 줄마다 ``(번호, 그 줄이 든 목록에서 가장 긴 번호의 자릿수)``.
+
+        같은 단계에서 이어지는 번호 줄이 한 목록이다. 더 깊은 줄은 끊지 않고,
+        글 줄이나 같은 단계의 다른 기호가 끼면 다음 줄은 1 부터 다시 센다."""
+        doc = doc or self.document()
+        numbers: dict[int, int] = {}
+        runs: dict[int, list[int]] = {}         # 단계 → 지금 이어지는 목록의 블록들
+        digits: dict[int, int] = {}
+
+        def close(level: int) -> None:
+            run = runs.pop(level, None)
+            if run:
+                width = len(str(numbers[run[-1]]))
+                for number in run:
+                    digits[number] = width
+
+        block = doc.begin()
+        while block.isValid():
+            bf = block.blockFormat()
+            code = bf.intProperty(MARKER_PROP)
+            if code not in MARKER_CODES:
+                for level in list(runs):
+                    close(level)
+            else:
+                level = max(0, min(MAX_LEVEL, bf.intProperty(LEVEL_PROP)))
+                for deeper in [k for k in runs if k > level]:
+                    close(deeper)
+                if code == MARKER_NUMBER:
+                    run = runs.setdefault(level, [])
+                    numbers[block.blockNumber()] = len(run) + 1
+                    run.append(block.blockNumber())
+                else:
+                    close(level)
+            block = block.next()
+        for level in list(runs):
+            close(level)
+        return numbers, digits
+
+    def list_numbers(self, doc: QTextDocument | None = None) -> dict[int, int]:
+        """번호 목록의 줄 번호(블록 번호 → 1, 2, 3 …)."""
+        return self._number_layout(doc)[0]
+
+    def next_number_for(self, block) -> int:
+        """이 줄(지금은 글 줄)을 번호 줄로 바꾸면 받게 될 번호."""
+        numbers = self.list_numbers()
+        prev = block.previous()
+        while prev.isValid():
+            code = self.block_marker(prev)
+            if code not in MARKER_CODES:
+                return 1
+            if self.block_level(prev) == 0:
+                return numbers[prev.blockNumber()] + 1 if code == MARKER_NUMBER else 1
+            prev = prev.previous()
+        return 1
+
+    def _list_margin(self, block, code: int, level: int, digits: int) -> float:
+        """목록 줄의 왼쪽 여백: 기호 칸 + 단계마다 글자 반 칸."""
+        fmt = self._lead_format(block)
+        em = self._em_of(fmt)
+        column = marker_column(em)
+        if code == MARKER_NUMBER and digits > 1:
+            fm = QFontMetricsF(self._effective_font(self._plain_format(fmt)))
+            label = fm.horizontalAdvance("0") * digits + fm.horizontalAdvance(".")
+            column = max(column, float(round(label + em * 0.58)))
+        return column + level * LEVEL_STEP * em
+
+    @staticmethod
+    def _block_kind(block, code: int) -> tuple[str, bool]:
+        """간격 규칙에서 보는 줄의 종류 ``(text | list | image, 빈 줄인가)``."""
+        if code in MARKER_CODES:
+            return "list", False
+        has_image = has_text = False
+        it = block.begin()
+        while not it.atEnd():
+            frag = it.fragment()
+            it += 1
+            if not frag.isValid():
+                continue
+            fmt = frag.charFormat()
+            if fmt.isImageFormat():
+                has_image = True
+            elif frag.text().replace(LINK_SPACER, "").strip():
+                has_text = True
+        if has_image and not has_text:
+            return "image", False
+        return "text", not (has_image or has_text)
+
+    @staticmethod
+    def _gap_before(prev: tuple[str, bool, int] | None,
+                    cur: tuple[str, bool, int]) -> float:
+        if prev is None:
+            return 0.0
+        (pk, p_empty, p_level), (ck, c_empty, c_level) = prev, cur
+        if p_empty or c_empty:
+            return 0.0                      # 빈 줄로 이미 띄워 놓았다
+        if pk == "image" or ck == "image":
+            return GAP_IMAGE
+        if ck == "list":
+            if pk != "list":
+                return GAP_LIST_START
+            return GAP_GROUP if (c_level == 0 and p_level > 0) else GAP_ITEM
+        return GAP_LIST_END if pk == "list" else 0.0
+
+    def restyle_lists(self, join_previous: bool = False) -> bool:
+        """목록 줄의 왼쪽 여백과 서식 사이의 위 간격을 지금 내용에 맞춘다.
+        바꾼 것이 있으면 True.
+
+        둘 다 화면에만 쓰는 값이다(저장할 때 뺀다). 위 간격은 이 편집기가 넣은
+        줄(``SPACING_PROP``)만 다시 잰다. 붙여 넣은 글이 원래 가진 여백은 두고,
+        그런 줄에는 간격을 더하지 않는다."""
+        if self._restyling:
+            return False
+        doc = self.document()
+        base_em = self.base_em()
+        _numbers, digits = self._number_layout()
+        ops: list[tuple[int, QTextBlockFormat]] = []
+        prev: tuple[str, bool, int] | None = None
+        block = doc.begin()
+        while block.isValid():
+            bf = block.blockFormat()
+            code = bf.intProperty(MARKER_PROP)
+            level = self.block_level(block)
+            kind, empty = self._block_kind(block, code)
+            merge = QTextBlockFormat()
+            dirty = False
+            if code in MARKER_CODES:
+                want = self._list_margin(block, code, level,
+                                         digits.get(block.blockNumber(), 1))
+                if abs(bf.leftMargin() - want) > 0.5:
+                    merge.setLeftMargin(want)
+                    dirty = True
+            cur = (kind, empty, level)
+            gap = float(round(self._gap_before(prev, cur) * base_em))
+            managed = bf.hasProperty(SPACING_PROP)
+            if managed or (gap > 0 and bf.topMargin() == 0):
+                if (not managed or abs(bf.topMargin() - gap) > 0.5
+                        or abs(bf.doubleProperty(SPACING_PROP) - gap) > 0.5):
+                    merge.setTopMargin(gap)
+                    merge.setProperty(SPACING_PROP, gap)
+                    dirty = True
+            if dirty:
+                ops.append((block.position(), merge))
+            prev = cur
+            block = block.next()
+        if not ops:
+            return False
+        self._restyling = True
+        cur = QTextCursor(doc)
+        if join_previous:
+            cur.joinPreviousEditBlock()
+        else:
+            cur.beginEditBlock()
+        try:
+            for pos, merge in ops:
+                cur.setPosition(pos)
+                cur.mergeBlockFormat(merge)
+        finally:
+            cur.endEditBlock()
+            self._restyling = False
+            self._undo_cmd_added = False
+        self.viewport().update()
+        return True
+
+    def set_block_marker(self, block, code: int, level: int | None = None) -> None:
+        """줄의 목록 종류(와 단계)를 정한다. 목록이 아니게 하면 여백과 단계를 지운다.
+        여백은 ``restyle_lists`` 가 잰다."""
+        if not block.isValid():
+            return
+        bf = QTextBlockFormat()
+        if code in MARKER_CODES:
+            bf.setProperty(MARKER_PROP, code)
+            if level is not None:
+                bf.setProperty(LEVEL_PROP, max(0, min(MAX_LEVEL, int(level))))
+        else:
+            bf.setProperty(MARKER_PROP, MARKER_NONE)
+            bf.setProperty(LEVEL_PROP, 0)
+            bf.setLeftMargin(0.0)
+        QTextCursor(block).mergeBlockFormat(bf)
+        self._done.rehighlightBlock(block)
+
+    # ── 주소를 링크로 ────────────────────────────────────────────────────
+
+    def _linkify_word(self, start: int, word: str) -> bool:
+        """문서 위치 ``start`` 에서 시작하는 낱말이 주소면 링크로 바꾼다."""
+        hit = auto_link_target(word)
+        if hit is None:
+            return False
+        text, href = hit
+        probe = QTextCursor(self.document())
+        probe.setPosition(start + 1)
+        if probe.charFormat().isAnchor():
+            return False                    # 이미 링크다
+        self.replace_link(start, start + len(text), text, href)
+        return True
+
+    def linkify_before_cursor(self) -> bool:
+        """커서 바로 앞의 낱말이 웹 주소나 file: 주소면 링크로 바꾼다
+        (빈칸이나 Enter 를 치기 직전에 부른다). 커서는 제자리에 둔다."""
+        cur = self.textCursor()
+        if cur.hasSelection():
+            return False
+        block = cur.block()
+        head = block.text()[:cur.position() - block.position()]
+        words = list(_WORD.finditer(head))
+        if not words or words[-1].end() != len(head):
+            return False
+        word = words[-1]
+        if not self._linkify_word(block.position() + word.start(), word.group()):
+            return False
+        # 링크 앞에 아이콘 자리 글자 하나가 들어갔다.
+        cur = self.textCursor()
+        cur.setPosition(block.position() + len(head) + 1)
+        self.setTextCursor(cur)
+        return True
+
+    def linkify_range(self, start: int, end: int) -> int:
+        """``start``~``end`` 에 든 주소를 링크로 바꾸고 바꾼 개수를 돌려준다
+        (붙여 넣은 글에 쓴다)."""
+        doc = self.document()
+        found: list[tuple[int, str]] = []
+        block = doc.findBlock(start)
+        while block.isValid() and block.position() < end:
+            for word in _WORD.finditer(block.text()):
+                pos = block.position() + word.start()
+                if start <= pos and pos + len(word.group()) <= end:
+                    found.append((pos, word.group()))
+            block = block.next()
+        count = 0
+        for pos, word in reversed(found):   # 뒤에서부터 바꿔야 앞의 자리가 안 밀린다
+            if self._linkify_word(pos, word):
+                count += 1
+        return count
 
     def setHtml(self, html: str) -> None:  # noqa: N802
         super().setHtml(html)
@@ -1622,8 +2274,9 @@ class RichTextEdit(QTextEdit):
         return out
 
     def _on_contents_change(self, position: int, removed: int, added: int) -> None:
-        if (not self._link_syncing and not self._link_sync_pending
-                and (self._has_links or added > 0)):
+        if (not self._link_syncing and not self._restyling
+                and not self._link_sync_pending
+                and (self._has_links or added > 0 or removed > 0)):
             self._link_sync_pending = True
             QTimer.singleShot(0, self._deferred_link_sync)
         if removed > 0 and self._anim.known_urls():
@@ -1662,21 +2315,43 @@ class RichTextEdit(QTextEdit):
     def paintEvent(self, event) -> None:  # noqa: N802
         super().paintEvent(event)
         doc = self.document()
+        view = self.viewport().rect()
+        ink = marker_ink(self._marker_light)
+        numbers: dict[int, int] | None = None
         block = doc.begin()
         painter = None
         while block.isValid():
             code = block.blockFormat().intProperty(MARKER_PROP)
             if code in MARKER_CODES:
-                glyph = marker_display_glyph(code, self._marker_light)
-                if glyph is not None and not glyph.isNull():
-                    cursor = QTextCursor(block)
-                    cursor.setPosition(block.position())
-                    r = self.cursorRect(cursor)
+                cursor = QTextCursor(block)
+                cursor.setPosition(block.position())
+                r = QRectF(self.cursorRect(cursor))
+                if r.bottom() >= view.top() and r.top() <= view.bottom():
                     if painter is None:
                         painter = QPainter(self.viewport())
-                    gx = r.left() - MARKER_MARGIN
-                    gy = r.top() + (r.height() - glyph.height()) / 2.0
-                    painter.drawImage(int(round(gx)), int(round(gy)), glyph)
+                    fmt = self._lead_format(block)
+                    em = self._em_of(fmt)
+                    column = marker_column(em)
+                    # 기호는 글자 바로 앞의 칸에, 칸 안에서 조금 왼쪽에 놓는다.
+                    cx = r.left() - column + column * 0.42
+                    cy = r.top() + r.height() / 2.0
+                    if code == MARKER_NUMBER:
+                        if numbers is None:
+                            numbers = self.list_numbers()
+                        painter.setFont(self._effective_font(self._plain_format(fmt)))
+                        painter.setPen(ink)
+                        right = r.left() - em * 0.36
+                        painter.drawText(
+                            QRectF(right - em * 4, r.top(), em * 4, r.height()),
+                            int(Qt.AlignRight | Qt.AlignVCenter),
+                            f"{numbers.get(block.blockNumber(), 1)}.")
+                    elif code in CHECK_CODES:
+                        draw_checkbox(painter, code == MARKER_CHECK1, cx, cy, em,
+                                      self._marker_light)
+                    else:
+                        draw_marker_shape(
+                            painter, marker_shape(code, self.block_level(block)),
+                            cx, cy, em, ink)
             block = block.next()
         if self._has_links:
             painter = self._paint_link_icons(painter)

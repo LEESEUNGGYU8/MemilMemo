@@ -64,6 +64,7 @@ _SID_TOP_LEVEL_BROWSER = _GUID.of("4C96BE40-915C-11CF-99D3-00AA004AE837")
 _IID_SHELL_BROWSER = _GUID.of("000214E2-0000-0000-C000-000000000046")
 _IID_FOLDER_VIEW2 = _GUID.of("1AF3A467-214F-4298-908E-06B03E0B39F9")
 _IID_ACCESSIBLE = _GUID.of("618736E0-3C3D-11CF-810C-00AA00389B71")
+_FOLDERID_RECYCLE_BIN = _GUID.of("B7534046-3ECB-4C18-BE4E-64CD4CB7D6AC")
 
 _QUERY_INTERFACE, _RELEASE = 0, 2
 _WINDOWS_FIND = 15                  # IShellWindows.FindWindowSW
@@ -89,6 +90,14 @@ class DesktopView:
     # 항목의 자리에서 그 항목이 차지하는 칸의 왼쪽 위까지. 바탕화면에 직접 물어 잰
     # 값이다. 잴 수 없었으면(항목이 없다) None 이고, 쓰는 쪽이 어림한다.
     offset: tuple[int, int] | None = None
+    # ``items`` 와 같은 차례로, 항목마다 아이콘 목록에서의 번호. 고른 항목을
+    # 번호로 알려 주는 물음(app/desktop_select.py)과 맞춰 볼 때 쓴다.
+    indices: tuple[int, ...] = ()
+    # Windows 휴지통 아이콘의 번호(바탕화면에 없으면 -1). 메모 아이콘을 거기에
+    # 끌어다 놓으면 메모 휴지통으로 보낸다.
+    bin: int = -1
+    # '자동 정렬'이 켜져 있다(아이콘의 자리를 탐색기가 정한다).
+    auto: bool = False
 
 
 class _Failed(Exception):
@@ -217,14 +226,19 @@ def read() -> DesktopView | None:
         _method(folder, _FV_FOLDER_FLAGS, ctypes.POINTER(wintypes.DWORD))(
             ctypes.byref(flags))
         left, top = _window_origin(window)
-        found = [(index, x + left, y + top) for index, x, y in _positions(folder)]
+        bins: list[int] = []
+        found = [(index, x + left, y + top)
+                 for index, x, y in _positions(folder, bins)]
         return DesktopView(
             icon=int(icon.value), spacing=(int(spacing.x), int(spacing.y)),
             items=tuple((x, y) for _index, x, y in found),
             snap=bool(flags.value & (_FWF_SNAPTOGRID | _FWF_AUTOARRANGE)),
             window=window, dpi=_dpi_of(window),
             offset=_cell_offset(window, found[:_OFFSET_SAMPLES],
-                                (int(spacing.x), int(spacing.y))))
+                                (int(spacing.x), int(spacing.y))),
+            indices=tuple(index for index, _x, _y in found),
+            bin=bins[0] if bins else -1,
+            auto=bool(flags.value & _FWF_AUTOARRANGE))
     except (_Failed, OSError, ValueError):
         return None
     finally:
@@ -279,8 +293,41 @@ def _cell_offset(window: int, samples: list[tuple[int, int, int]],
         _release(acc)
 
 
-def _positions(folder) -> list[tuple[int, int, int]]:
-    """놓여 있는 항목들의 번호와 자리(목록 창 안의 좌표)."""
+def _shell32():
+    """이 모듈만 쓰는 shell32. 함수의 인자 모양을 여기서 정해도 다른 곳과 섞이지
+    않는다."""
+    global _SHELL32
+    if _SHELL32 is None:
+        dll = ctypes.WinDLL("shell32")
+        dll.SHGetKnownFolderIDList.argtypes = [
+            ctypes.POINTER(_GUID), wintypes.DWORD, wintypes.HANDLE,
+            ctypes.POINTER(ctypes.c_void_p)]
+        dll.SHGetKnownFolderIDList.restype = ctypes.c_long
+        dll.ILIsEqual.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        dll.ILIsEqual.restype = wintypes.BOOL
+        _SHELL32 = dll
+    return _SHELL32
+
+
+_SHELL32 = None
+
+
+def _bin_pidl() -> ctypes.c_void_p | None:
+    """Windows 휴지통을 가리키는 식별값. 쓰고 나면 놓아 준다."""
+    try:
+        pidl = ctypes.c_void_p()
+        if _shell32().SHGetKnownFolderIDList(
+                ctypes.byref(_FOLDERID_RECYCLE_BIN), 0, None,
+                ctypes.byref(pidl)) != _S_OK or not pidl:
+            return None
+        return pidl
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def _positions(folder, bins: list[int] | None = None) -> list[tuple[int, int, int]]:
+    """놓여 있는 항목들의 번호와 자리(목록 창 안의 좌표). ``bins`` 를 주면
+    Windows 휴지통 아이콘의 번호를 거기에 담는다."""
     count = ctypes.c_int(0)
     if _method(folder, _FV_ITEM_COUNT, ctypes.c_uint,
                ctypes.POINTER(ctypes.c_int))(
@@ -292,16 +339,26 @@ def _positions(folder) -> list[tuple[int, int, int]]:
     free = ctypes.windll.ole32.CoTaskMemFree
     free.argtypes = [ctypes.c_void_p]
     out: list[tuple[int, int, int]] = []
-    for index in range(min(count.value, _MAX_ITEMS)):
-        pidl = ctypes.c_void_p()
-        if item(index, ctypes.byref(pidl)) != _S_OK or not pidl:
-            continue
-        try:
-            point = wintypes.POINT()
-            if position(pidl, ctypes.byref(point)) == _S_OK:
-                out.append((index, int(point.x), int(point.y)))
-        finally:
-            free(pidl)
+    # 바탕화면의 항목은 이름 공간의 뿌리 바로 아래에 있어, 항목의 식별값을
+    # 휴지통의 식별값과 그대로 견줄 수 있다.
+    bin_pidl = _bin_pidl() if bins is not None else None
+    try:
+        for index in range(min(count.value, _MAX_ITEMS)):
+            pidl = ctypes.c_void_p()
+            if item(index, ctypes.byref(pidl)) != _S_OK or not pidl:
+                continue
+            try:
+                point = wintypes.POINT()
+                if position(pidl, ctypes.byref(point)) == _S_OK:
+                    out.append((index, int(point.x), int(point.y)))
+                    if bin_pidl is not None and not bins \
+                            and _shell32().ILIsEqual(pidl, bin_pidl):
+                        bins.append(index)
+            finally:
+                free(pidl)
+    finally:
+        if bin_pidl is not None:
+            free(bin_pidl)
     return out
 
 
@@ -324,4 +381,18 @@ def spacing_of(window: int) -> tuple[int, int] | None:
     return (cx, cy) if cx > 0 and cy > 0 else None
 
 
-__all__ = ["DesktopView", "read", "spacing_of"]
+def single_click_opens() -> bool:
+    """사용자가 Windows 를 '한 번 클릭해서 열기'로 쓰는가(폴더 옵션). 보통은
+    두 번 눌러 연다. 알 수 없으면 거짓."""
+    if sys.platform != "win32":
+        return False
+    try:
+        state = (ctypes.c_uint32 * 16)()        # SHELLSTATE(넉넉하게)
+        # SSF_DOUBLECLICKINWEBVIEW: 첫 값의 여섯째 비트가 '두 번 눌러 연다'.
+        ctypes.windll.shell32.SHGetSetSettings(ctypes.byref(state), 0x80, False)
+        return not (state[0] >> 5) & 1
+    except (OSError, AttributeError, ValueError):
+        return False
+
+
+__all__ = ["DesktopView", "read", "single_click_opens", "spacing_of"]

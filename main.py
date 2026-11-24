@@ -10,10 +10,9 @@ from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from app import config, data_home, i18n, packaging, shell_menu
 from app.backup import (
-    BackupManager, backup_time, latest_good_backup, list_backups,
-    replace_database, set_aside,
+    BackupManager, backup_time, latest_good_backup, replace_database, set_aside,
 )
-from app.database import SqliteRepository, check_database
+from app.database import SqliteRepository
 from app.datetime_fmt import fmt_relative
 from app.ipc import (
     CMD_NEW_NOTE_HERE, CMD_SHOW, IpcReceiver, claim_boot, forward_command,
@@ -26,16 +25,18 @@ from app.network.guest_client import GuestClient
 from app.network.host_client import HostLocalClient
 from app.network.host_server import HostServer
 from app.offline_drafts import DraftStore
-from app.replica import ReplicaStore, ReplicaSync, build_host_database
+from app.replica import (
+    ReplicaStore, ReplicaSync, build_host_database,
+    build_host_database_from_backup, file_kind,
+)
 from app.settings import AppSettings, get_windows_autostart, set_windows_autostart
 from app.share_auth import ShareAuth
 from app.sync.history_tracker import HistoryTracker
 from app.sync.lock_manager import LockManager
 from app.ui import confirm, theme
 from app.ui.connect_dialog import ConnectDialog, ConnectionChoice
+from app.ui.copies_dialog import CopiesDialog
 from app.ui.main_window import MainWindow
-from app.ui.restore_dialog import RestoreDialog
-from app.ui.settings_dialog import SettingsDialog
 from app.ui.update_dialog import UpdateAvailableDialog
 from app.updater import (
     UpdateChecker, UpdateDownloader, launch_installer,
@@ -73,6 +74,10 @@ def _saved_choice(local_store: LocalStateStore) -> ConnectionChoice | None:
             port=ls.last_host_port or config.DEFAULT_PORT,
             heartbeat_ms=ls.last_heartbeat_ms or config.DEFAULT_HEARTBEAT_MS,
         )
+    if ls.last_mode == "solo" and ls.nickname:
+        # 공유하지 않고 혼자 쓴다. 접속 정보를 바꾸기 전까지 이대로 켜진다.
+        return ConnectionChoice(mode="solo", nickname=ls.nickname,
+                                port=ls.last_host_port or config.DEFAULT_PORT)
     if ls.last_mode == "guest" and ls.nickname:
         return ConnectionChoice(
             mode="guest",
@@ -100,6 +105,13 @@ def _persist_choice(local_store: LocalStateStore,
                     choice: ConnectionChoice) -> None:
     """현재 접속 정보를 저장한다. 다음 실행 때 자동 재접속에 쓰인다."""
     ls = local_store.state
+    if choice.mode == "solo":
+        # 혼자 쓴다. 포트도 비밀번호도 쓰지 않는다. 전에 적어 둔 것은 그대로 둔다
+        # (나중에 공유를 시작할 때 다시 정한다).
+        ls.last_mode = "solo"
+        ls.nickname = choice.nickname
+        local_store.save()
+        return
     if choice.mode == "host":
         if choice.password is not None:
             # 접속 창에서 정했다. 비워 두었으면 비밀번호 없이 공유한다. 글자는
@@ -383,14 +395,17 @@ def main() -> int:
             if choice is None:
                 return 0
 
-        if choice.mode == "host":
+        if choice.mode in ("host", "solo"):
+            # 혼자 쓰기는 공유 PC 와 같은 길이다. 메모를 이 PC 에 두고, 포트를 열지
+            # 않으며 찾는 신호에도 답하지 않는다.
+            solo = choice.mode == "solo"
             db_path = config.default_db_path()
             repo = _open_repository(db_path, settings)
             if repo is None:
                 return 0
             locks = LockManager(idle_timeout_ms=config.LOCK_IDLE_TIMEOUT_MS)
             history = HistoryTracker(repo)
-            if choice.password is not None:
+            if choice.password is not None and not solo:
                 # 포트를 열기 전에 정해 둔다(저장은 아래 _persist_choice 가 한다).
                 picked = ShareAuth.from_password(choice.password)
                 local_store.state.share_auth = (
@@ -399,10 +414,13 @@ def main() -> int:
             server = HostServer(
                 repo=repo, lock_manager=locks, history_tracker=history,
                 host_nickname=choice.nickname, heartbeat_ms=choice.heartbeat_ms,
-                auth=ShareAuth.from_dict(local_store.state.share_auth),
+                auth=(None if solo
+                      else ShareAuth.from_dict(local_store.state.share_auth)),
             )
             server.old_version_message = i18n.t("auth.old_version")
-            if not server.start(choice.port):
+            if solo:
+                server.start_local()
+            elif not server.start(choice.port):
                 repo.close()
                 confirm.notify(
                     None, i18n.t("boot.start_failed_title"),
@@ -415,7 +433,7 @@ def main() -> int:
             _persist_choice(local_store, choice)
             # 내부망에서 공유 PC 를 찾는 신호에 답한다. 포트를 열지 못해도 공유는 된다.
             beacon = None
-            if config.discovery_port() is not None:
+            if config.discovery_port() is not None and not solo:
                 beacon = Responder(lambda: server.beacon(choice.port),
                                    config.discovery_port(), parent=app)
                 beacon.start()
@@ -428,8 +446,23 @@ def main() -> int:
                            if config.default_drafts_path().exists() else None)
             window = MainWindow(client=client, local_state=local_store,
                                 role="host", settings=settings, app_icon=app_icon,
-                                drafts=host_drafts)
+                                drafts=host_drafts, solo=solo)
             client.start()
+
+            def _on_share(password: str):
+                # 혼자 쓰던 메모의 공유를 시작한다. 다음부터 공유 PC 로 켜지게 적어
+                # 두고 곧바로 다시 켠다(포트를 여는 길은 공유 PC 로 시작할 때와
+                # 같다. 열지 못하면 그때 알리고 시작 방식을 다시 묻는다).
+                state = local_store.state
+                picked = ShareAuth.from_password(password) if password else None
+                state.share_auth = picked.to_dict() if picked is not None else None
+                state.last_mode = "host"
+                state.last_host_port = settings.default_port
+                state.last_heartbeat_ms = settings.default_heartbeat_ms
+                local_store.save()
+                _restart_app(window)
+
+            window.shareRequested.connect(_on_share)
             backup_manager = BackupManager(db_path=db_path, settings=settings)
 
             def _on_backup_now():
@@ -456,25 +489,14 @@ def main() -> int:
             # 때맞춰 도는 자동 백업의 실패는 창을 띄우지 않고 상태줄에 남긴다.
             backup_manager.backupFailed.connect(window.show_backup_failure)
 
-            def _on_restore():
-                # 설정 창에서 눌렀다. 아직 저장하지 않은 백업 폴더라도 거기서 찾는다
-                # (다른 PC 에서 가져온 백업 폴더를 가리켜 되살리는 경우).
+            def _on_restore(chosen_path: str):
+                # 복원 창에서 백업을 골라 '복원'을 눌렀다. 고른 파일은 읽기만 하고,
+                # 그 내용을 떠서 메모 파일을 채운다(그 파일을 메모 파일로 쓰지 않는다).
                 parent = QApplication.activeModalWidget() or window
-                folder = (parent.backup_folder()
-                          if isinstance(parent, SettingsDialog)
-                          else settings.resolved_backup_dir())
-                backups = list_backups(folder)
-                if not backups:
-                    confirm.notify(parent, i18n.t("restore.window_title"),
-                                   i18n.t("restore.empty"))
-                    return
-                picker = RestoreDialog(backups, parent)
-                if picker.exec() != QDialog.Accepted:
-                    return
-                chosen = picker.selected()
-                if chosen is None:
-                    return
-                if check_database(chosen):
+                chosen = Path(chosen_path)
+                # 공유 PC 의 메모 파일 모양이 아니면(참여한 PC 의 사본 같은 것)
+                # 덮어쓰지 않는다. 손상된 파일도 여기서 걸린다.
+                if file_kind(chosen) != "backup":
                     confirm.notify(
                         parent, i18n.t("boot.restore_failed_title"),
                         i18n.t("restore.err_damaged"), icon=QMessageBox.Warning)
@@ -501,6 +523,9 @@ def main() -> int:
                 confirm.notify(
                     parent, i18n.t("boot.restore_done_title"),
                     i18n.t("boot.restore_done_body", when=_when(chosen)))
+                # 복원 창이 보여 주던 것은 이제 옛 내용이다. 닫는다.
+                if isinstance(parent, CopiesDialog):
+                    parent.accept()
 
             window.restoreRequested.connect(_on_restore)
 
@@ -545,17 +570,27 @@ def main() -> int:
                             address=f"{choice.host_ip}:{choice.port}", parent=app)
 
             def _on_takeover(copy_path: str, nickname=choice.nickname):
-                # 공유 PC 를 다시 쓸 수 없을 때, 받아 둔 사본으로 이 PC 가 공유를 잇는다.
+                # 공유 PC 를 다시 쓸 수 없을 때, 받아 둔 사본이나 백업 파일로 이 PC 가
+                # 공유를 잇는다. 고른 파일은 읽기만 하고 그 내용으로 메모 파일을
+                # 새로 만든다. 이 PC 에 있던 메모 파일은 지우지 않고 옮겨 둔다.
                 parent = QApplication.activeModalWidget() or window
+                from_backup = file_kind(Path(copy_path)) == "backup"
                 if not confirm.ask(
-                        parent, i18n.t("copies.btn_takeover"),
-                        i18n.t("copies.takeover_body"),
+                        parent,
+                        i18n.t("restore.btn_takeover_backup" if from_backup
+                               else "copies.btn_takeover"),
+                        i18n.t("restore.takeover_body" if from_backup
+                               else "copies.takeover_body"),
                         detail=i18n.t("copies.takeover_detail"),
                         action=i18n.t("copies.takeover_action"), danger=True):
                     return
                 try:
-                    build_host_database(Path(copy_path), config.default_db_path(),
-                                        nickname)
+                    if from_backup:
+                        build_host_database_from_backup(
+                            Path(copy_path), config.default_db_path())
+                    else:
+                        build_host_database(Path(copy_path),
+                                            config.default_db_path(), nickname)
                 except (OSError, sqlite3.Error, ValueError) as e:
                     confirm.notify(
                         parent, i18n.t("boot.start_failed_title"),

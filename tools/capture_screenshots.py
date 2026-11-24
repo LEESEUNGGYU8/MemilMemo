@@ -185,11 +185,11 @@ def _notes() -> list[dict]:
     from app.ui.rich_text import bullet_url_for, checkbox_url, image_to_data_url
 
     def chk(done: bool, text: str) -> str:
-        style = ' style="text-decoration: line-through; color:#6B7280;"' if done else ""
-        return (f'<p><img src="{checkbox_url(done)}" /> '
-                f'<span{style}>{text}</span></p>')
+        # 끝낸 줄을 흐리게 하고 줄을 긋는 것은 앱이 한다(1.0.4 부터).
+        return f'<p><img src="{checkbox_url(done)}" /> {text}</p>'
 
-    def bul(text: str, kind: str = "circle") -> str:
+    def bul(text: str, kind: str = "square") -> str:
+        # 네모가 기본 목록이다.
         return f'<p><img src="{bullet_url_for(kind)}" /> {text}</p>'
 
     from app import file_links as fl

@@ -16,12 +16,16 @@ from ..protocol import (
     MSG_CREATE_NOTE,
     MSG_DELETE_FOLDER,
     MSG_DELETE_NOTE,
+    MSG_EMPTY_TRASH,
     MSG_GET_HISTORY,
+    MSG_GET_TRASH,
     MSG_HELLO,
     MSG_LOCK_DENIED,
     MSG_PING,
     MSG_PONG,
+    MSG_PURGE_NOTE,
     MSG_RELEASE_LOCK,
+    MSG_RESTORE_NOTE,
     MSG_SET_NOTE_FOLDER,
     MSG_SET_NOTE_PRIVACY,
     MSG_UPDATE_FOLDER,
@@ -437,3 +441,15 @@ class GuestClient(ClientBase):
 
     def get_history(self, note_id: str | None = None) -> None:
         self._send(make(MSG_GET_HISTORY, note_id=note_id))
+
+    def get_trash(self) -> None:
+        self._send(make(MSG_GET_TRASH))
+
+    def restore_note(self, note_id: str) -> None:
+        self._send(make(MSG_RESTORE_NOTE, id=note_id))
+
+    def purge_note(self, note_id: str) -> None:
+        self._send(make(MSG_PURGE_NOTE, id=note_id))
+
+    def empty_trash(self) -> None:
+        self._send(make(MSG_EMPTY_TRASH))

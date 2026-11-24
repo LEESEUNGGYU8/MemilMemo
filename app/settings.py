@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import platform
+import re
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from . import config, packaging, startup_task
@@ -20,6 +21,28 @@ VIEW_DENSITIES = (VIEW_COMPACT, VIEW_STANDARD, VIEW_DETAILED)
 VIEW_LIST = "list"
 VIEW_GRID = "grid"
 VIEW_LAYOUTS = (VIEW_LIST, VIEW_GRID)
+# 폴더 창은 탐색기처럼 아이콘으로도 보인다.
+VIEW_ICONS = "icons"
+FOLDER_VIEW_LAYOUTS = (VIEW_ICONS, VIEW_LIST, VIEW_GRID)
+
+# 메모가 접히고 펴지고 미끄러지는 움직임의 빠르기(배). 1 이 기본이고 2 는 두 배 빠르다.
+ANIMATION_SPEED_MIN = 0.5
+ANIMATION_SPEED_MAX = 2.0
+ANIMATION_SPEED_STEP = 0.1
+
+_HEX_COLOR = re.compile(r"#[0-9A-Fa-f]{6}")
+
+
+def clamp_animation_speed(value) -> float:
+    """설정 파일이나 입력 칸의 값을 쓸 수 있는 빠르기로 맞춘다(0.1 단위)."""
+    try:
+        speed = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if speed != speed:                      # NaN
+        return 1.0
+    speed = max(ANIMATION_SPEED_MIN, min(ANIMATION_SPEED_MAX, speed))
+    return round(speed, 1)
 
 
 @dataclass
@@ -39,9 +62,17 @@ class AppSettings:
 
     notes_view_density: str = VIEW_STANDARD
     notes_view_layout: str = VIEW_LIST
+    # 폴더 아이콘을 열면 뜨는 창의 보기 방식(아이콘, 리스트, 그리드)과 밀도.
+    folder_view_layout: str = VIEW_ICONS
+    folder_view_density: str = VIEW_STANDARD
+    # 휴지통 창의 보기 방식. 지운 메모가 많을 때 한눈에 보이게 고른다.
+    trash_view_layout: str = VIEW_LIST
+    trash_view_density: str = VIEW_STANDARD
 
     # 접고 펴는 그림을 움직임으로 보일지. 꺼도 접기 자체는 그대로 된다.
     fold_animation: bool = True
+    # 그 움직임의 빠르기(0.5 ~ 2.0 배).
+    animation_speed: float = 1.0
     # 접힌 메모의 기본 모양: "slip"(쪽지) 또는 "icon"(바탕화면 아이콘).
     fold_style: str = "slip"
     # 화면 가장자리에 붙인 메모(탭과 거기서 펼친 메모)를 다른 창 위에 둘지.
@@ -66,6 +97,10 @@ class AppSettings:
     notify_note_edit: bool = True
     # 새 메모를 '나만 보기'로 만든다. 꺼져 있으면 모두에게 공개한다.
     new_note_private: bool = False
+
+    # 글자 색과 메모 색의 '다른 색'에서 고른 색들(방금 고른 것부터, "#RRGGBB").
+    recent_font_colors: list = field(default_factory=list)
+    recent_note_colors: list = field(default_factory=list)
 
     backup_enabled: bool = True
     # 자동 백업이 기본으로 꺼져 있던 때(1.0.7 까지)의 설정 파일에는 이 값이 없다.
@@ -94,8 +129,25 @@ class AppSettings:
             loaded.notes_view_density = VIEW_STANDARD
         if loaded.notes_view_layout not in VIEW_LAYOUTS:
             loaded.notes_view_layout = VIEW_LIST
+        if loaded.folder_view_layout not in FOLDER_VIEW_LAYOUTS:
+            loaded.folder_view_layout = VIEW_ICONS
+        if loaded.folder_view_density not in VIEW_DENSITIES:
+            loaded.folder_view_density = VIEW_STANDARD
+        if loaded.trash_view_layout not in FOLDER_VIEW_LAYOUTS:
+            loaded.trash_view_layout = VIEW_LIST
+        if loaded.trash_view_density not in VIEW_DENSITIES:
+            loaded.trash_view_density = VIEW_STANDARD
         if loaded.fold_style not in ("slip", "icon"):
             loaded.fold_style = "slip"
+        if isinstance(loaded.animation_speed, bool):
+            loaded.animation_speed = 1.0
+        loaded.animation_speed = clamp_animation_speed(loaded.animation_speed)
+        for name in ("recent_font_colors", "recent_note_colors"):
+            recents = getattr(loaded, name)
+            setattr(loaded, name, [
+                value.upper()
+                for value in (recents if isinstance(recents, list) else [])
+                if isinstance(value, str) and _HEX_COLOR.fullmatch(value)][:10])
         if "backup_default_applied" not in raw:
             loaded.backup_enabled = True
             loaded.backup_default_applied = True

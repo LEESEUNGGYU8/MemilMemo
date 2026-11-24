@@ -5,6 +5,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
     QDialogButtonBox,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -15,7 +16,7 @@ from PySide6.QtWidgets import (
 
 from .. import config, i18n
 from .icons import color_swatch_icon
-from .theme import refresh_style
+from .theme import color_name, refresh_style
 
 
 class FolderEditDialog(QDialog):
@@ -57,9 +58,11 @@ class FolderEditDialog(QDialog):
 
         swatch_row = QHBoxLayout()
         swatch_row.setContentsMargins(0, 0, 0, 0)
-        swatch_row.setSpacing(6)
         swatch_row.addStretch(1)
-        for hex_color in config.COLORS:
+        swatches = QGridLayout()
+        swatches.setContentsMargins(0, 0, 0, 0)
+        swatches.setSpacing(6)
+        for index, hex_color in enumerate(config.COLORS):
             btn = QToolButton()
             btn.setFixedSize(32, 32)
             btn.setIcon(color_swatch_icon(hex_color, 24))
@@ -73,9 +76,11 @@ class FolderEditDialog(QDialog):
                 "QToolButton:hover { background: rgba(0,0,0,0.06); }"
                 "QToolButton:checked { border: 2px solid #1F1F1F; }"
             )
+            btn.setToolTip(color_name(hex_color))
             btn.clicked.connect(lambda _=False, c=hex_color: self._select(c))
             self._color_buttons[hex_color] = btn
-            swatch_row.addWidget(btn)
+            swatches.addWidget(btn, *divmod(index, config.COLOR_COLUMNS))
+        swatch_row.addLayout(swatches)
         swatch_row.addStretch(1)
         root.addLayout(swatch_row)
         self._refresh_color_buttons()

@@ -314,10 +314,10 @@ def test_backup_buttons_follow_the_role(qapp):
 
     host = SettingsDialog(AppSettings(), role="host")
     guest = SettingsDialog(AppSettings(), role="guest")
-    for key in ("settings.btn_copies", "settings.btn_restore",
-                "settings.btn_backup_now"):
+    for key in ("settings.btn_restore", "settings.btn_backup_now"):
         assert i18n.t(key) in texts(host)
-    assert i18n.t("settings.btn_copies") in texts(guest)
+    # 받아 둔 사본은 '백업에서 복원'에 합쳤다. 참여한 PC 에도 그 단추가 있다.
+    assert i18n.t("settings.btn_restore") in texts(guest)
     assert i18n.t("settings.btn_backup_now") not in texts(guest)
     # 참여한 PC 에는 백업하지 않는 까닭을 적는다.
     every = " ".join(lbl.text() for lbl in guest.findChildren(QLabel))

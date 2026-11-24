@@ -31,6 +31,12 @@ class ClientBase(QObject):
     # 편집 중에 저장된 글은 noteUpdated 로 온다.
     noteEdited = Signal(dict)
     historyList = Signal(str, list)          # note_id 또는 '', [entries]
+    # 휴지통에 든 메모들(메모 dict 에 deleted_at, deleted_by 가 더 있다).
+    trashList = Signal(list)
+    # 휴지통이 달라졌다(누가 지웠다, 되살렸다, 비웠다). 열어 둔 창이 다시 묻는다.
+    trashChanged = Signal()
+    # 휴지통에서 되살아난 메모({"user": 되살린 사람, "note_id": 메모}).
+    noteRestored = Signal(dict)
     connectionChanged = Signal(bool)
     errorOccurred = Signal(str)
     # 암호가 걸린 공유다. 사용자에게 암호를 물어야 한다({"wrong": 방금 넣은 암호가
@@ -87,16 +93,30 @@ class ClientBase(QObject):
                        private: bool | None = None) -> None: ...
     def delete_folder(self, folder_id: str) -> None: ...
     def get_history(self, note_id: str | None = None) -> None: ...
+    # 휴지통(공유 PC 가 1.0.4 이상일 때만 답한다).
+    def get_trash(self) -> None: ...
+    def restore_note(self, note_id: str) -> None: ...
+    def purge_note(self, note_id: str) -> None: ...
+    def empty_trash(self) -> None: ...
 
     def _dispatch(self, msg_type: str, data: dict[str, Any]) -> None:
         if msg_type == "welcome":
             self.welcomed.emit(data)
         elif msg_type == "note_created":
             note = data.get("note", {})
+            if data.get("restored_by"):
+                # 메모가 오기 전에 알린다. 받는 쪽이 새 메모로 다루지 않게.
+                self.noteRestored.emit({"user": str(data["restored_by"]),
+                                        "note_id": note.get("id", "")})
             self.noteCreated.emit(note)
             if data.get("shared_by"):
                 self.noteShared.emit({"user": str(data["shared_by"]),
                                       "note_id": note.get("id", "")})
+        elif msg_type == "trash_list":
+            notes = data.get("notes", [])
+            self.trashList.emit(notes if isinstance(notes, list) else [])
+        elif msg_type == "trash_changed":
+            self.trashChanged.emit()
         elif msg_type == "note_updated":
             self.noteUpdated.emit(data.get("note", {}))
         elif msg_type == "note_deleted":

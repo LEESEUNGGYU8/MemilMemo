@@ -21,6 +21,7 @@ from .theme import refresh_style
 MAX_LINE_WIDTH = 400
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+|(?<=[。！？])\s*")
 _CLAUSE_END = re.compile(r"(?<=[、，])")
+_PATH_STEP = re.compile(r"(?<=[\\/])")
 _KANA = re.compile("[\u3040-\u30ff]")
 
 
@@ -45,7 +46,11 @@ def _units(text: str) -> tuple[list[str], str]:
     if len(words) > 1 and not _KANA.search(text):
         return words, " "
     clauses = [c for c in _CLAUSE_END.split(text) if c]
-    return (clauses, "") if len(clauses) > 1 else ([], "")
+    if len(clauses) > 1:
+        return clauses, ""
+    # 파일 경로는 폴더 이름 사이에서 나눈다(이름 한가운데서 끊기지 않게).
+    steps = [c for c in _PATH_STEP.split(text) if c]
+    return (steps, "") if len(steps) > 2 else ([], "")
 
 
 def _anywhere(text: str, font: QFont, width: int) -> list[str]:
@@ -127,6 +132,17 @@ def arrange(box: QMessageBox) -> None:
         widest = max([widest] + [fm.horizontalAdvance(ln) for ln in text.split("\n")])
     for label in labels:
         label.setMinimumWidth(widest + 4)
+    # 글이 한두 줄뿐이면 아이콘보다 낮아 위쪽에 붙어 보인다. 아이콘의 가운데에
+    # 맞춘다(아래에 덧붙이는 글이 있을 때는 첫 줄이 아이콘의 위와 나란하다).
+    icon = box.findChild(QLabel, "qt_msgboxex_icon_label")
+    main = box.findChild(QLabel, "qt_msgbox_label")
+    if (icon is not None and main is not None and len(labels) == 1
+            and labels[0] is main and not icon.pixmap().isNull()):
+        tall = icon.sizeHint().height()
+        lines = len(main.text().splitlines()) or 1
+        if lines * QFontMetrics(main.font()).lineSpacing() <= tall:
+            main.setMinimumHeight(tall)
+            main.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
 
 def build_ask(parent: QWidget | None, title: str, text: str, *,

@@ -861,7 +861,8 @@ def test_folded_menu_has_no_dock_items(qapp, monkeypatch):
     from PySide6.QtGui import QContextMenuEvent
     w.contextMenuEvent(QContextMenuEvent(
         QContextMenuEvent.Mouse, QPoint(5, 5), w.mapToGlobal(QPoint(5, 5))))
-    assert seen[-1] == [i18n.t("sticky.slip_unfold"), i18n.t("sticky.more_hide")]
+    assert seen[-1] == [i18n.t("sticky.slip_unfold"), i18n.t("sticky.more_hide"),
+                        i18n.t("common.btn_delete")]
     w.unfold()
     w._show_more_menu()
     # 벽에 붙여 둔 메모는 접는 길이 하나다.

@@ -132,6 +132,19 @@ class LocalState:
     # [칸 폭, 칸 높이, 첫 칸의 x, 첫 칸의 y]). 앱이 꺼져 있는 동안 바탕화면
     # 아이콘의 크기가 바뀌었으면, 켤 때 아이콘들을 같은 칸으로 옮기는 데 쓴다.
     icon_grids: dict[str, list] = field(default_factory=dict)
+    # 휴지통으로 간 메모가 이 PC 에서 있던 자리와 접힘(메모 id → (버린 때, 상태)).
+    # 되살아나면 그대로 돌아온다. 휴지통의 보관 기간이 지나면 버린다.
+    trashed: dict[str, tuple[int, NoteLocalState]] = field(default_factory=dict)
+
+    def keep_trashed(self, note_id: str) -> None:
+        """사라진 메모의 자리를 따로 적어 두고 메모 목록에서는 뺀다."""
+        state = self.notes.pop(note_id, None)
+        if state is not None:
+            self.trashed[note_id] = (int(time.time() * 1000), state)
+
+    def take_trashed(self, note_id: str) -> NoteLocalState | None:
+        kept = self.trashed.pop(note_id, None)
+        return kept[1] if kept is not None else None
 
     def get_note_state(self, note_id: str) -> NoteLocalState:
         if note_id not in self.notes:
@@ -209,6 +222,26 @@ class LocalState:
         return rec
 
 
+def _trashed_from_raw(raw: Any) -> dict[str, tuple[int, NoteLocalState]]:
+    """휴지통으로 간 메모의 자리. 보관 기간이 지난 것은 읽지 않는다."""
+    out: dict[str, tuple[int, NoteLocalState]] = {}
+    if not isinstance(raw, dict):
+        return out
+    oldest = int(time.time() * 1000) - (
+        (config.TRASH_KEEP_DAYS + 1) * 24 * 60 * 60 * 1000)
+    for nid, payload in raw.items():
+        if not isinstance(nid, str) or not isinstance(payload, dict):
+            continue
+        at = _as_int(payload.get("at"))
+        if at < oldest:
+            continue
+        try:
+            out[nid] = (at, _note_from_raw(payload, payload))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _icon_grids_from_raw(raw: Any) -> dict[str, list]:
     out: dict[str, list] = {}
     if not isinstance(raw, dict):
@@ -264,6 +297,7 @@ class LocalStateStore:
                 share_auth=(raw.get("share_auth")
                             if isinstance(raw.get("share_auth"), dict) else None),
                 icon_grids=_icon_grids_from_raw(raw.get("icon_grids")),
+                trashed=_trashed_from_raw(raw.get("trashed_notes")),
             )
         except (json.JSONDecodeError, TypeError, ValueError):
             return LocalState()
@@ -294,5 +328,11 @@ class LocalStateStore:
             data["share_auth"] = self.state.share_auth
         if self.state.icon_grids:
             data["icon_grids"] = self.state.icon_grids
+        if self.state.trashed:
+            data["trashed_notes"] = {
+                nid: {"at": at, **{k: getattr(v, k)
+                                   for k in _NOTE_BASE_KEYS + _NOTE_FOLD_KEYS}}
+                for nid, (at, v) in self.state.trashed.items()
+            }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")

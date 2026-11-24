@@ -750,3 +750,21 @@ def test_slips_are_not_dropped_into_folders(qapp, tmp_path):
     _drop(a)
     assert win._client.moves == []
     _close(qapp, win)
+
+
+def test_real_icons_being_dragged_along_leave_their_cells_free(qapp):
+    """메모 아이콘과 함께 끌려가는 진짜 아이콘의 칸은 빈 칸으로 본다."""
+    v = DesktopView(icon=48, spacing=(76, 100), items=((14, 2), (14, 102), (90, 2)),
+                    snap=True, window=0, dpi=96, offset=(-14, 3), indices=(4, 9, 2))
+    watch = ig.DesktopGrid(reader=lambda: v, light=lambda window: (76, 100))
+    watch.refresh()
+    area = _avail()
+    assert watch.grid_for(area).taken == {(0, 0), (0, 1), (1, 0)}
+    watch.set_lifted([9, 2])
+    assert watch.grid_for(area).taken == {(0, 0)}
+    # 칸의 자리는 그대로다(끌려가는 것도 아직 제 칸에 있다).
+    assert watch.grid_for(area).pos_of(0, 0) == QPoint(area.left(), area.top() + 5)
+    watch.refresh()                     # 다시 읽어도 끄는 동안에는 그대로 비워 둔다
+    assert watch.grid_for(area).taken == {(0, 0)}
+    watch.set_lifted([])
+    assert watch.grid_for(area).taken == {(0, 0), (0, 1), (1, 0)}

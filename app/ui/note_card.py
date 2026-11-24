@@ -339,6 +339,44 @@ class CardFlowLayout(QLayout):
         return (y - sp) - rect.y() + m.bottom()
 
 
+class _CheckMark(QWidget):
+    """고르는 카드(휴지통)의 왼쪽 체크. 누르는 것은 카드가 받는다."""
+
+    SIDE = 20
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setFixedSize(self.SIDE, self.SIDE)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._checked = False
+        self._dark = False
+
+    def set_state(self, checked: bool, dark: bool) -> None:
+        if (checked, dark) != (self._checked, self._dark):
+            self._checked, self._dark = checked, dark
+            self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        center = QPointF(self.SIDE / 2, self.SIDE / 2)
+        if self._checked:
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor("#93C5FD" if self._dark else "#1D4ED8"))
+            p.drawEllipse(center, 8.5, 8.5)
+            p.setPen(QPen(QColor("#1F2937" if self._dark else "#FFFFFF"), 2.0,
+                          Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            cx, cy = center.x(), center.y()
+            p.drawLine(QPointF(cx - 4.0, cy + 0.2), QPointF(cx - 1.2, cy + 3.0))
+            p.drawLine(QPointF(cx - 1.2, cy + 3.0), QPointF(cx + 4.2, cy - 2.8))
+        else:
+            ring = QColor(255, 255, 255, 170) if self._dark else QColor(0, 0, 0, 120)
+            p.setPen(QPen(ring, 1.4))
+            p.setBrush(QColor(255, 255, 255, 40 if self._dark else 150))
+            p.drawEllipse(center, 7.8, 7.8)
+        p.end()
+
+
 class NoteCard(QFrame):
     clicked = Signal(str)
     rangeClickRequested = Signal(str)
@@ -347,6 +385,9 @@ class NoteCard(QFrame):
     historyRequested = Signal(str)
     privateToggleRequested = Signal(str, bool)   # note_id, new_private
     moveToFolderRequested = Signal(str, object)  # note_id, folder_id|None
+    doubleClicked = Signal(str)
+    # 단추 없는 카드(휴지통)를 오른쪽 단추로 눌렀다: note_id, 화면에서의 자리.
+    menuRequested = Signal(str, QPoint)
 
     _CARD_RADIUS = 12
 
@@ -370,6 +411,11 @@ class NoteCard(QFrame):
         self._folder_context: list[tuple[str, str]] = []  # (id, name)
         self._selection_mode: bool = False
         self._selected: bool = False
+        # 눈과 메뉴 단추가 없는 카드인가(휴지통). 누르고 고르는 것만 된다.
+        self._plain: bool = False
+        # 시각과 아랫줄에 따로 적을 글(휴지통: 남은 날, 지운 사람). None 이면 평소대로.
+        self._stamp_text: str | None = None
+        self._meta_text: str | None = None
         self._density: str = VIEW_STANDARD
         self._layout_mode: str = VIEW_LIST
         self._fg: str = "#1F1F1F"
@@ -420,6 +466,11 @@ class NoteCard(QFrame):
         self._menu_btn.setAccessibleName(i18n.t("main.tooltip_menu"))
         self._menu_btn.clicked.connect(self._open_menu)
 
+        # 고르는 카드(휴지통)에서는 눈 단추 자리에 체크가 온다.
+        self._check = _CheckMark()
+        self._check.hide()
+
+        self._top.addWidget(self._check)
         self._top.addWidget(self._eye_btn)
         self._top.addWidget(self._image_indicator)
         self._top.addWidget(self._private_indicator)
@@ -475,17 +526,27 @@ class NoteCard(QFrame):
         grid = self._layout_mode == VIEW_GRID
         compact = self._density == VIEW_COMPACT
         detailed = self._density == VIEW_DETAILED
-        inline = compact and not grid
+        # 고르는 카드의 리스트는 제목을 윗줄에 둔다. 윗줄에 체크와 남은 날만
+        # 있으면 카드가 한 줄만큼 헛되이 길어진다.
+        plain_list = self._plain and not grid
+        inline = (compact or self._plain) and not grid
 
-        if inline:
+        if compact and not grid:
             self._root.setContentsMargins(10, 3, 8, 3)
         elif grid:
             self._root.setContentsMargins(12, 8, 8, 10)
+        elif plain_list:
+            self._root.setContentsMargins(12, 9, 14, 11)
         else:
             self._root.setContentsMargins(16, 12, 14, 14)
         self._root.setSpacing(4 if (grid or compact) else 6)
+        self._top.setSpacing(6 if self._plain else 4)
+        # 글은 제목과 줄을 맞춘다(체크의 폭만큼 들인다).
+        self._mid.setContentsMargins(
+            _CheckMark.SIDE + self._top.spacing() if plain_list else 0, 0, 0, 0)
 
         self._inline_title.setVisible(inline)
+        self._inline_title.setTextFont(13 if compact else 14, True)
         self._title.setVisible(not inline)
         self._title.setMaxLines(2)
         self._title.setTextFont(13 if grid else 14, True)
@@ -501,6 +562,10 @@ class NoteCard(QFrame):
         if grid:
             self.setFixedHeight({VIEW_COMPACT: 84, VIEW_STANDARD: 148,
                                  VIEW_DETAILED: 236}[self._density])
+        elif plain_list:
+            self.setMinimumHeight({VIEW_COMPACT: 38, VIEW_STANDARD: 44,
+                                   VIEW_DETAILED: 44}[self._density])
+            self.setMaximumHeight(16777215)
         else:
             self.setMinimumHeight({VIEW_COMPACT: 38, VIEW_STANDARD: 92,
                                    VIEW_DETAILED: 112}[self._density])
@@ -576,12 +641,17 @@ class NoteCard(QFrame):
             self._body.setMaxLines(
                 (4 if thumb is not None else 8) if grid else 6)
 
-        stamp = datetime_fmt.fmt_card_timestamp(self._updated_at)
+        stamp = (self._stamp_text if self._stamp_text is not None
+                 else datetime_fmt.fmt_card_timestamp(self._updated_at))
         self._timestamp.setText(stamp)
         meta_parts: list[str] = []
         if grid and not compact:
             meta_parts.append(stamp)
-        if detailed:
+        if self._meta_text is not None:
+            # 그리드의 타일은 좁다. 시각 자리의 글만 적는다.
+            if detailed and not grid:
+                meta_parts.append(self._meta_text)
+        elif detailed:
             user = (self._note.get("updated_by") or "").strip()
             if user:
                 meta_parts.append(i18n.t("main.card_meta_edited_by", user=user))
@@ -633,6 +703,7 @@ class NoteCard(QFrame):
                 "QToolButton { background: transparent; border: none; "
                 "padding: 4px; border-radius: 6px; }"
                 f"QToolButton:hover {{ background: {hover}; }}")
+        self._check.set_state(self._selected, dark)
         self._refresh_eye_icon()
 
     def set_visible(self, visible: bool) -> None:
@@ -653,6 +724,25 @@ class NoteCard(QFrame):
         if self._density == VIEW_DETAILED:
             self._render()
 
+    def set_plain(self, on: bool) -> None:
+        """고르기만 하는 카드로 바꾼다. 눈과 메뉴 단추를 없애고 왼쪽에 체크를
+        둔다. 오른쪽 단추는 ``menuRequested`` 로, Enter 는 ``doubleClicked`` 로
+        알린다."""
+        if self._plain == bool(on):
+            return
+        self._plain = bool(on)
+        self._eye_btn.setVisible(not on)
+        self._menu_btn.setVisible(not on)
+        self._check.setVisible(bool(on))
+        self._apply_view_metrics()
+        self._render()
+
+    def set_caption(self, stamp: str | None, meta: str | None) -> None:
+        """시각 자리와 아랫줄에 적을 글을 따로 정한다."""
+        if (stamp, meta) != (self._stamp_text, self._meta_text):
+            self._stamp_text, self._meta_text = stamp, meta
+            self._render()
+
     def set_selection_mode(self, on: bool) -> None:
         # 일괄 편집 중 카드별 동작이 실행되지 않도록 눈/메뉴 버튼을 비활성화한다.
         if self._selection_mode == on:
@@ -664,10 +754,16 @@ class NoteCard(QFrame):
         self._menu_btn.setEnabled(not on)
         self.update()
 
+    def mouseDoubleClickEvent(self, ev: QMouseEvent) -> None:  # noqa: N802
+        if ev.button() == Qt.LeftButton:
+            self.doubleClicked.emit(self._note_id)
+        super().mouseDoubleClickEvent(ev)
+
     def set_selected(self, selected: bool) -> None:
         if self._selected == selected:
             return
         self._selected = selected
+        self._check.set_state(selected, self._fg == "#FFFFFF")
         self.update()
 
     def is_selected(self) -> bool:
@@ -706,14 +802,15 @@ class NoteCard(QFrame):
 
     def mousePressEvent(self, ev: QMouseEvent) -> None:  # noqa: N802
         if ev.button() == Qt.LeftButton:
-            self._press_pos = ev.pos()
+            self._press_pos = ev.position().toPoint()
         super().mousePressEvent(ev)
 
     def mouseReleaseEvent(self, ev: QMouseEvent) -> None:  # noqa: N802
         if ev.button() == Qt.LeftButton and hasattr(self, "_press_pos"):
-            if (ev.pos() - self._press_pos).manhattanLength() < 5:
+            at = ev.position().toPoint()
+            if (at - self._press_pos).manhattanLength() < 5:
                 # 눈/메뉴 미니 버튼 위 클릭은 카드 클릭으로 처리하지 않는다.
-                child = self.childAt(ev.pos())
+                child = self.childAt(at)
                 if child not in (self._eye_btn, self._menu_btn):
                     if (self._selection_mode
                             and ev.modifiers() & Qt.ShiftModifier):
@@ -723,6 +820,9 @@ class NoteCard(QFrame):
         super().mouseReleaseEvent(ev)
 
     def contextMenuEvent(self, ev) -> None:  # noqa: N802
+        if self._plain:
+            self.menuRequested.emit(self._note_id, ev.globalPos())
+            return
         self._open_menu()
 
     def focusInEvent(self, ev) -> None:  # noqa: N802
@@ -745,13 +845,19 @@ class NoteCard(QFrame):
 
     def keyPressEvent(self, ev) -> None:  # noqa: N802
         key = ev.key()
-        if key in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+        if self._plain and key in (Qt.Key_Return, Qt.Key_Enter):
+            self.doubleClicked.emit(self._note_id)  # 두 번 누른 것과 같다
+        elif key in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
             self.clicked.emit(self._note_id)        # 누른 것과 같다: 메모를 꺼낸다
         elif key == Qt.Key_Delete:
             self.deleteRequested.emit(self._note_id)
         elif key == Qt.Key_Menu or (key == Qt.Key_F10
                                     and ev.modifiers() & Qt.ShiftModifier):
-            self._open_menu()
+            if self._plain:
+                self.menuRequested.emit(
+                    self._note_id, self.mapToGlobal(self.rect().center()))
+            else:
+                self._open_menu()
         elif key in (Qt.Key_Down, Qt.Key_Up):
             # 방향키로 위아래 카드를 오간다. 글쇠로 옮긴 것이므로 초점을 보인다.
             target = (self.nextInFocusChain() if key == Qt.Key_Down
@@ -783,7 +889,9 @@ class NoteCard(QFrame):
             p.setBrush(Qt.NoBrush)
             inset = rect.adjusted(1, 1, -1, -1)
             p.drawRoundedRect(inset, radius - 1, radius - 1)
-            # 색에만 기대지 않도록 오른쪽 아래에 체크 표식을 둔다.
+        if self._selected and not self._plain:
+            # 색에만 기대지 않도록 오른쪽 아래에 체크 표식을 둔다. 고르는 카드는
+            # 왼쪽의 체크가 대신한다.
             d = 18
             cx, cy = rect.right() - 8 - d / 2, rect.bottom() - 8 - d / 2
             p.setPen(Qt.NoPen)

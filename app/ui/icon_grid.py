@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import time
 from collections import Counter
+from dataclasses import replace
 
 from PySide6.QtCore import QObject, QRect, QSize, QTimer, Signal
 from PySide6.QtGui import QGuiApplication
@@ -121,6 +122,7 @@ class DesktopGrid(QObject):
     """바탕화면의 아이콘 격자를 지켜본다."""
 
     changed = Signal()      # 칸의 크기나 자리가 달라졌다
+    refreshed = Signal()    # 바탕화면을 다시 읽었다(아이콘 목록 창이 바뀌었을 수 있다)
 
     def __init__(self, parent: QObject | None = None, *, reader=None,
                  light=None):
@@ -130,6 +132,9 @@ class DesktopGrid(QObject):
         self._light = light or desktop_icons.spacing_of
         self._view: DesktopView | None = None
         self._grids: dict[tuple, nf.IconGrid] = {}
+        # 지금 함께 끌려가고 있는 진짜 아이콘들의 번호. 그 아이콘들이 비울 칸은
+        # 빈 칸으로 본다.
+        self._lifted: frozenset[int] = frozenset()
         self._read_at = 0.0
         self._read_cost = 0.0
         self._retry_at = 0.0
@@ -189,18 +194,42 @@ class DesktopGrid(QObject):
         self._read_at = time.monotonic()
         self._read_cost = self._read_at - started
         self._view = view
-        grids: dict[tuple, nf.IconGrid] = {}
-        if view is not None:
-            screens = self._screens()
-            residue = item_residue(view, screens)
-            for geometry, area, dpr in screens:
-                grids[self._key(area)] = screen_grid(view, geometry, area, dpr,
-                                                     residue)
-        before, self._grids = self._grids, grids
+        before, self._grids = self._grids, self._build(view)
+        grids = self._grids
         same = (before.keys() == grids.keys() and all(
             before[key].same_shape(grids[key]) for key in grids))
         if not same:
             self.changed.emit()
+        self.refreshed.emit()
+
+    def _build(self, view: DesktopView | None) -> dict[tuple, nf.IconGrid]:
+        grids: dict[tuple, nf.IconGrid] = {}
+        if view is None:
+            return grids
+        screens = self._screens()
+        # 칸의 자리는 놓여 있는 아이콘 전부로 잰다(끌려가는 것도 아직 제 칸에 있다).
+        residue = item_residue(view, screens)
+        placed = view
+        if self._lifted:
+            indices = view.indices or tuple(range(len(view.items)))
+            kept = [(index, pos) for index, pos in zip(indices, view.items)
+                    if index not in self._lifted]
+            placed = replace(view, items=tuple(pos for _index, pos in kept),
+                             indices=tuple(index for index, _pos in kept))
+        for geometry, area, dpr in screens:
+            grids[self._key(area)] = screen_grid(placed, geometry, area, dpr,
+                                                 residue)
+        return grids
+
+    def set_lifted(self, indices) -> None:
+        """그 번호의 진짜 아이콘들이 곧 다른 칸으로 옮겨진다(메모 아이콘과 함께
+        끌려가는 중이다). 그 아이콘들이 있는 칸을 빈 칸으로 본다. 빈 목록을 주면
+        원래대로 본다."""
+        lifted = frozenset(int(index) for index in indices)
+        if lifted == self._lifted:
+            return
+        self._lifted = lifted
+        self._grids = self._build(self._view)
 
     def refresh_items(self) -> None:
         """놓여 있는 아이콘의 자리가 오래됐으면 다시 읽는다(끌어다 놓기 전에)."""

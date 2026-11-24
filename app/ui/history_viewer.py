@@ -46,6 +46,8 @@ _ACTION_COLOR = {
     "create": ("#E6F5EC", "#15803D"),
     "update": ("#E6EEFB", "#1D4ED8"),
     "delete": ("#FCE3E7", "#B0122C"),
+    # 휴지통에서 되살린 기록(1.0.4 부터).
+    "restore": ("#E6F5EC", "#15803D"),
 }
 
 
@@ -498,7 +500,10 @@ class HistoryViewer(QDialog):
         self._current_entry = e
         action = e.get("action", "")
         label = _action_label(action)
-        self._header.setText(f"{label}  —  {e.get('user', '')}")
+        user = e.get("user", "")
+        self._header.setText(
+            i18n.t(f"history.by_{action}", user=user) if action in _ACTION_COLOR
+            else f"{label} {user}")
         start = _fmt_ts(e.get("session_start", 0))
         end = _fmt_ts(e.get("session_end", 0))
         self._meta.setText(
