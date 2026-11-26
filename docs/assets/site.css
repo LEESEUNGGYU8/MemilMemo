@@ -414,6 +414,8 @@ footer {
   .hero { grid-template-columns: minmax(0, 0.86fr) minmax(0, 1.14fr); align-items: center; padding: 56px 0 76px; gap: 48px; }
   .feature { grid-template-columns: minmax(0, 0.78fr) minmax(0, 1.22fr); gap: 52px; padding: 34px 0; }
   .feature.flip .text { order: 2; }
+  /* 그림이 왼쪽에 오는 줄도 그림이 넓은 칸을 쓴다. */
+  .feature.flip { grid-template-columns: minmax(0, 1.22fr) minmax(0, 0.78fr); }
   dl.more { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 

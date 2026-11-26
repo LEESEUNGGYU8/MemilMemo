@@ -34,6 +34,54 @@
 
 ## Features
 
+### Working together
+
+See the participants, who is editing, and the edit history.
+
+<p align="center">
+  <img src="docs/images/en/together.png" width="100%" alt="The Participants window, the Edit history window, and a note someone else is editing">
+</p>
+
+### Notices and @mentions
+
+Make any note a notice to see who has read it, and mention participants.
+
+<p align="center">
+  <img src="docs/images/en/notice.png" width="100%" alt="A notice pinned at the top of the list, the list of readers, and an @mention alert">
+</p>
+
+### Reminders
+
+Set a reminder on a note to remind the people you choose at a set time and interval.
+
+<p align="center">
+  <img src="docs/images/en/reminders.png" width="100%" alt="A note's reminder window, a reminder alert in the screen corner, and a note with a bell">
+</p>
+
+### Formatting and images
+
+Use bold, text color, highlighter, bullets, to-do checkboxes, and tables. Paste images or drag them in.
+
+<p align="center">
+  <img src="docs/images/en/editing.png" width="100%" alt="A note being edited, the formatting menus, and the image viewer">
+</p>
+
+### Widgets
+
+Create a variety of widgets inside a note and use them together.
+
+<p align="center">
+  <img src="docs/images/en/widgets.png" width="100%" alt="Notes with a poll, a calendar, and a chart widget">
+</p>
+
+### Shortcuts to files and folders
+
+Put files, folders, and web addresses into a note as links. Each link gets an icon for its type. Network paths to shared folders open on the other PCs too.
+
+<p align="center">
+  <img src="docs/images/en/links.png" width="100%" alt="A note with links marked by file type icons, and the link window">
+</p>
+
 ### Folding and docking
 
 Fold a note into a slip or an icon. Drag it to the screen edge and it docks as a tab. Unfold it and it returns to where it was.
@@ -46,47 +94,28 @@ Fold a note into a slip or an icon. Drag it to the screen edge and it docks as a
   <img src="docs/images/en/icons.png" width="100%" alt="Folded notes and folders: a slip, an icon, a closed folder, an open folder, an edge tab">
 </p>
 
-### Shortcuts to files and folders
-
-Put files, folders, and web addresses into a note as links. Each link gets an icon for its type. Network paths to shared folders open on the other PCs too.
-
-<p align="center">
-  <img src="docs/images/en/links.png" width="100%" alt="A note with links marked by file type icons, and the link window">
-</p>
-
 ### List views
 
-Choose Compact, Standard, or Detailed, as a list or a grid.
+Choose Small, Medium, or Large, as a list or a grid.
 
 <p align="center">
-  <img src="docs/images/en/views.png" width="100%" alt="The six list views">
-</p>
-
-### Formatting and images
-
-Use bold, text color, highlighter, bullets, and to-do checkboxes. Paste images or drag them in.
-
-<p align="center">
-  <img src="docs/images/en/editing.png" width="100%" alt="A note being edited, the formatting menus, and the image viewer">
-</p>
-
-### Working together
-
-See the participants, who is editing, and the edit history.
-
-<p align="center">
-  <img src="docs/images/en/together.png" width="100%" alt="The Participants window, the Edit history window, and a note someone else is editing">
+  <img src="docs/images/en/views.png" width="100%" alt="List and grid views in three sizes">
 </p>
 
 ### More
 
-- Folders, private notes, search
+- Folders, #tags, private notes, the Find window
+- Use on this PC only, without sharing
 - Notifications for new notes, edits, and notes made public
 - Deleted notes restored from the history
 - Automatic backup and restore
 - While the sharing PC is off, reading your copy, writing notes, and taking over sharing from a copy
 - A new note or note folder from the desktop right-click menu, and a new note from the taskbar
 - A link note from a file's right-click menu
+- Global shortcuts, and a new note from the clipboard
+- Results for calculation lines, and totals and averages of selected numbers
+- Print and PDF
+- Attaching a note to a program window (experimental)
 - Korean, English, Japanese
 
 ## Installation
