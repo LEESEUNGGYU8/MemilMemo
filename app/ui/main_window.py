@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import platform
 import time
+from datetime import datetime
 from typing import Any
 
-from PySide6.QtCore import QPoint, QPointF, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QPointF, QRect, QSize, Qt, QTimer, Signal, QMimeData
 from PySide6.QtGui import (
-    QColor, QCursor, QGuiApplication, QIcon, QKeySequence, QPainter, QPen,
+    QActionGroup, QColor, QCursor, QGuiApplication, QIcon, QKeySequence, QPainter, QPen,
     QShortcut,
 )
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QApplication,
     QDialog,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -29,13 +33,14 @@ from PySide6.QtWidgets import (
 )
 
 from .. import config, html_guard, i18n
+from .. import reminders as rm
 from ..ipc import (
-    CMD_LINK_NOTE, CMD_NEW_FOLDER_HERE, CMD_NEW_NOTE, CMD_NEW_NOTE_HERE,
+    CMD_CLIP_NOTE_HERE, CMD_LINK_NOTE, CMD_NEW_FOLDER_HERE, CMD_NEW_NOTE, CMD_NEW_NOTE_HERE,
     CMD_SHOW, split_command,
 )
 from ..datetime_fmt import fmt_relative
 from ..local_state import FolderIconState, LocalStateStore, NoteLocalState
-from ..network.client_base import ClientBase
+from ..network.client_base import ClientBase, clean_seen
 from ..models import new_id
 from ..offline_drafts import KIND_EDIT, KIND_NEW, Draft, DraftStore
 from ..backup import list_backups
@@ -49,29 +54,37 @@ from ..settings import (
     VIEW_LIST,
     VIEW_STANDARD,
     AppSettings,
+    clamp_transparency,
 )
-from . import confirm, drafts_dialog, password_dialog, theme
+from . import confirm, drafts_dialog, edit_menu, password_dialog, reminder_dialog, theme
 from ..network.discovery import Searcher
 from .copies_dialog import CopiesDialog
 from .folder_dialog import FolderEditDialog
 from .folder_icon import FolderIconWidget
+from .screen_layouts import ScreenLayouts, keep_recent
 from .folder_window import FolderWindow
 from .history_viewer import HistoryViewer
+from .global_keys import GlobalKeys, probe_free
+from .quick_find import QuickFind
+from .window_follow import WindowFollower
+from .. import window_attach as wa
 from .icons import color_swatch_icon, folder_lock_icon, svg_icon
 from .menu_item import add_centered_menu_action
-from .note_card import GRID_MIN_COLUMN, CardFlowLayout, NoteCard
+from .note_card import GRID_CELL, CardFlowLayout, NoteCard
 from . import note_fold as nf
 from .icon_grid import DesktopGrid
 from .icon_select import IconController, folder_key, note_key
 from .note_fold import FOLD_ICON, free_dock_slot, snap_icon_pos
-from .rich_text import has_non_checkbox_image, html_to_plain
+from .rich_text import has_non_checkbox_image, html_to_plain, with_widgets_as_text
 from .sessions_dialog import SessionsDialog
 from .settings_dialog import SettingsDialog
 from .sticky_note import StickyNoteWidget
 from .theme import RoundedScrollBar
 from . import toast
 from .toast import ToastManager
-from .trash_dialog import TrashDialog
+from .trash_dialog import _Preview as TrashPreview, days_left
+from . import main_shell as shell
+from . import window_frame
 
 
 # 실제 폴더 id 와 같은 dict 키 자리에 분기 없이 섞여 저장되도록 문자열 sentinel 로 둔다.
@@ -79,8 +92,8 @@ FOLDER_ALL = "__all__"
 FOLDER_NONE = "__none__"
 
 # 목록에 무엇을 보이는가. 메모 수 단추를 누를 때마다 이 차례로 넘어간다.
-LIST_ALL, LIST_SHOWN, LIST_HIDDEN = "all", "shown", "hidden"
-LIST_MODES = (LIST_ALL, LIST_SHOWN, LIST_HIDDEN)
+LIST_ALL, LIST_SHOWN, LIST_HIDDEN, LIST_REMIND = "all", "shown", "hidden", "remind"
+LIST_MODES = (LIST_ALL, LIST_SHOWN, LIST_HIDDEN, LIST_REMIND)
 
 # 파일을 여럿 골라 우클릭 메뉴를 누르면 경로가 하나씩 따로 도착한다. 이만큼
 # 기다려 모으고, 메모를 만든 뒤에도 얼마 동안은 뒤늦게 온 경로를 같은 메모에 잇는다.
@@ -180,6 +193,60 @@ class _ConnectionBadge(QWidget):
         self._detail.setVisible(not compact)
 
 
+def _user_idle_ms() -> int:
+    """마지막 키보드나 마우스 입력 뒤 지난 시간(ms). 알 수 없으면 아주 큰 값."""
+    if platform.system() != "Windows":
+        return 1 << 30
+    import ctypes
+
+    class _LastInput(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+    info = _LastInput()
+    info.cbSize = ctypes.sizeof(info)
+    try:
+        user32, kernel32 = ctypes.WinDLL("user32"), ctypes.WinDLL("kernel32")
+        kernel32.GetTickCount.restype = ctypes.c_uint
+        if not user32.GetLastInputInfo(ctypes.byref(info)):
+            return 1 << 30
+        return (kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF
+    except (OSError, AttributeError):
+        return 1 << 30
+
+
+def copy_mime(source) -> QMimeData | None:
+    """클립보드 내용의 사본(클립보드의 것은 곧 바뀔 수 있다). 넣을 것이 없으면 None."""
+    if source is None:
+        return None
+    out = QMimeData()
+    if source.hasImage():
+        out.setImageData(source.imageData())
+    if source.hasHtml():
+        out.setHtml(source.html())
+    if source.hasText():
+        out.setText(source.text())
+    if source.hasUrls():
+        out.setUrls(source.urls())
+    if not (out.hasImage() or out.hasHtml() or (out.hasText() and out.text().strip())
+            or out.hasUrls()):
+        return None
+    return out
+
+
+def play_reminder_sound() -> None:
+    """Windows 의 알림 소리를 기다리지 않고 낸다(다른 운영체제에서는 조용히)."""
+    import sys
+    # 화면 없이 도는 시험(offscreen)에서는 소리를 내지 않는다.
+    if sys.platform != "win32" or QGuiApplication.platformName() == "offscreen":
+        return
+    try:
+        import winsound
+        winsound.PlaySound("SystemNotification",
+                           winsound.SND_ALIAS | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+    except Exception:
+        pass
+
+
 class MainWindow(QMainWindow):
     backupRequested = Signal()
     restoreRequested = Signal(str)      # 복원할 백업 파일의 경로(공유 PC)
@@ -206,7 +273,10 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
         self._solo = bool(solo)
         self.setWindowTitle(i18n.t("app.name"))
-        self.resize(380, 600)
+        self.resize(780, 600)
+        # 좁게 줄이면(560px 아래) 옆줄이 위의 펼침 칸으로 접힌다. 그만큼 줄일 수 있게
+        # 레이아웃이 정하는 최소 폭 대신 이 값을 쓴다.
+        self.setMinimumSize(360, 420)
         if app_icon is not None and not app_icon.isNull():
             self.setWindowIcon(app_icon)
 
@@ -226,6 +296,7 @@ class MainWindow(QMainWindow):
         self._cards: dict[str, NoteCard] = {}
         self._users: list[str] = []
         self._history_viewer: HistoryViewer | None = None
+        self._settings_dialog: SettingsDialog | None = None
         self._sessions_dialog: SessionsDialog | None = None
         # 호스트는 첫 welcome 이전부터 자기 닉네임이 호스트 닉네임임을 알므로 미리 채운다.
         self._host_nickname: str = (
@@ -237,8 +308,16 @@ class MainWindow(QMainWindow):
         self._force_quit = False
         self._tray: QSystemTrayIcon | None = None
         self._search_query: str = ""
-        # 목록에 무엇을 보이는가: 전체, 바탕화면에 표시한 메모, 숨긴 메모.
+        # 목록에 무엇을 보이는가: 전체, 바탕화면에 표시한 메모, 숨긴 메모, 알림.
         self._list_mode = LIST_ALL
+        # 옆줄에서 고른 곳(전체 메모, 표시, 숨김, 알림, 폴더, 미분류, 휴지통).
+        self._place = shell.PLACE_ALL
+        # 휴지통 자리: 공유 PC 가 보낸 지운 메모와 그 카드.
+        self._trash_notes: list[dict] = []
+        self._trash_cards: dict[str, NoteCard] = {}
+        self._trash_preview: TrashPreview | None = None
+        self._narrow: bool | None = None
+        self._rail_folder_sig = None
         # 복원이 일반 lock → update → release 흐름을 타야 이력 항목이 남으므로,
         # 클릭 시 여기에 내용을 담아 두고 _on_lock_granted 에서 소비한다.
         self._pending_restore: dict[str, str] = {}
@@ -267,9 +346,23 @@ class MainWindow(QMainWindow):
         self._selection_mode: bool = False
         self._selected_notes: set[str] = set()
         self._selection_anchor: str | None = None
-        # 밖에서 온 '새 메모' 요청이 바란 자리(요청 시각, 자리 또는 None).
-        # 메모 id 는 만들어진 뒤에야 알 수 있어 순서대로 짝짓는다.
-        self._new_note_spots: list[tuple[float, QPoint | None]] = []
+        # 밖에서 온 '새 메모' 요청이 바란 자리(요청 시각, 자리 또는 None, 띄울 화면의
+        # 한 점 또는 None). 메모 id 는 만들어진 뒤에야 알 수 있어 순서대로 짝짓는다.
+        self._new_note_spots: list[tuple[float, QPoint | None, QPoint | None]] = []
+        # 클립보드로 만드는 새 메모에 넣을 내용(만든 차례대로).
+        self._clip_note_queue: list[QMimeData] = []
+        # 1.2: 공지(메모 id → 만든 사람), 공유 PC 가 공지를 아는가, 내 공지를 본 기록,
+        # 내가 본 공지의 판(같은 판을 두 번 알리지 않는다).
+        self._notices: dict[str, str] = {}
+        self._notices_ok = False
+        self._seen: dict[str, dict] = {}
+        self._seen_sent: dict[str, int] = {}
+        # 메모 안 위젯(위젯 id → (메모 id, 데이터)), 공유 PC 가 위젯을 아는가.
+        self._widget_store: dict[str, tuple[str, dict]] = {}
+        self._widgets_ok = False
+        # 메모마다 #태그(판이 바뀌면 다시 읽는다).
+        self._tag_cache: dict[str, tuple] = {}
+        self._plain_cache: dict[str, tuple] = {}
         # 이 PC 에 남겨 둔 메모 사본(게스트). 호스트가 꺼져 있을 때 보여 준다.
         self._replica = replica
         self._replica_shown = False
@@ -332,7 +425,6 @@ class MainWindow(QMainWindow):
         # 공유 PC 가 지운 메모를 휴지통에 두는 날 수. 0 이면 휴지통이 없는 옛
         # 버전의 공유 PC 다(지우면 되살릴 수 없으므로 지우기 전에 묻는다).
         self._trash_days = 0
-        self._trash_dialog: TrashDialog | None = None
         # 휴지통에서 되살아나 곧 도착할 메모(메모 id → 되살린 사람).
         self._restoring: dict[str, str] = {}
         self._announce_timer = QTimer(self)
@@ -355,90 +447,51 @@ class MainWindow(QMainWindow):
         # 아이콘을 바탕화면 아이콘처럼 고르고 함께 다루는 일(ui/icon_select.py).
         # 바탕화면 빈 곳을 끌어 고르는 것도 여기서 따라간다.
         self._icon_ctl = IconController(self, self._desktop_grid, self)
+        # 모니터 구성마다 메모 자리를 따로 기억한다.
+        self._screen_layouts = ScreenLayouts(self)
+        self._screen_layouts.switched.connect(self._on_screen_layout_switched)
+        # 알림과 체크 해제 예약의 때를 매 분 0초에 확인한다.
+        self._schedule_timer = QTimer(self)
+        self._schedule_timer.setSingleShot(True)
+        self._schedule_timer.timeout.connect(self._on_schedule_tick)
+        # 띄우지 못한 알림(전체 화면으로 쓰는 중). 다음 확인 때 다시 띄운다.
+        self._held_rings: list = []
+        # 공유 PC 가 공유 알림(모두, 고른 사람)을 아는가(welcome 에 reminders 가 왔다).
+        self._shared_ok = False
+        self._arm_schedule_timer()
         self._desktop_grid.refreshed.connect(self._icon_ctl.marquee.sync)
         # 폴더 아이콘을 열면 뜨는 창(폴더 id → 창).
         self._folder_windows: dict[str, FolderWindow] = {}
         # 폴더 창에서 꺼내 본 메모. 폴더가 접혀 있어도 이 메모만 바탕화면에
         # 나와 있다. 닫으면 다시 폴더 안으로 들어간다(이번 실행 동안만).
         self._peeked: set[str] = set()
+        # 목록에서 눌러 꺼낸 메모와 꺼내기 전 상태(다시 누르면 그 상태로 넣어 둔다).
+        self._taken_out: dict[str, dict] = {}
         self._desktop_grid.start()
 
         self._build_ui()
+        QTimer.singleShot(8000, self._prebuild_settings_when_idle)
+        # 어디서나 쓰는 단축키(새 메모, 메모 찾기, 클립보드로 새 메모).
+        self._quick_find: QuickFind | None = None
+        self._global_keys = GlobalKeys(self)
+        self._global_keys.triggered.connect(self._on_global_key)
+        self._apply_hotkeys()
+        # 프로그램 창에 붙인 메모를 그 창에 따라 옮긴다(설정에서 켰을 때만).
+        self._follower = WindowFollower(lambda: self._stickies, self,
+                                        restore=lambda nid: self._sync_note_shown(nid))
+        QTimer.singleShot(0, self._apply_window_attach)
         self._wire_client()
         self._build_tray()
         self._show_replica()
         self._show_drafts()
 
     def _build_ui(self) -> None:
-        root = QWidget(self)
-        root.setObjectName("ContentRoot")
-        self.setCentralWidget(root)
+        # ── 상단바: 앱 아이콘과 메밀메모(다른 창보다 조금 크게), 검색칸, 본인 아이콘, 창 단추 ──
+        self._title_bar = window_frame.install(self, window_frame.WINDOW)
+        self._title_bar.set_lead_size(self._MARK_SIZE, self._TITLE_PX)
 
-        v = QVBoxLayout(root)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(0)
-
-        top = QWidget()
-        top_row = QHBoxLayout(top)
-        top_row.setContentsMargins(12, 12, 12, 8)
-        top_row.setSpacing(8)
-
-        self._new_btn = QPushButton(i18n.t("main.btn_new_note"))
-        self._new_btn.setIcon(svg_icon("plus"))
-        self._new_btn.setIconSize(QSize(16, 16))
-        self._new_btn.setProperty("primary", True)
-        self._new_btn.setCursor(Qt.PointingHandCursor)
-        self._new_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self._new_btn.setMinimumHeight(44)
-        self._new_btn.setToolTip(i18n.t("main.tooltip_new_note"))
-        self._new_btn.clicked.connect(
-            lambda: self._create_note(self._settings.default_note_color))
-        top_row.addWidget(self._new_btn, 1)
-
-        self._hist_btn = QPushButton(i18n.t("main.btn_history"))
-        self._hist_btn.setIcon(svg_icon("clock"))
-        self._hist_btn.setIconSize(QSize(16, 16))
-        self._hist_btn.setProperty("primary", True)
-        self._hist_btn.setCursor(Qt.PointingHandCursor)
-        self._hist_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self._hist_btn.setMinimumHeight(44)
-        self._hist_btn.clicked.connect(self._open_history)
-        top_row.addWidget(self._hist_btn, 1)
-
-        square_style = (
-            "QToolButton { background: #F5F5F5; border: 1px solid #EAEAEA; "
-            "border-radius: 10px; padding: 0; color: #1F1F1F; }"
-            "QToolButton:hover { background: #F0F0F0; border-color: #D5D5D5; }"
-            "QToolButton:pressed { background: #E2E2E2; }"
-        )
-
-        self._sessions_btn = QToolButton()
-        self._sessions_btn.setIcon(svg_icon("users"))
-        self._sessions_btn.setIconSize(QSize(16, 16))
-        self._sessions_btn.setToolTip(i18n.t("main.tooltip_sessions"))
-        self._sessions_btn.setCursor(Qt.PointingHandCursor)
-        self._sessions_btn.setFixedSize(44, 44)
-        self._sessions_btn.setStyleSheet(square_style)
-        self._sessions_btn.clicked.connect(self._open_sessions)
-        self._sessions_btn.setVisible(not self._solo)       # 혼자 쓰면 참가자가 없다
-        top_row.addWidget(self._sessions_btn)
-
-        self._settings_btn = QToolButton()
-        self._settings_btn.setIcon(svg_icon("settings"))
-        self._settings_btn.setIconSize(QSize(16, 16))
-        self._settings_btn.setToolTip(i18n.t("main.tooltip_settings"))
-        self._settings_btn.setCursor(Qt.PointingHandCursor)
-        self._settings_btn.setFixedSize(44, 44)
-        self._settings_btn.setStyleSheet(square_style)
-        self._settings_btn.clicked.connect(self._open_settings)
-        top_row.addWidget(self._settings_btn)
-
-        v.addWidget(top)
-
-        search_wrap = QWidget()
-        search_layout = QHBoxLayout(search_wrap)
-        search_layout.setContentsMargins(12, 2, 12, 6)
         self._search_input = QLineEdit()
+        self._search_input.setObjectName("MainSearch")
         self._search_input.setPlaceholderText(i18n.t("main.search_placeholder"))
         self._search_input.setClearButtonEnabled(True)
         from PySide6.QtGui import QAction
@@ -446,16 +499,65 @@ class MainWindow(QMainWindow):
                                  "", self._search_input)
         self._search_input.addAction(
             search_action, QLineEdit.LeadingPosition)
-        self._search_input.textChanged.connect(self._apply_search_filter)
-        search_layout.addWidget(self._search_input)
-        v.addWidget(search_wrap)
+        # 높이는 스타일에 적는다. 상단바와 목록 위를 오갈 때 다시 입히는 기본 스타일
+        # (입력칸 최소 높이 20)이 setFixedHeight 를 덮어써 좁은 창에서 낮아졌다.
+        # 테두리는 늘 2px(평소에는 투명)이라 초점이 와도 높이가 그대로다.
+        self._search_input.setStyleSheet(
+            "QLineEdit#MainSearch { background: #F3F3F3; border: 2px solid transparent; "
+            "border-radius: 9px; padding: 0 8px; font-size: 13px; "
+            "min-height: 32px; max-height: 32px; }"
+            "QLineEdit#MainSearch:focus { background: #FFFFFF; "
+            f"border-color: {theme.COLOR_FOCUS}; }}")
+        self._search_input.setFixedHeight(36)
+        # 메모가 많으면 치기를 멈춘 뒤에 거른다(글자마다 모든 메모를 다시 보지 않게).
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(160)
+        self._search_timer.timeout.connect(lambda: self._apply_search_filter())
+        self._search_input.textChanged.connect(self._on_search_typed)
+        self._search_input.setFixedWidth(self._SEARCH_MIN)
+        self._title_bar.insert_widget(0, self._search_input)
 
-        folder_wrap = QWidget()
-        folder_row = QHBoxLayout(folder_wrap)
-        folder_row.setContentsMargins(12, 0, 12, 8)
-        folder_row.setSpacing(8)
+        self._me_btn = shell.MeButton()
+        self._me_btn.clicked.connect(self._open_me_popup)
+        self._title_bar.add_widget(self._me_btn)
+        self._me_popup: shell.MePopup | None = None
 
-        self._folder_chip = QPushButton(i18n.t("main.folder_all"))
+        # ── 왼쪽 옆줄 ──
+        root = QWidget(self)
+        root.setObjectName("ContentRoot")
+        self.setCentralWidget(root)
+        body = QHBoxLayout(root)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        self._rail = shell.Rail()
+        self._rail.newNoteRequested.connect(
+            lambda: self._create_note(self._settings.default_note_color))
+        self._rail.tagChosen.connect(self._choose_tag)
+        self._rail.newFolderRequested.connect(self._create_folder_dialog)
+        self._rail.placeChosen.connect(self._choose_place)
+        self._rail.folderMenuRequested.connect(self._show_folder_menu)
+        self._rail.historyRequested.connect(self._open_history)
+        self._rail.settingsRequested.connect(self._open_settings)
+        body.addWidget(self._rail)
+        # 옛 이름으로도 찾는다(단축키, 시험).
+        self._new_btn = self._rail.new_button
+        self._hist_btn = self._rail.history_button
+        self._settings_btn = self._rail.settings_button
+
+        main = QWidget()
+        main.setObjectName("MainArea")
+        v = QVBoxLayout(main)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        body.addWidget(main, 1)
+
+        # 좁은 창: 옆줄 대신 위에 고른 곳 펼침 칸과 '새 메모', 그 아래 검색칸.
+        self._narrow_bar = QWidget()
+        narrow = QHBoxLayout(self._narrow_bar)
+        narrow.setContentsMargins(12, 10, 12, 6)
+        narrow.setSpacing(8)
+        self._folder_chip = QPushButton(i18n.t("main.place_all"))
         self._folder_chip.setIcon(svg_icon("folder", color="#3A3A3A"))
         self._folder_chip.setIconSize(QSize(16, 16))
         self._folder_chip.setCursor(Qt.PointingHandCursor)
@@ -466,7 +568,6 @@ class MainWindow(QMainWindow):
             "color: #1F1F1F; text-align: left; font-weight: 600; }"
             "QPushButton:hover { background: #F0F0F0; border-color: #D5D5D5; }"
         )
-        # 펼침 표식은 글자(글리프)가 아니라 아이콘으로 오른쪽 끝에 둔다.
         chip_row = QHBoxLayout(self._folder_chip)
         chip_row.setContentsMargins(0, 0, 11, 0)
         chip_row.addStretch(1)
@@ -477,66 +578,59 @@ class MainWindow(QMainWindow):
         chip_chevron.setStyleSheet("background: transparent; border: none;")
         chip_row.addWidget(chip_chevron, 0, Qt.AlignVCenter)
         self._folder_chip.clicked.connect(self._show_folder_selector)
-        folder_row.addWidget(self._folder_chip, 1)
+        self._folder_chip.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._folder_chip.customContextMenuRequested.connect(
+            lambda pos: self._show_folder_menu(
+                self._current_folder, self._folder_chip.mapToGlobal(pos)))
+        narrow.addWidget(self._folder_chip, 1)
+        self._narrow_new_btn = QPushButton(i18n.t("main.btn_new_note"))
+        self._narrow_new_btn.setIcon(svg_icon("plus", color="#FFFFFF"))
+        self._narrow_new_btn.setIconSize(QSize(14, 14))
+        self._narrow_new_btn.setCursor(Qt.PointingHandCursor)
+        self._narrow_new_btn.setStyleSheet(
+            "QPushButton { min-height: 18px; padding: 7px 12px; }")
+        self._narrow_new_btn.clicked.connect(
+            lambda: self._create_note(self._settings.default_note_color))
+        narrow.addWidget(self._narrow_new_btn)
+        v.addWidget(self._narrow_bar)
+        self._narrow_search = QWidget()
+        self._narrow_search_row = QHBoxLayout(self._narrow_search)
+        self._narrow_search_row.setContentsMargins(12, 0, 12, 4)
+        v.addWidget(self._narrow_search)
 
-        self._folder_menu_btn = QToolButton()
-        self._folder_menu_btn.setIcon(svg_icon("more"))
-        self._folder_menu_btn.setIconSize(QSize(16, 16))
-        self._folder_menu_btn.setToolTip(i18n.t("main.tooltip_folder_actions"))
-        self._folder_menu_btn.setCursor(Qt.PointingHandCursor)
-        self._folder_menu_btn.setFixedSize(34, 34)
-        self._folder_menu_btn.setStyleSheet(
-            "QToolButton { background: #F5F5F5; border: 1px solid #EAEAEA; "
-            "border-radius: 10px; padding: 0; color: #1F1F1F; }"
-            "QToolButton:hover { background: #F0F0F0; border-color: #D5D5D5; }"
-        )
-        self._folder_menu_btn.clicked.connect(self._show_folder_menu)
-        folder_row.addWidget(self._folder_menu_btn)
-
-        v.addWidget(folder_wrap)
-
+        # 머리 줄: 고른 곳, 메모 수, 격자 칸 크기, 보기, 선택
         hdr_row = QWidget()
         hdr = QHBoxLayout(hdr_row)
-        hdr.setContentsMargins(20, 12, 16, 8)
+        hdr.setContentsMargins(20, 14, 16, 8)
         hdr.setSpacing(8)
-        header_lbl = QLabel(i18n.t("main.header_recent_notes"))
-        header_lbl.setStyleSheet(
-            "color: #111827; font-size: 14px; font-weight: 800; "
-            "letter-spacing: -0.2px;")
-        hdr.addWidget(header_lbl, 0)
-
-        # 메모 수 단추. 누를 때마다 전체 → 표시 → 숨김 차례로 목록을 바꾼다.
-        # 숨긴 메모는 목록에서 첫 줄 제목으로만 찾아야 해서 놓치기 쉽다.
-        self._count_btn = QToolButton()
-        self._count_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        self._count_btn.setCursor(Qt.PointingHandCursor)
-        self._count_btn.setFocusPolicy(Qt.NoFocus)
-        self._count_btn.setStyleSheet(
-            "QToolButton { background: rgba(17, 24, 39, 0.07); border: none; "
-            "  border-radius: 9px; padding: 3px 10px; color: #111827; "
-            "  font-size: 11px; font-weight: 700; }"
-            "QToolButton:hover { background: rgba(17, 24, 39, 0.12); }"
-            "QToolButton:pressed { background: rgba(17, 24, 39, 0.18); }"
-        )
-        self._count_btn.clicked.connect(self._cycle_list_mode)
-        hdr.addWidget(self._count_btn, 0)
+        self._place_title = shell.ElidedLabel(i18n.t("main.place_all"))
+        self._place_title.setTextFormat(Qt.PlainText)
+        self._place_title.setStyleSheet(
+            "color: #1F1F1F; font-size: 17px; font-weight: 800;")
+        hdr.addWidget(self._place_title, 0, Qt.AlignVCenter)
+        self._place_count = QLabel("")
+        self._place_count.setStyleSheet("color: #707070; font-size: 13px;")
+        hdr.addWidget(self._place_count, 0, Qt.AlignVCenter)
         hdr.addStretch(1)
-
-        self._view_btn = QToolButton()
-        self._view_btn.setIconSize(QSize(16, 16))
-        self._view_btn.setToolTip(i18n.t("main.tooltip_view"))
-        self._view_btn.setAccessibleName(i18n.t("main.tooltip_view"))
-        self._view_btn.setCursor(Qt.PointingHandCursor)
-        self._view_btn.setFixedSize(32, 26)
-        self._view_btn.setStyleSheet(
-            "QToolButton { background: transparent; border: 1px solid "
-            "  #D5D5D5; border-radius: 7px; padding: 0; }"
-            "QToolButton:hover { background: #F3F4F6; }"
-            "QToolButton:pressed { background: #E5E7EB; }"
-            "QToolButton:focus { border-color: #1F1F1F; }"
-        )
-        self._view_btn.clicked.connect(self._show_view_menu)
-        hdr.addWidget(self._view_btn)
+        self._size_btn = QToolButton()
+        # 글 오른쪽에 펼침 표시(글자가 아니라 그림으로).
+        self._size_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._size_btn.setLayoutDirection(Qt.RightToLeft)
+        self._size_btn.setIcon(svg_icon("chevron_down", color="#5B5B5B"))
+        self._size_btn.setIconSize(QSize(12, 12))
+        self._size_btn.setCursor(Qt.PointingHandCursor)
+        self._size_btn.setToolTip(i18n.t("main.tooltip_cell_size"))
+        self._size_btn.setAccessibleName(i18n.t("main.tooltip_cell_size"))
+        self._size_btn.setStyleSheet(
+            "QToolButton { background: transparent; border: 1px solid #D5D5D5; "
+            "border-radius: 7px; padding: 4px 10px; color: #3A3A3A; "
+            "font-size: 12px; font-weight: 600; }"
+            "QToolButton:hover { background: #F3F3F3; }")
+        self._size_btn.clicked.connect(self._show_size_menu)
+        hdr.addWidget(self._size_btn, 0, Qt.AlignVCenter)
+        self._view_toggle = shell.ViewToggle()
+        self._view_toggle.changed.connect(lambda k: self._set_view_mode(layout=k))
+        hdr.addWidget(self._view_toggle, 0, Qt.AlignVCenter)
 
         self._select_btn = QToolButton()
         self._select_btn.setText(i18n.t("main.btn_select"))
@@ -546,20 +640,20 @@ class MainWindow(QMainWindow):
         self._select_btn.setFocusPolicy(Qt.NoFocus)
         self._select_btn.setStyleSheet(
             "QToolButton { background: transparent; border: 1px solid "
-            "  #D5D5D5; border-radius: 7px; padding: 3px 10px; "
-            "  color: #4B5563; font-size: 11.5px; font-weight: 700; }"
-            "QToolButton:hover { background: #F3F4F6; }"
-            "QToolButton:checked { background: #2563EB; "
-            "  border-color: #2563EB; color: #FFFFFF; }"
+            "  #D5D5D5; border-radius: 7px; padding: 4px 12px; "
+            "  color: #3A3A3A; font-size: 12px; font-weight: 600; }"
+            "QToolButton:hover { background: #F3F3F3; }"
+            "QToolButton:checked { background: #1F1F1F; "
+            "  border-color: #1F1F1F; color: #FFFFFF; }"
         )
         self._select_btn.toggled.connect(self._on_select_mode_toggled)
-        hdr.addWidget(self._select_btn)
+        hdr.addWidget(self._select_btn, 0, Qt.AlignVCenter)
 
         v.addWidget(hdr_row)
 
         scroll_wrap = QWidget()
         scroll_wrap_v = QVBoxLayout(scroll_wrap)
-        scroll_wrap_v.setContentsMargins(12, 2, 12, 10)
+        scroll_wrap_v.setContentsMargins(12, 0, 12, 8)
         scroll_wrap_v.setSpacing(0)
 
         self._scroll = QScrollArea()
@@ -567,11 +661,7 @@ class MainWindow(QMainWindow):
         self._scroll.setFrameShape(QScrollArea.NoFrame)
         self._scroll.setVerticalScrollBar(RoundedScrollBar())
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._scroll.setStyleSheet(
-            "QScrollArea { background: #FAFBFD; "
-            "border: 1px solid #ECECEC; border-radius: 14px; }"
-        )
-        # 뷰포트를 투명으로 둬야 스크롤 영역이 그리는 둥근 배경이 드러난다.
+        self._scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
         self._scroll.viewport().setStyleSheet("background: transparent;")
         self._scroll.viewport().setAutoFillBackground(False)
 
@@ -579,8 +669,16 @@ class MainWindow(QMainWindow):
         self._cards_container.setObjectName("CardsContainer")
         self._cards_container.setStyleSheet("background: transparent;")
         self._cards_layout = CardFlowLayout(self._cards_container)
-        self._cards_layout.setContentsMargins(10, 10, 10, 10)
-        self._cards_layout.setSpacing(8)
+        self._cards_layout.setContentsMargins(4, 2, 4, 10)
+        self._cards_layout.setSpacing(2)
+
+        self._trash_container = QWidget()
+        self._trash_container.setObjectName("TrashContainer")
+        self._trash_container.setStyleSheet("background: transparent;")
+        self._trash_layout = CardFlowLayout(self._trash_container)
+        self._trash_layout.setContentsMargins(4, 2, 4, 10)
+        self._trash_layout.setSpacing(2)
+        self._trash_container.hide()
 
         self._scroll.setWidget(self._cards_container)
         # 목록 위의 한 줄 알림. 이 PC 의 사본을 보여 주는 중이거나, 끊긴 동안 쓴
@@ -621,8 +719,7 @@ class MainWindow(QMainWindow):
         self._empty_panel = QFrame()
         self._empty_panel.setObjectName("EmptyPanel")
         self._empty_panel.setStyleSheet(
-            "QFrame#EmptyPanel { background: #FAFBFD; "
-            "border: 1px solid #ECECEC; border-radius: 14px; }")
+            "QFrame#EmptyPanel { background: transparent; border: none; }")
         empty_v = QVBoxLayout(self._empty_panel)
         empty_v.setContentsMargins(28, 24, 28, 24)
         empty_v.setSpacing(8)
@@ -649,6 +746,7 @@ class MainWindow(QMainWindow):
         self._empty_panel.hide()
         scroll_wrap_v.addWidget(self._empty_panel)
         v.addWidget(scroll_wrap, 1)
+        v.addWidget(self._build_trash_bar())
 
         self._bulk_bar = QWidget()
         self._bulk_bar.setObjectName("BulkActionBar")
@@ -716,11 +814,17 @@ class MainWindow(QMainWindow):
         self._undo_timer.setSingleShot(True)
         self._undo_timer.setInterval(self._UNDO_MS)
         self._undo_timer.timeout.connect(self._forget_undo)
-        self._conn_badge = _ConnectionBadge()
-        status.addPermanentWidget(self._conn_badge)
-        status.messageChanged.connect(
-            lambda text: self._conn_badge.set_compact(bool(text)))
+        # 연결 상태는 상단바의 본인 아이콘이 보인다. 이 표시는 그 상태를 들고 있다.
+        self._conn_badge = _ConnectionBadge(self)
+        self._conn_badge.hide()
+        # 상태줄은 잠깐 뜨는 글과 '되돌리기'가 있을 때만 보인다.
+        status.setSizeGripEnabled(False)
+        status.setStyleSheet(
+            "QStatusBar { background: #FFFFFF; border-top: 1px solid #EFEFEF; "
+            "color: #4B5563; font-size: 12px; padding: 2px 12px; }")
+        status.messageChanged.connect(lambda _t: self._refresh_status_bar())
         self._refresh_status_text()
+        self._refresh_status_bar()
 
         self._select_all_shortcut = QShortcut(
             QKeySequence.SelectAll, self, self._select_all_via_shortcut)
@@ -731,6 +835,7 @@ class MainWindow(QMainWindow):
         self._find_shortcut = QShortcut(
             QKeySequence.Find, self, self._focus_search)
         self._refresh_view_mode()
+        self._apply_narrow(self.width() < self._narrow_below())
 
     def _focus_search(self) -> None:
         self._search_input.setFocus(Qt.ShortcutFocusReason)
@@ -742,6 +847,8 @@ class MainWindow(QMainWindow):
             self._search_input.setFocus(Qt.OtherFocusReason)
         elif self._empty_kind == "unreachable":
             self._reset_connection()
+        elif self._empty_kind in (LIST_SHOWN, LIST_HIDDEN, LIST_REMIND):
+            self._choose_place(shell.PLACE_ALL, "")
         else:
             self._create_note(self._settings.default_note_color)
 
@@ -752,32 +859,51 @@ class MainWindow(QMainWindow):
 
     # ── 보기 방식 ──
 
-    def _show_view_menu(self) -> None:
+    def _fit_minimum_width(self, cell: int) -> None:
+        """창을 가장 좁게 줄여도 격자가 두 줄로 보이게 한다(옆줄은 접힌다). 목록으로
+        볼 때도 같은 폭이라, 보기를 바꿔도 창 폭이 튀지 않는다."""
+        bar = self._scroll.verticalScrollBar().sizeHint().width()
+        cards = self._cards_layout.contentsMargins()
+        wrap = self._scroll.parentWidget().layout().contentsMargins()
+        width = (2 * cell + 10 + cards.left() + cards.right()
+                 + wrap.left() + wrap.right() + bar + 4)
+        self._two_columns = width
+        self.setMinimumWidth(max(self._TITLE_MIN_WIDTH, width))
+
+    def _narrow_below(self) -> int:
+        """이 폭보다 좁으면 옆줄을 접는다: 옆줄을 둔 채로는 격자가 두 줄로 들어가지
+        않는 폭(그래야 옆줄이 있는 채로 한 줄이 되어 오른쪽이 비는 일이 없다)."""
+        return max(shell.NARROW_BELOW, shell.RAIL_WIDTH + getattr(self, "_two_columns", 0))
+
+    # 상단바(표식, 이름, 본인 아이콘, 창 단추)가 들어가는 가장 작은 폭.
+    _TITLE_MIN_WIDTH = 340
+
+    def _show_size_menu(self) -> None:
+        """작게, 보통, 크게. 메뉴는 단추 폭만큼 좁고, 고른 것 앞에 체크가 있다."""
         s = self._settings
-        menu = QMenu(self._view_btn)
-        add_centered_menu_action(
-            menu, None, i18n.t("main.view_section_density"), header=True)
-        for key, label in ((VIEW_COMPACT, "main.view_compact"),
-                           (VIEW_STANDARD, "main.view_standard"),
-                           (VIEW_DETAILED, "main.view_detailed")):
-            add_centered_menu_action(
-                menu, None, i18n.t(label),
-                lambda k=key: self._set_view_mode(density=k),
-                checked=(s.notes_view_density == key))
-        menu.addSeparator()
-        add_centered_menu_action(
-            menu, None, i18n.t("main.view_section_layout"), header=True)
-        for key, label, icon in ((VIEW_LIST, "main.view_list", "view_list"),
-                                 (VIEW_GRID, "main.view_grid", "view_grid")):
-            add_centered_menu_action(
-                menu, svg_icon(icon, color="#3A3A3A"), i18n.t(label),
-                lambda k=key: self._set_view_mode(layout=k),
-                checked=(s.notes_view_layout == key))
-        # 버튼이 창 오른쪽 끝에 있어 메뉴를 버튼의 오른쪽 끝에 맞춰 연다.
-        pos = self._view_btn.mapToGlobal(
-            QPoint(self._view_btn.width() - menu.sizeHint().width(),
-                   self._view_btn.height() + 2))
-        menu.exec(pos)
+        menu = QMenu(self._size_btn)
+        menu.setAttribute(Qt.WA_NoMouseReplay)
+        check = (config.RESOURCE_DIR / "Image" / "check.svg").as_posix()
+        menu.setStyleSheet(
+            "QMenu { background-color: #FFFFFF; border: 1px solid #EAEAEA; "
+            "border-radius: 8px; padding: 4px; color: #1F1F1F; }"
+            "QMenu::item { background-color: transparent; padding: 6px 14px 6px 28px; "
+            "border-radius: 6px; color: #1F1F1F; min-width: 0px; }"
+            "QMenu::item:selected { background-color: #F0F0F0; }"
+            "QMenu::indicator { width: 12px; height: 12px; left: 9px; }"
+            f'QMenu::indicator:checked {{ image: url("{check}"); }}')
+        group = QActionGroup(menu)
+        group.setExclusive(True)
+        for key in (VIEW_COMPACT, VIEW_STANDARD, VIEW_DETAILED):
+            act = menu.addAction(i18n.t(f"main.size_{key}"))
+            act.setCheckable(True)
+            act.setChecked(s.notes_view_density == key)
+            group.addAction(act)
+            act.triggered.connect(lambda *_a, k=key: self._set_view_mode(density=k))
+        menu.setMinimumWidth(self._size_btn.width())
+        edit_menu.run_menu(menu, self._size_btn.mapToGlobal(
+            QPoint(0, self._size_btn.height() + 2)))
+        menu.deleteLater()
 
     def _set_view_mode(self, *, density: str | None = None,
                        layout: str | None = None) -> None:
@@ -790,18 +916,30 @@ class MainWindow(QMainWindow):
         self._refresh_view_mode()
 
     def _refresh_view_mode(self) -> None:
-        """설정에 적힌 보기 방식을 카드와 배치에 입힌다."""
+        """설정에 적힌 보기 방식을 카드와 배치에 입힌다. 휴지통도 같은 보기다."""
         s = self._settings
         grid = s.notes_view_layout == VIEW_GRID
-        compact = s.notes_view_density == VIEW_COMPACT
-        self._cards_layout.set_min_column_width(GRID_MIN_COLUMN if grid else 0)
-        self._cards_layout.setSpacing(5 if (compact and not grid) else 8)
-        for card in self._cards.values():
-            card.set_view(s.notes_view_density, s.notes_view_layout)
-        self._view_btn.setIcon(svg_icon(
-            "view_grid" if grid else "view_list", color="#4B5563"))
-        self._cards_layout.invalidate()
+        cell = GRID_CELL.get(s.notes_view_density, GRID_CELL[VIEW_STANDARD])
+        for layout, cards in ((self._cards_layout, self._cards.values()),
+                              (self._trash_layout, self._trash_cards.values())):
+            layout.set_min_column_width(0)
+            layout.set_square(cell if grid else 0)
+            layout.setSpacing(10 if grid else 2)
+            for card in cards:
+                if hasattr(card, "set_view_all"):
+                    card.set_view_all(grid, s.notes_view_density, s.notes_view_layout)
+                else:
+                    card.set_square(grid)
+                    card.set_view(s.notes_view_density, s.notes_view_layout)
+            layout.invalidate()
+        self._view_toggle.set_layout(s.notes_view_layout)
+        self._fit_minimum_width(cell)
+        if self._narrow is not None:
+            self._apply_narrow(self.width() < self._narrow_below())
+        self._size_btn.setText(i18n.t(f"main.size_{s.notes_view_density}"))
+        self._size_btn.setVisible(True)          # 목록도 작게, 보통, 크게
         self._cards_container.updateGeometry()
+        self._trash_container.updateGeometry()
 
     def _wire_client(self) -> None:
         c = self._client
@@ -826,6 +964,12 @@ class MainWindow(QMainWindow):
         c.noteRestored.connect(self._on_note_restored)
         c.trashList.connect(self._on_trash_list)
         c.trashChanged.connect(self._on_trash_changed)
+        c.reminderChanged.connect(self._on_reminder_changed)
+        c.noticeChanged.connect(self._on_notice_changed)
+        c.seenChanged.connect(self._on_seen_changed)
+        c.mentioned.connect(self._on_mentioned)
+        c.widgetChanged.connect(self._on_widget_changed)
+        c.widgetError.connect(self._on_widget_error)
         c.connectionChanged.connect(self._on_connection_changed)
         c.errorOccurred.connect(self._on_error)
         c.passwordRequired.connect(self._on_password_required)
@@ -888,6 +1032,9 @@ class MainWindow(QMainWindow):
             self.handle_new_note_request(QCursor.pos())
         elif cmd == CMD_NEW_FOLDER_HERE:
             self.handle_new_folder_request(QCursor.pos())
+        elif cmd == CMD_CLIP_NOTE_HERE:
+            # 바탕 화면이나 파일 우클릭 메뉴의 '클립보드로 새 메모'. 마우스가 있는 자리에.
+            self.handle_clip_note_request(QCursor.pos())
         elif cmd == CMD_LINK_NOTE:
             if arg:
                 self._queue_link_path(arg)
@@ -928,10 +1075,11 @@ class MainWindow(QMainWindow):
             self._show_main_window()
             return
         self._link_note_queue.append(paths)
-        self._new_note_spots.append((time.monotonic(), at))
+        self._new_note_spots.append((time.monotonic(), at, None))
         self._create_note(self._settings.default_note_color)
 
-    def handle_new_note_request(self, at: QPoint | None = None) -> None:
+    def handle_new_note_request(self, at: QPoint | None = None,
+                                screen_hint: QPoint | None = None) -> None:
         """앱 밖(작업 표시줄 목록, 바탕 화면 우클릭 메뉴)에서 온 '새 메모'.
 
         메인 창은 건드리지 않는다. 만들어진 메모만 다른 창들 위로 올라온다
@@ -941,8 +1089,58 @@ class MainWindow(QMainWindow):
             # 상태)이 보이는 메인 창을 띄운다.
             self._show_main_window()
             return
-        self._new_note_spots.append((time.monotonic(), at))
+        self._new_note_spots.append((time.monotonic(), at, screen_hint))
         self._create_note(self._settings.default_note_color)
+
+    def handle_clip_note_request(self, spot: QPoint | None = None) -> None:
+        """클립보드의 글이나 그림으로 새 메모를 만든다(단축키, 우클릭 메뉴). 자리를 주지
+        않으면 마우스가 있는 자리에."""
+        mime = copy_mime(QGuiApplication.clipboard().mimeData())
+        if mime is None:
+            self._toasts.show_text(i18n.t("hotkey.clip_empty"))
+            return
+        if not self._connected and not self._can_work_offline():
+            self._show_main_window()
+            return
+        self._clip_note_queue.append(mime)
+        # 우클릭 메뉴로 왔으면 누른 자리에, 단축키면 마우스가 있는 화면에 띄운다
+        # ('새 메모 추가' 와 같다).
+        if spot is not None:
+            self._new_note_spots.append((time.monotonic(), spot, spot))
+        else:
+            self._new_note_spots.append((time.monotonic(), None, QCursor.pos()))
+        self._create_note(self._settings.default_note_color)
+
+    # ── 어디서나 쓰는 단축키 ──
+
+    def _apply_hotkeys(self) -> None:
+        if self._force_quit:
+            return
+        self._global_keys.apply(self._settings.hotkeys)
+
+    def _on_global_key(self, action: str) -> None:
+        if self._force_quit:
+            return
+        if action == "new_note":
+            self.handle_new_note_request(screen_hint=QCursor.pos())
+        elif action == "find":
+            self._open_quick_find()
+        elif action == "clip_note":
+            self.handle_clip_note_request()
+
+    def _open_quick_find(self) -> None:
+        if self._quick_find is None:
+            self._quick_find = QuickFind()
+            self._quick_find.picked.connect(self._take_note_out)
+        notes = []
+        for nid, note in self._notes.items():
+            folder = self._folders.get(note.get("folder_id") or "") or {}
+            notes.append({"id": nid, "title": self._note_title(note, 80),
+                          "body": html_to_plain(with_widgets_as_text(note.get("content") or "")),
+                          "folder": folder.get("name") or "",
+                          "color": note.get("color") or config.DEFAULT_COLOR,
+                          "updated_at": note.get("updated_at") or 0})
+        self._quick_find.open_at(notes, QCursor.pos())
 
     def handle_new_folder_request(self, at: QPoint | None = None) -> None:
         """바탕 화면 우클릭 메뉴의 '새 메모 폴더 추가'. 폴더를 만들어 그 자리에
@@ -968,22 +1166,24 @@ class MainWindow(QMainWindow):
             number += 1
         return f"{base} ({number})"
 
-    def _take_new_note_spot(self) -> QPoint | None:
-        """방금 만들어진 메모에 해당하는 요청 자리를 꺼낸다."""
+    def _take_new_note_spot(self) -> tuple[QPoint | None, QPoint | None]:
+        """방금 만들어진 메모에 해당하는 요청 (자리, 띄울 화면의 한 점)을 꺼낸다."""
         now = time.monotonic()
         while self._new_note_spots:
-            asked_at, spot = self._new_note_spots.pop(0)
+            asked_at, spot, hint = self._new_note_spots.pop(0)
             if now - asked_at <= NEW_NOTE_SPOT_TTL:
-                return spot
-        return None
+                return spot, hint
+        return None, None
 
     def _new_note_position(self, width: int, height: int,
-                           at: QPoint | None) -> QPoint:
+                           at: QPoint | None,
+                           screen_hint: QPoint | None = None) -> QPoint:
         """방금 만든 메모를 띄울 자리.
 
         우클릭 메뉴에서 왔으면 마우스 자리에, 아니면 주 화면 왼쪽 위에서 시작해
         이미 메모가 놓인 자리를 비켜 간다. 어느 쪽이든 화면 안에 들어오게 한다."""
-        screen = QGuiApplication.screenAt(at) if at is not None else None
+        point = at if at is not None else screen_hint
+        screen = QGuiApplication.screenAt(point) if point is not None else None
         screen = screen or QGuiApplication.primaryScreen()
         avail = (screen.availableGeometry() if screen is not None
                  else QRect(0, 0, 1280, 720))
@@ -1018,7 +1218,11 @@ class MainWindow(QMainWindow):
 
     def _ensure_history_viewer(self) -> HistoryViewer:
         if self._history_viewer is None:
-            self._history_viewer = HistoryViewer(self)
+            # 주인 창을 두지 않는다. 메인 창과 앞뒤를 자유롭게 바꾸고 작업 표시줄에
+            # 따로 보인다.
+            self._history_viewer = HistoryViewer(None)
+            if self._app_icon is not None and not self._app_icon.isNull():
+                self._history_viewer.setWindowIcon(self._app_icon)
             self._history_viewer.restoreRequested.connect(
                 self._on_restore_requested)
             self._history_viewer.reviveRequested.connect(
@@ -1032,21 +1236,65 @@ class MainWindow(QMainWindow):
             self._history_viewer.set_notes(list(self._notes.values()))
 
     def _open_settings(self) -> None:
+        """설정 창을 연다. 모달이 아니라 열어 둔 채 메인 창을 옮기고 쓸 수 있다. 창은
+        한가할 때 미리 만들어 두어 바로 뜬다(처음 만드는 데 1초 가까이 걸린다)."""
+        dlg = self._settings_dialog
+        if dlg is not None and dlg.isVisible():
+            dlg.raise_()
+            dlg.activateWindow()
+            return
+        if dlg is None:
+            dlg = self._build_settings_dialog()
+        self._settings_dialog = dlg
+        dlg.finished.connect(self._on_settings_closed)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _build_settings_dialog(self) -> SettingsDialog:
         dlg = SettingsDialog(self._settings, role=self._role, parent=self,
                              solo=self._solo)
         dlg.backupNowRequested.connect(self.backupRequested.emit)
-        dlg.resetConnectionRequested.connect(self._reset_connection)
-        dlg.shareRequested.connect(self._start_sharing)
         # 아직 저장하지 않은 백업 폴더라도 거기서 찾는다(다른 PC 에서 가져온
         # 백업 폴더를 가리켜 되살리는 경우).
-        dlg.restoreRequested.connect(lambda: self.open_restore(dlg.backup_folder()))
-        dlg.exec()
+        dlg.restoreRequested.connect(lambda d=dlg: self.open_restore(d.backup_folder()))
+        dlg.set_hotkey_probe(lambda text: probe_free(self._global_keys, text))
+        return dlg
+
+    def _prebuild_settings_when_idle(self) -> None:
+        """사용자가 키보드와 마우스를 2초 넘게 쉬고 있으면 설정 창을 미리 만든다. 아니면
+        조금 뒤에 다시 본다(느린 PC 에서 일하는 중에 멈추지 않게)."""
+        if self._settings_dialog is not None or self._force_quit:
+            return
+        if _user_idle_ms() >= 2000:
+            self._prebuild_settings()
+        else:
+            QTimer.singleShot(4000, self._prebuild_settings_when_idle)
+
+    def _prebuild_settings(self) -> None:
+        """한가할 때 설정 창을 미리 만들어 둔다(보이지 않는다)."""
+        if self._settings_dialog is None and not self._force_quit:
+            self._settings_dialog = self._build_settings_dialog()
+
+    def _on_settings_closed(self, _result: int = 0) -> None:
+        dlg, self._settings_dialog = self._settings_dialog, None
+        if dlg is not None:
+            dlg.deleteLater()
         self._apply_tray_visibility()
+        self._apply_hotkeys()
+        self._apply_window_attach()
+        for nid in list(self._stickies):
+            self._apply_widgets(nid)
         nf.set_animation_speed(self._settings.animation_speed)
         # '붙인 메모를 다른 창 위에'와 접힌 모양은 떠 있는 메모에 바로 반영한다.
         for w in self._stickies.values():
             w.refresh_dock_layer()
             w.refresh_fold_face()
+            w.set_attach_modes(self._settings.attach_modes)
+            w.set_opacity(self._note_opacity(w.note_id))
+            w.set_word_wrap(self._note_wraps(w.note_id))
+        # 다음에 열 창을 미리 만든다(방금 바꾼 설정으로).
+        QTimer.singleShot(3000, self._prebuild_settings_when_idle)
 
     def open_copies(self) -> None:
         """끊겨 있다는 안내를 눌렀다. 받아 둔 사본을 열어 본다."""
@@ -1173,9 +1421,10 @@ class MainWindow(QMainWindow):
             self._status.showMessage(i18n.t("main.status_disconnected"), 6000)
         else:
             self._connect_failures += 1
-        # 끊긴 동안에는 메모에 '오프라인'을 적는다.
+        # 끊긴 동안에는 메모에 '오프라인'을 적고, 위젯은 넣거나 고치지 못하게 한다.
         for w in self._stickies.values():
             w.set_offline(not connected)
+            self._apply_widget_env(w)
         if not connected:
             self._enter_offline()
             self._find_host_again()
@@ -1385,6 +1634,9 @@ class MainWindow(QMainWindow):
         me = self._client.nickname()
         for nick in self._users:
             self._local.state.touch_user_in_session(nick, is_self=(nick == me))
+        self._take_shared_reminders(data)
+        self._take_notices(data)
+        self._take_widgets(data)
         self._local.save()
         self._refresh_sessions_dialog()
         self._refresh_status_text()
@@ -1392,6 +1644,8 @@ class MainWindow(QMainWindow):
                             dict(data.get("locks", {})), offline=False)
         self._recover_unsent(unsent, seen_versions, was_private)
         self._settle_drafts(set(unsent))
+        self._refresh_notices()
+        self._show_waiting_mentions(data.get("mentions"))
 
     def _load_snapshot(self, notes: list, folders: list, locks: dict, *,
                        offline: bool) -> None:
@@ -1441,6 +1695,8 @@ class MainWindow(QMainWindow):
         # (앱이 꺼져 있는 동안 바탕화면 아이콘의 크기가 바뀌었을 수 있다).
         self._icons_loaded = True
         self._align_icons()
+        # 꺼져 있던 동안 지난 알림과 체크 해제 예약을 곧 처리한다.
+        self._schedule_timer.start(1500)
 
     def _hide_notes_new_to_this_pc(self, notes: list, *,
                                    received: bool) -> None:
@@ -1735,6 +1991,7 @@ class MainWindow(QMainWindow):
         self._keep_unanswered_text()
         self._recreate_queue.clear()
         self._link_note_queue.clear()
+        self._clip_note_queue.clear()
         self._pending_restore.clear()
         self._draft_uploads.clear()
         self._drafts_in_flight.clear()
@@ -2070,12 +2327,15 @@ class MainWindow(QMainWindow):
             if restoring.get("draft"):
                 # 끊긴 동안 쓴 글을 올리는 중이다. 글이 들어가면 적어 둔 것을 지운다.
                 self._draft_uploads[note["id"]] = restoring["draft"]
+                # 끊긴 동안 만든 메모에 정해 둔 알림, 투명도 같은 것도 새 id 로 옮긴다.
+                self._local.state.move_note_extras(restoring["draft"], note["id"])
             self._pending_resend[note["id"]] = restoring["content"]
         elif is_creator:
+            spot, hint = self._take_new_note_spot()
             pos = self._new_note_position(
                 int(note.get("width") or config.DEFAULT_NOTE_WIDTH),
                 int(note.get("height") or config.DEFAULT_NOTE_HEIGHT),
-                self._take_new_note_spot())
+                spot, screen_hint=hint)
             st.x, st.y = pos.x(), pos.y()
         self._local.save()
         # 남이 만든 메모는 숨김으로 들어온다. '숨김 N' 의 수를 맞춘다.
@@ -2102,6 +2362,7 @@ class MainWindow(QMainWindow):
         if is_creator:
             recovered = bool(self._orphan_texts)
             links = None
+            clip = None
             if recovered:
                 # 끊긴 동안 쓴 글을 담으려고 만든 메모다. 그 글을 넣는다.
                 self._pending_resend[note["id"]] = self._orphan_texts.pop(0)
@@ -2111,11 +2372,17 @@ class MainWindow(QMainWindow):
                     i18n.t("main.status_unsent_new_note"), 10000)
             elif self._link_note_queue:
                 links = self._link_note_queue.pop(0)
+            elif self._clip_note_queue:
+                clip = self._clip_note_queue.pop(0)
             # 메모는 평소 바탕 화면 쪽에 깔린다. 방금 만든 메모는 다른 창을 쓰던
             # 중이어도 보여야 하고 바로 쓸 수 있어야 하므로 앞으로 올린다.
             w = self._stickies.get(note["id"])
             if w is not None:
-                w.bring_to_front(start_editing=not recovered and not links)
+                w.bring_to_front(start_editing=not recovered and not links
+                                 and clip is None)
+                if clip is not None:
+                    # 클립보드로 만든 메모: 그 내용을 넣는다.
+                    w.add_clipboard(clip)
                 if links:
                     # 파일 우클릭 메뉴로 만든 메모: 그 파일의 링크를 넣는다.
                     self._link_note_recent = (note["id"], time.monotonic())
@@ -2137,15 +2404,424 @@ class MainWindow(QMainWindow):
         self._refresh_folder_icons()
         # 서버는 실제 변경에만 note_updated 를 보내므로, 도착할 때마다 맨 위로 올린다.
         self._move_card_to_top(note["id"])
-        self._apply_search_filter()
+        if self._place == shell.PLACE_TRASH:
+            self._apply_search_filter()
+        else:
+            # 그 카드 하나만 다시 거른다(모든 카드를 다시 보지 않는다).
+            card = self._cards.get(note["id"])
+            if card is not None:
+                card.setVisible(self._card_matches(note["id"], note))
+            self._refresh_count()
         self._invalidate_tray_menu()
 
     def _move_card_to_top(self, note_id: str) -> None:
         card = self._cards.get(note_id)
         if card is None:
             return
+        # 이미 맨 위(위에 공지만 있음)면 옮기지 않는다. 옮기면 목록 전체를 다시 놓는다.
+        index = self._cards_layout.indexOf(card)
+        if index >= 0 and all(
+                getattr(self._cards_layout.itemAt(i).widget(), "_note_id", None) in self._notices
+                for i in range(index)):
+            return
         self._cards_layout.removeWidget(card)
         self._cards_layout.insertWidget(0, card)
+        if note_id not in self._notices:
+            self._pin_notices()
+
+    # ── 인쇄와 PDF ──
+
+    def _note_for_print(self, note_id: str) -> dict | None:
+        note = self._notes.get(note_id)
+        if note is None:
+            return None
+        out = dict(note)
+        w = self._stickies.get(note_id)
+        if w is not None and w.is_editing():
+            out["content"] = w._current_content()           # 고치는 중인 글
+        return out
+
+    def print_notes(self, note_ids: list[str], how: str, *,
+                    one_per_page: bool = True, title: str = "") -> None:
+        """메모들을 인쇄하거나 PDF 로 저장한다. 흰 바탕이 기본이고 설정의 '메모 색
+        그대로' 를 따른다."""
+        from . import note_print
+        notes = [n for n in (self._note_for_print(nid) for nid in note_ids) if n]
+        if not notes:
+            return
+        title = title or self._note_title(notes[0])
+        keep = bool(self._settings.print_keep_color)
+        if how == "pdf":
+            path, _ = QFileDialog.getSaveFileName(
+                self, i18n.t("print.menu_pdf"), note_print.pdf_file_name(title), "PDF (*.pdf)")
+            if not path:
+                return
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                note_print.save_pdf(path, notes, keep_color=keep,
+                                    one_per_page=one_per_page, doc_title=title)
+            except OSError:
+                QApplication.restoreOverrideCursor()
+                confirm.notify(self, i18n.t("print.menu_pdf"), i18n.t("print.error_pdf"))
+                return
+            QApplication.restoreOverrideCursor()
+            self._status.showMessage(i18n.t("print.saved"), 5000)
+        else:
+            note_print.print_notes(self, notes, keep_color=keep,
+                                   one_per_page=one_per_page, doc_name=title)
+
+    def _add_print_menu(self, menu: QMenu, note_ids_of) -> None:
+        """폴더 메뉴의 '인쇄': 인쇄와 PDF, 각각 메모마다 한 쪽 또는 이어서. 메모 색 그대로."""
+        # 하위 메뉴는 부모를 주어 만든다(파이썬 쪽이 가지면 이 함수를 벗어날 때 지워진다).
+        sub = QMenu(i18n.t("print.menu"), menu)
+        sub.setIcon(svg_icon("printer"))
+        menu.addMenu(sub)
+        one = bool(self._settings.print_one_per_page)
+        sub.addAction(i18n.t("print.menu_print"),
+                      lambda: self.print_notes(note_ids_of(), "print",
+                                               one_per_page=self._settings.print_one_per_page))
+        sub.addAction(i18n.t("print.menu_pdf"),
+                      lambda: self.print_notes(note_ids_of(), "pdf",
+                                               one_per_page=self._settings.print_one_per_page))
+        sub.addSeparator()
+        group = QActionGroup(sub)
+        for value, label in ((True, "print.one_per_page"), (False, "print.continuous")):
+            act = sub.addAction(i18n.t(label))
+            act.setCheckable(True)
+            act.setChecked(one == value)
+            group.addAction(act)
+            act.triggered.connect(lambda _c=False, v=value: self._set_print_one_per_page(v))
+        sub.addSeparator()
+        keep = sub.addAction(i18n.t("print.keep_color"))
+        keep.setCheckable(True)
+        keep.setChecked(bool(self._settings.print_keep_color))
+        keep.toggled.connect(self._set_print_keep_color)
+
+    def _set_print_one_per_page(self, on: bool) -> None:
+        self._settings.print_one_per_page = bool(on)
+        self._settings.save()
+
+    def _set_print_keep_color(self, on: bool) -> None:
+        self._settings.print_keep_color = bool(on)
+        self._settings.save()
+
+    # ── 공지, 읽음, @이름 (1.2) ──
+
+    def _take_notices(self, data: dict) -> None:
+        self._notices_ok = isinstance(data.get("notices"), dict)
+        raw = data.get("notices") if self._notices_ok else {}
+        self._notices = {k: v for k, v in raw.items()
+                         if isinstance(k, str) and isinstance(v, str) and v}
+        seen = data.get("seen") if isinstance(data.get("seen"), dict) else {}
+        self._seen = {k: clean_seen(v) for k, v in seen.items() if isinstance(k, str)}
+        self._seen_sent.clear()
+
+    def _refresh_notices(self) -> None:
+        for nid in list(self._notes):
+            self._apply_notice(nid)
+        self._pin_notices()
+
+    def _visible_card_order(self) -> list[str]:
+        """목록에 놓인 차례대로의 메모 id."""
+        out = []
+        for i in range(self._cards_layout.count()):
+            card = self._cards_layout.itemAt(i).widget()
+            if isinstance(card, NoteCard):
+                out.append(card._note_id)
+        return out
+
+    def _pin_notices(self) -> None:
+        """공지는 목록 맨 위(최근에 고친 것이 먼저)."""
+        pinned = sorted((nid for nid in self._notices if nid in self._cards),
+                        key=lambda n: int(self._notes.get(n, {}).get("updated_at") or 0))
+        for nid in pinned:
+            card = self._cards[nid]
+            self._cards_layout.removeWidget(card)
+            self._cards_layout.insertWidget(0, card)
+
+    def _read_counts(self, note_id: str) -> tuple[list, list]:
+        """내 공지를 마지막으로 고친 뒤에 본 사람(이름, 때)과 아직 안 본 사람."""
+        note = self._notes.get(note_id) or {}
+        version = int(note.get("version") or 1)
+        seen = self._seen.get(note_id, {})
+        me = self._client.nickname()
+        people = [p for p in self._reminder_people(list(seen)) if p != me]
+        read = sorted(((p, seen[p]["at"]) for p in people
+                       if p in seen and seen[p]["version"] >= version),
+                      key=lambda x: x[1])
+        done = {p for p, _ in read}
+        return read, [p for p in people if p not in done]
+
+    def _apply_notice(self, note_id: str) -> None:
+        owner = self._notices.get(note_id)
+        note = self._notes.get(note_id) or {}
+        me = self._client.nickname()
+        card = self._cards.get(note_id)
+        if card is not None:
+            card.set_notice(bool(owner))
+        w = self._stickies.get(note_id)
+        if w is None:
+            return
+        can_make = (self._notices_ok and self._connected and not owner
+                    and note.get("created_by") == me and not self._note_is_private(note))
+        can_lift = bool(owner) and (owner == me or self._role == "host")
+        read_text = ""
+        if owner and owner == me:
+            read, unread = self._read_counts(note_id)
+            read_text = i18n.t("notice.read", read=len(read), total=len(read) + len(unread))
+            read_short = f"{len(read)}/{len(read) + len(unread)}"
+        else:
+            read_short = ""
+        w.set_notice(owner, can_make=can_make, can_lift=can_lift, read_text=read_text,
+                     read_short=read_short)
+        # @이름 자동 완성: 모두가 보는 메모에서, 나를 뺀 참가자.
+        w.set_people([] if self._note_is_private(note) else
+                     [p for p in self._reminder_people([]) if p != me])
+
+    # ── 메모 안 위젯 ──
+
+    def _take_widgets(self, data: dict) -> None:
+        raw = data.get("widgets")
+        self._widgets_ok = isinstance(raw, dict)
+        self._widget_store = {}
+        for wid, entry in (raw or {}).items():
+            if (isinstance(wid, str) and isinstance(entry, dict)
+                    and isinstance(entry.get("note_id"), str)
+                    and isinstance(entry.get("data"), dict)):
+                self._widget_store[wid] = (entry["note_id"], entry["data"])
+        for nid in list(self._stickies):
+            self._apply_widgets(nid)
+
+    def _apply_widgets(self, note_id: str) -> None:
+        w = self._stickies.get(note_id)
+        if w is None:
+            return
+        self._apply_widget_env(w)
+        for wid, (nid, data) in self._widget_store.items():
+            if nid == note_id:
+                w.set_widget_data(wid, data)
+
+    def _apply_widget_env(self, w) -> None:
+        """위젯을 넣고 쓸 수 있는가: 공유 PC 가 위젯을 알고 지금 붙어 있을 때만. 끊긴 동안
+        넣은 위젯은 공유 PC 에 가지 못해 다시 붙을 때 사라진다."""
+        w.set_widget_env(self._widgets_ok and self._connected,
+                         bool(self._settings.widget_games), offline=not self._connected)
+
+    def _on_widget_created(self, note_id: str, widget_id: str, data: dict) -> None:
+        self._widget_store[widget_id] = (note_id, data)
+        if self._widgets_ok and self._connected:
+            self._client.put_widget(note_id, widget_id, data)
+
+    def _on_widget_op(self, _note_id: str, widget_id: str, op: dict) -> None:
+        if not self._widgets_ok or not self._require_online():
+            return
+        self._client.widget_op(widget_id, op)
+
+    def _on_widget_changed(self, note_id: str, widget_id: str, data: dict, _by: str) -> None:
+        self._widget_store[widget_id] = (note_id, data)
+        w = self._stickies.get(note_id)
+        if w is not None:
+            w.set_widget_data(widget_id, data)
+
+    def _on_widget_error(self, widget_id: str, error: str) -> None:
+        from ..widgets import texts as wtexts
+        entry = self._widget_store.get(widget_id)
+        if entry is None:
+            return
+        self._status.showMessage(wtexts.tr("err." + error), 4000)
+
+    # ── 프로그램 창에 붙이기(실험) ──
+
+    def _attachments(self) -> dict:
+        out = {}
+        for nid, raw in self._local.state.attachments.items():
+            att = wa.Attachment.from_dict(raw)
+            if att is not None and nid in self._notes:
+                out[nid] = att
+        return out
+
+    def _apply_window_attach(self) -> None:
+        """설정을 따라 붙인 메모를 따라가게 하거나 모두 풀어 둔다(붙인 곳은 지우지 않는다)."""
+        if self._force_quit:
+            return
+        on = bool(self._settings.window_attach) and wa.is_windows()
+        self._follower.set_attachments(self._attachments() if on else {})
+        for nid in list(self._stickies):
+            self._apply_attach_chip(nid)
+            self._sync_note_shown(nid)
+
+    def _apply_attach_chip(self, note_id: str) -> None:
+        w = self._stickies.get(note_id)
+        if w is None:
+            return
+        on = bool(self._settings.window_attach)
+        att = self._follower.attachments.get(note_id) if on else None
+        w.set_attached(att.label if att else None, can_attach=on)
+
+    def _attach_note_to_window(self, note_id: str) -> None:
+        from . import window_pick
+        w = self._stickies.get(note_id)
+        if w is None or not self._settings.window_attach:
+            return
+        import os
+        # 숨어 있는 창(잠든 스토어 앱의 창 등)은 고를 것으로 보이지 않는다.
+        windows = [win for win in wa.list_windows(skip_pid=os.getpid()) if not win.cloaked]
+        choice = window_pick.pick_window(w, windows)
+        if choice is None:
+            return
+        win, title = choice
+        x, y = self._note_physical_pos(w)
+        corner, dx, dy = wa.offset_for(win.rect, (x, y))
+        att = wa.Attachment(win.exe, title, corner, dx, dy,
+                            label=(title or win.program)[:40])
+        self._local.state.attachments[note_id] = att.to_dict()
+        self._local.save()
+        self._follower.attach(note_id, att)
+        self._apply_attach_chip(note_id)
+
+    def _attach_note_by_drop(self, note_id: str, hwnd: int) -> None:
+        """메모를 다른 창의 가장자리에 끌어다 놓았다. 창 고르는 창 없이 그 창(제목이 같은
+        창)에 바로 붙인다."""
+        w = self._stickies.get(note_id)
+        if w is None or not self._settings.window_attach:
+            return
+        win = wa.window_info(hwnd)
+        if win is None or not win.exe:
+            return
+        x, y = self._note_physical_pos(w)
+        corner, dx, dy = wa.offset_for(win.rect, (x, y))
+        att = wa.Attachment(win.exe, win.title, corner, dx, dy,
+                            label=(win.title or win.program)[:40])
+        self._local.state.attachments[note_id] = att.to_dict()
+        self._local.save()
+        self._follower.attach(note_id, att)
+        self._apply_attach_chip(note_id)
+
+    def _detach_note_from_window(self, note_id: str) -> None:
+        self._local.state.attachments.pop(note_id, None)
+        self._local.save()
+        self._follower.detach(note_id)
+        self._apply_attach_chip(note_id)
+        self._sync_note_shown(note_id)
+
+    @staticmethod
+    def _note_physical_pos(w) -> tuple[int, int]:
+        """메모 창의 왼쪽 위(물리 픽셀)."""
+        if wa.is_windows():
+            import ctypes
+            from ctypes import wintypes
+            rect = wintypes.RECT()
+            if ctypes.windll.user32.GetWindowRect(wintypes.HWND(int(w.winId())),
+                                                  ctypes.byref(rect)):
+                return rect.left, rect.top
+        return w.x(), w.y()
+
+    def _note_wraps(self, note_id: str) -> bool:
+        """메모마다 고른 자동 줄바꿈. 고른 적이 없으면 설정의 기본값."""
+        chosen = self._local.state.wrap_notes.get(note_id)
+        return bool(self._settings.word_wrap) if chosen is None else bool(chosen)
+
+    def _on_wrap_toggled(self, note_id: str, on: bool) -> None:
+        wraps = self._local.state.wrap_notes
+        if bool(on) == bool(self._settings.word_wrap):
+            wraps.pop(note_id, None)        # 기본값과 같으면 따로 적지 않는다
+        else:
+            wraps[note_id] = bool(on)
+        self._local.save()
+        w = self._stickies.get(note_id)
+        if w is not None:
+            w.set_word_wrap(on)
+
+    def _on_tally_toggled(self, note_id: str, on: bool) -> None:
+        notes = self._local.state.tally_notes
+        if on and note_id not in notes:
+            notes.append(note_id)
+        elif not on and note_id in notes:
+            notes.remove(note_id)
+        self._local.save()
+        w = self._stickies.get(note_id)
+        if w is not None:
+            w.set_tally(on)
+
+    def _on_notice_requested(self, note_id: str, on: bool) -> None:
+        if not self._notices_ok or not self._require_online():
+            return
+        self._client.set_notice(note_id, on)
+
+    def _on_notice_changed(self, note_id: str, owner, _by: str) -> None:
+        if owner:
+            self._notices[note_id] = owner
+        else:
+            self._notices.pop(note_id, None)
+            self._seen.pop(note_id, None)
+        self._apply_notice(note_id)
+        self._pin_notices()
+
+    def _on_seen_changed(self, note_id: str, seen: dict) -> None:
+        self._seen[note_id] = seen
+        self._apply_notice(note_id)
+
+    def _note_viewed(self, note_id: str) -> None:
+        """공지를 봤다(펼쳤다, 목록에서 꺼냈다, 2초 머물렀다). 만든 사람에게 알린다
+        (설정에서 끌 수 있다). 같은 판은 한 번만."""
+        owner = self._notices.get(note_id)
+        note = self._notes.get(note_id)
+        if (not owner or note is None or owner == self._client.nickname()
+                or not self._connected or self._settings.hide_read_receipts):
+            return
+        version = int(note.get("version") or 1)
+        if self._seen_sent.get(note_id) == version:
+            return
+        self._seen_sent[note_id] = version
+        self._client.send_seen(note_id, version)
+
+    def _show_read_list(self, note_id: str) -> None:
+        """내 공지를 본 사람(때)과 아직 안 본 사람."""
+        w = self._stickies.get(note_id)
+        if w is None:
+            return
+        read, unread = self._read_counts(note_id)
+        now = self._now()
+        menu = QMenu(w)
+        menu.setAttribute(Qt.WA_NoMouseReplay)
+        head = menu.addAction(f"{i18n.t('notice.read_head')} {len(read)}")
+        head.setEnabled(False)
+        for name, at in sorted(read, key=lambda x: -x[1]):
+            menu.addAction(f"{name}\t{reminder_dialog.short_when(rm.from_ms(at), now)}")
+        if unread:
+            menu.addSeparator()
+            head = menu.addAction(f"{i18n.t('notice.unread_head')} {len(unread)}")
+            head.setEnabled(False)
+            for name in unread:
+                menu.addAction(name)
+        edit_menu.run_menu(menu, QCursor.pos())
+        menu.deleteLater()
+
+    def _on_mentioned(self, note_id: str, by: str, _at: int) -> None:
+        note = self._notes.get(note_id)
+        if note is None:
+            return
+        toast = self._toasts.show_actions(
+            self._note_title(note), i18n.t("mention.sub", name=by),
+            [(i18n.t("reminder.toast_open"), "open", True)], persistent=False)
+        if toast is not None:
+            toast.action.connect(lambda _key, n=note_id: self._take_note_out(n))
+
+    def _show_waiting_mentions(self, raw) -> None:
+        """꺼져 있던 동안 나를 부른 메모. 셋까지는 한 장씩, 그보다 많으면 한 장에."""
+        items = [m for m in (raw if isinstance(raw, list) else [])
+                 if isinstance(m, dict) and m.get("note_id") in self._notes
+                 and isinstance(m.get("by"), str)]
+        if len(items) <= 3:
+            for m in items:
+                self._on_mentioned(m["note_id"], m["by"], 0)
+            return
+        lines = [f"{m['by']}  {self._note_title(self._notes[m['note_id']], 24)}"
+                 for m in items[:5]]
+        if len(items) > 5:
+            lines.append(i18n.t("mention.more", count=len(items) - 5))
+        self._toasts.show_actions(i18n.t("mention.many", count=len(items)),
+                                  "\n".join(lines), [], persistent=False)
 
     def _on_note_deleted(self, note_id: str) -> None:
         # 내가 지워 달라고 한 메모가 실제로 지워졌다. 이제 되돌릴 수 있다.
@@ -2153,6 +2829,7 @@ class MainWindow(QMainWindow):
         if undoable is not None:
             self._undo_snapshots.append(undoable)
             self._undo_btn.show()
+            self._refresh_status_bar()
             self._undo_timer.start()
             self._status.showMessage(self._delete_message, self._UNDO_MS)
         gone = self._notes.pop(note_id, None)
@@ -2246,15 +2923,62 @@ class MainWindow(QMainWindow):
             card.set_folder_context(ctx)
 
     def _refresh_folder_chip(self) -> None:
-        label, _ = self._current_folder_label_and_color()
+        """좁은 창의 펼침 칸, 옆줄의 폴더 줄, 머리 줄의 이름을 고른 곳에 맞춘다."""
+        label = self._place_label()
         self._folder_chip.setText(label)
         cf = self._current_folder
         is_private_folder = (
-            cf not in (FOLDER_ALL, FOLDER_NONE)
+            self._place == shell.PLACE_FOLDER
             and bool((self._folders.get(cf) or {}).get("private_owner"))
         )
-        icon_name = "lock" if is_private_folder else "folder"
+        icon_name = ("trash" if self._place == shell.PLACE_TRASH
+                     else "lock" if is_private_folder else "folder")
         self._folder_chip.setIcon(svg_icon(icon_name, color="#3A3A3A"))
+        self._place_title.setText(label)
+        self._refresh_rail()
+
+    def _place_label(self) -> str:
+        place = self._place
+        if place == shell.PLACE_TRASH:
+            return i18n.t("main.folder_trash")
+        if place == shell.PLACE_FOLDER:
+            return self._current_folder_label_and_color()[0]
+        if place == shell.PLACE_NONE:
+            return i18n.t("main.folder_uncategorized")
+        return i18n.t(f"main.place_{place}")
+
+    def _refresh_rail(self) -> None:
+        """옆줄의 폴더 줄(바뀌었을 때만 다시 놓는다), 수, 고른 곳, 태그."""
+        self._refresh_tags()
+        folders = sorted(self._folders.values(),
+                         key=lambda f: (f.get("name") or "").lower())
+        counts: dict[str, int] = {}
+        loose = 0
+        for note in self._notes.values():
+            fid = note.get("folder_id") or ""
+            if fid and fid in self._folders:
+                counts[fid] = counts.get(fid, 0) + 1
+            else:
+                loose += 1
+        sig = tuple((f["id"], f.get("name"), bool(f.get("private_owner"))) for f in folders)
+        rows = [shell.FolderRow(f["id"], f.get("name") or i18n.t("main.folder_default_name"),
+                                f.get("color") or config.DEFAULT_COLOR,
+                                bool(f.get("private_owner")), counts.get(f["id"], 0))
+                for f in folders]
+        if sig != self._rail_folder_sig:
+            self._rail_folder_sig = sig
+            self._rail.set_folders(rows, none_count=loose if folders else None)
+        else:
+            for row in rows:
+                b = self._rail.folders.get(row.folder_id)
+                if b is not None:
+                    b.set_count(row.count)
+            if "" in self._rail.folders:
+                self._rail.folders[""].set_count(loose)
+        self._rail.set_trash(len(self._trash_notes) if self._trash_notes else "",
+                             bool(self._trash_days))
+        self._rail.set_current(self._place, self._current_folder
+                               if self._place == shell.PLACE_FOLDER else "")
 
     def _current_folder_label_and_color(self) -> tuple[str, str]:
         cf = self._current_folder
@@ -2272,17 +2996,19 @@ class MainWindow(QMainWindow):
 
     def _show_folder_selector(self) -> None:
         menu = self._folder_selector_menu()
+        menu.setAttribute(Qt.WA_NoMouseReplay)
         menu.exec(self._folder_chip.mapToGlobal(
             QPoint(0, self._folder_chip.height())))
 
     def _folder_selector_menu(self) -> QMenu:
+        """좁은 창의 펼침 칸: 옆줄과 같은 곳들(거르기, 폴더, 휴지통)."""
         menu = QMenu(self._folder_chip)
-        add_centered_menu_action(
-            menu, svg_icon("folder"), i18n.t("main.folder_all"),
-            lambda: self._select_folder(FOLDER_ALL))
-        add_centered_menu_action(
-            menu, None, i18n.t("main.folder_uncategorized"),
-            lambda: self._select_folder(FOLDER_NONE))
+        for place, icon in ((shell.PLACE_ALL, "list"), (shell.PLACE_SHOWN, "eye_on"),
+                            (shell.PLACE_HIDDEN, "eye_off"), (shell.PLACE_REMIND, "bell")):
+            add_centered_menu_action(
+                menu, svg_icon(icon), i18n.t(f"main.place_{place}"),
+                lambda *_a, p=place: self._choose_place(p, ""),
+                checked=self._place == place)
         folders = sorted(
             self._folders.values(),
             key=lambda f: (f.get("name") or "").lower(),
@@ -2300,6 +3026,9 @@ class MainWindow(QMainWindow):
                 add_centered_menu_action(
                     menu, icon, name,
                     lambda _fid=fid: self._select_folder(_fid))
+            add_centered_menu_action(
+                menu, None, i18n.t("main.folder_uncategorized"),
+                lambda: self._select_folder(FOLDER_NONE))
         menu.addSeparator()
         add_centered_menu_action(
             menu, svg_icon("plus"), i18n.t("main.menu_new_folder"),
@@ -2311,10 +3040,15 @@ class MainWindow(QMainWindow):
                 self.open_trash)
         return menu
 
-    def _show_folder_menu(self) -> None:
-        cf = self._current_folder
-        is_real = cf not in (FOLDER_ALL, FOLDER_NONE)
-        menu = QMenu(self._folder_menu_btn)
+    def _show_folder_menu(self, folder_id: str | None = None,
+                          global_pos: QPoint | None = None) -> None:
+        """폴더 하나의 메뉴(옆줄의 폴더 줄을 오른쪽 단추로 누름)."""
+        cf = folder_id or self._current_folder
+        is_real = cf not in (FOLDER_ALL, FOLDER_NONE, "") and cf in self._folders
+        if is_real and (self._place != shell.PLACE_FOLDER or self._current_folder != cf):
+            self._select_folder(cf)
+        menu = QMenu(self)
+        menu.setStyleSheet(theme.ALIGNED_MENU_QSS)      # 인쇄 줄도 같은 그림 칸에
         add_centered_menu_action(
             menu, svg_icon("eye_on"), i18n.t("main.menu_folder_show_all"),
             lambda: self._bulk_set_folder_visibility(True))
@@ -2336,17 +3070,45 @@ class MainWindow(QMainWindow):
                     menu, svg_icon("folder"),
                     i18n.t("main.menu_folder_icon_place"),
                     lambda: self._place_folder_icon(cf))
+            self._add_print_menu(menu, lambda f=cf: [
+                nid for nid in self._visible_card_order() if
+                (self._notes.get(nid, {}).get("folder_id") or None) == f])
+            menu.addSeparator()
             add_centered_menu_action(
                 menu, None, i18n.t("main.menu_folder_edit"),
                 self._edit_current_folder)
             add_centered_menu_action(
                 menu, None, i18n.t("main.menu_folder_delete"),
                 self._delete_current_folder)
-        menu.exec(self._folder_menu_btn.mapToGlobal(
-            QPoint(0, self._folder_menu_btn.height())))
+        edit_menu.run_menu(menu, global_pos if global_pos is not None
+                           else self._folder_chip.mapToGlobal(
+                               QPoint(0, self._folder_chip.height())))
+        menu.deleteLater()
 
     def _select_folder(self, folder_id: str) -> None:
-        self._current_folder = folder_id
+        if folder_id == FOLDER_ALL:
+            self._choose_place(shell.PLACE_ALL, "")
+        elif folder_id == FOLDER_NONE:
+            self._choose_place(shell.PLACE_NONE, "")
+        else:
+            self._choose_place(shell.PLACE_FOLDER, folder_id)
+
+    def _choose_place(self, place: str, folder_id: str = "") -> None:
+        """옆줄에서 고른 곳을 보인다. 거르기와 폴더는 하나만 고른다."""
+        if place == shell.PLACE_TRASH:
+            self.open_trash()
+            return
+        was_trash = self._place == shell.PLACE_TRASH
+        if place == shell.PLACE_FOLDER and folder_id not in self._folders:
+            place = shell.PLACE_ALL
+        self._place = place
+        self._current_folder = (folder_id if place == shell.PLACE_FOLDER
+                                else FOLDER_NONE if place == shell.PLACE_NONE
+                                else FOLDER_ALL)
+        self._list_mode = (place if place in (LIST_SHOWN, LIST_HIDDEN, LIST_REMIND)
+                           else LIST_ALL)
+        if was_trash:
+            self._show_trash_view(False)
         self._refresh_folder_chip()
         self._apply_search_filter()
 
@@ -2533,10 +3295,12 @@ class MainWindow(QMainWindow):
         w = self._stickies.get(note_id)
         if w is not None:
             w.set_lock_holder(holder)
+        self._refresh_card_marks(note_id)
 
     def _on_lock_released(self, note_id: str) -> None:
         self._locks.pop(note_id, None)
         self._edit_handled.pop(note_id, None)
+        self._refresh_card_marks(note_id)
         w = self._stickies.get(note_id)
         if w is not None:
             if (w.is_editing() and note_id not in self._offline_edit_ids
@@ -2703,8 +3467,10 @@ class MainWindow(QMainWindow):
             visible=not self._local.state.get_note_state(note["id"]).hidden,
         )
         card.set_folder_context(self._folder_context_for_cards())
+        card.set_square(self._settings.notes_view_layout == VIEW_GRID)
         card.set_view(self._settings.notes_view_density,
                       self._settings.notes_view_layout)
+        self._refresh_card_marks(note["id"], card)
         if self._selection_mode:
             card.set_selection_mode(True)
         card.clicked.connect(self._on_card_clicked)
@@ -2717,7 +3483,37 @@ class MainWindow(QMainWindow):
         self._cards[note["id"]] = card
         self._cards_layout.addWidget(card)
 
+    def _refresh_card_marks(self, note_id: str | None = None,
+                            card: NoteCard | None = None) -> None:
+        """목록 카드의 상태 그림: 알림, 체크 해제 예약, 편집 중인 사람."""
+        st = self._local.state
+        me = self._client.nickname()
+        ids = [note_id] if note_id else list(self._cards)
+        for nid in ids:
+            c = card if card is not None else self._cards.get(nid)
+            if c is None:
+                continue
+            shared = st.shared_reminders.get(nid)
+            remind = nid in st.reminders or bool(
+                shared and (rm.is_target(shared, me) or shared.get("set_by") == me))
+            holder = self._locks.get(nid) or ""
+            c.set_marks(remind=remind, reset=nid in st.check_resets,
+                        editing=holder if holder and holder != me else "",
+                        folded=bool(getattr(st.notes.get(nid), "folded", False)))
+
+    def _remind_note_ids(self) -> set[str]:
+        """알림이나 체크 해제 예약을 건 메모(공유 알림은 내가 받거나 내가 건 것)."""
+        st = self._local.state
+        me = self._client.nickname()
+        ids = set(st.reminders) | set(st.check_resets)
+        ids |= {nid for nid, e in st.shared_reminders.items()
+                if rm.is_target(e, me) or e.get("set_by") == me}
+        return ids & set(self._notes)
+
     def _folder_context_for_cards(self) -> list[tuple[str, str]]:
+        return self._plain_folder_context()
+
+    def _plain_folder_context(self) -> list[tuple[str, str]]:
         return [
             (fid, (i18n.t("main.folder_private_label",
                           name=f.get("name") or i18n.t("main.folder_default_name"))
@@ -2964,29 +3760,193 @@ class MainWindow(QMainWindow):
     # ── 휴지통 ──────────────────────────────────────────────────────────
 
     def open_trash(self) -> None:
-        """지운 메모를 되살리거나 완전히 지우는 창을 연다."""
+        """휴지통을 메인 창에 보인다(메모 목록과 같은 보기). 공유 PC 에 목록을 묻는다."""
         if not self._trash_days or not self._require_online():
             return
-        if self._trash_dialog is None:
-            dlg = TrashDialog(self._trash_days, self._settings, self,
-                              icon=self._app_icon)
-            dlg.restoreRequested.connect(self._restore_from_trash)
-            dlg.purgeRequested.connect(self._purge_from_trash)
-            dlg.emptyRequested.connect(self._empty_trash)
-            self._trash_dialog = dlg
-        self._trash_dialog.show()
-        self._trash_dialog.raise_()
-        self._trash_dialog.activateWindow()
+        if self.isHidden() or self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        if self._place != shell.PLACE_TRASH:
+            self._exit_selection_mode()
+            self._place = shell.PLACE_TRASH
+            self._show_trash_view(True)
+            self._refresh_folder_chip()
         self._client.get_trash()
 
+    def _build_trash_bar(self) -> QWidget:
+        """휴지통 아래의 막대: 고른 수, 복원, 완전히 삭제, 휴지통 비우기."""
+        bar = QWidget()
+        bar.setObjectName("TrashBar")
+        bar.setStyleSheet(
+            "QWidget#TrashBar { background: #FFFFFF; border-top: 1px solid #EFEFEF; }"
+            "QWidget#TrashBar QLabel { color: #4B5563; font-size: 12px; }")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(16, 8, 16, 8)
+        row.setSpacing(8)
+        self._trash_note_lbl = QLabel("")
+        row.addWidget(self._trash_note_lbl, 1)
+        self._trash_restore_btn = QPushButton(i18n.t("trash.btn_restore"))
+        self._trash_purge_btn = QPushButton(i18n.t("trash.btn_purge"))
+        self._trash_empty_btn = QPushButton(i18n.t("trash.btn_empty"))
+        for b in (self._trash_purge_btn, self._trash_empty_btn):
+            b.setProperty("secondary", True)
+            theme.refresh_style(b)
+        for b in (self._trash_restore_btn, self._trash_purge_btn, self._trash_empty_btn):
+            b.setCursor(Qt.PointingHandCursor)
+            b.setStyleSheet("QPushButton { padding: 6px 14px; min-height: 18px; }")
+        self._trash_restore_btn.clicked.connect(
+            lambda: self._restore_from_trash(self._trash_selected()))
+        self._trash_purge_btn.clicked.connect(
+            lambda: self._ask_purge(self._trash_selected()))
+        self._trash_empty_btn.clicked.connect(self._ask_empty_trash)
+        row.addWidget(self._trash_restore_btn)
+        row.addWidget(self._trash_purge_btn)
+        row.addWidget(self._trash_empty_btn)
+        bar.hide()
+        self._trash_bar = bar
+        return bar
+
+    def _show_trash_view(self, on: bool) -> None:
+        """목록 자리를 휴지통과 메모 목록 사이에서 바꾼다."""
+        current = self._scroll.widget()
+        want = self._trash_container if on else self._cards_container
+        if current is not want:
+            self._scroll.takeWidget()
+            current.hide()
+            self._scroll.setWidget(want)
+            want.show()
+        self._trash_bar.setVisible(on)
+        self._select_btn.setVisible(not on)
+        if on:
+            self._bulk_bar.hide()
+            self._apply_trash_filter()
+        self._refresh_trash_bar()
+
+    def _trash_selected(self) -> list[str]:
+        return [nid for nid, c in self._trash_cards.items() if c.is_selected()]
+
+    def _refresh_trash_bar(self) -> None:
+        picked = len(self._trash_selected())
+        self._trash_restore_btn.setEnabled(bool(picked))
+        self._trash_purge_btn.setEnabled(bool(picked))
+        self._trash_empty_btn.setEnabled(bool(self._trash_notes))
+        self._trash_note_lbl.setText(
+            i18n.t("main.bulk_selected_count", count=picked) if picked
+            else i18n.t("trash.note", days=self._trash_days or 0))
+
+    def _apply_trash_filter(self) -> None:
+        query = self._search_query
+        visible = 0
+        for nid, card in self._trash_cards.items():
+            note = next((n for n in self._trash_notes if n.get("id") == nid), {})
+            match = not query or query in html_to_plain(note.get("content") or "").lower()
+            card.setVisible(match)
+            visible += match
+        self._place_count.setText(i18n.t("main.count_n", count=visible))
+        empty = not visible
+        self._empty_kind = "trash" if empty else ""
+        self._empty_panel.setVisible(empty)
+        self._scroll.setVisible(not empty)
+        if empty:
+            self._empty_title.setText(i18n.t(
+                "main.empty_search_title", query=self._search_input.text().strip()[:24])
+                if query else i18n.t("trash.empty"))
+            self._empty_body.setText("")
+            self._empty_body.hide()
+            self._empty_action.setVisible(bool(query))
+            self._empty_action.setText(i18n.t("main.empty_search_clear"))
+            self._empty_kind = "search" if query else "trash"
+        else:
+            self._empty_action.show()
+
     def _on_trash_list(self, notes: list) -> None:
-        if self._trash_dialog is not None:
-            self._trash_dialog.set_notes(notes, self._trash_days or None)
+        """공유 PC 가 보낸 휴지통의 메모로 휴지통 자리의 카드를 다시 놓는다."""
+        keep = {nid for nid, c in self._trash_cards.items() if c.is_selected()}
+        for card in self._trash_cards.values():
+            card.setParent(None)
+            card.deleteLater()
+        self._trash_cards.clear()
+        # 방금 버린 것부터.
+        self._trash_notes = sorted(
+            (n for n in notes if isinstance(n, dict) and n.get("id")),
+            key=lambda n: -int(n.get("deleted_at") or 0))
+        s = self._settings
+        for note in self._trash_notes:
+            nid = note["id"]
+            card = NoteCard(note, visible=True)
+            card.set_plain(True)
+            left = days_left(int(note.get("deleted_at") or 0), self._trash_days or 0)
+            card.set_caption(i18n.t("trash.days_left", days=left),
+                             str(note.get("deleted_by") or ""))
+            card.set_square(s.notes_view_layout == VIEW_GRID)
+            card.set_view(s.notes_view_density, s.notes_view_layout)
+            card.set_selected(nid in keep)
+            card.clicked.connect(self._on_trash_card_clicked)
+            card.doubleClicked.connect(self._show_trash_preview)
+            card.menuRequested.connect(self._on_trash_card_menu)
+            card.deleteRequested.connect(lambda n: self._ask_purge([n]))
+            self._trash_cards[nid] = card
+            self._trash_layout.addWidget(card)
+        self._refresh_view_mode()
+        if self._place == shell.PLACE_TRASH:
+            self._apply_trash_filter()
+        self._refresh_trash_bar()
+        self._refresh_rail()
+
+    def _on_trash_card_clicked(self, note_id: str) -> None:
+        card = self._trash_cards.get(note_id)
+        if card is not None:
+            card.set_selected(not card.is_selected())
+        self._refresh_trash_bar()
+
+    def _on_trash_card_menu(self, note_id: str, pos: QPoint) -> None:
+        card = self._trash_cards.get(note_id)
+        if card is not None and not card.is_selected():
+            for c in self._trash_cards.values():
+                c.set_selected(c is card)
+            self._refresh_trash_bar()
+        ids = self._trash_selected()
+        menu = QMenu(self)
+        add_centered_menu_action(menu, svg_icon("undo"), i18n.t("trash.btn_restore"),
+                                 lambda: self._restore_from_trash(ids))
+        add_centered_menu_action(menu, svg_icon("trash"), i18n.t("trash.btn_purge"),
+                                 lambda: self._ask_purge(ids))
+        edit_menu.run_menu(menu, pos)
+        menu.deleteLater()
+
+    def _show_trash_preview(self, note_id: str) -> None:
+        note = next((n for n in self._trash_notes if n.get("id") == note_id), None)
+        if note is None:
+            return
+        if self._trash_preview is None:
+            self._trash_preview = TrashPreview(self)
+            self._trash_preview.restoreRequested.connect(
+                lambda nid: self._restore_from_trash([nid]))
+        self._trash_preview.show_note(note, self._trash_days or 0)
+
+    def _ask_purge(self, note_ids: list) -> None:
+        if not note_ids:
+            return
+        if not confirm.ask(self, i18n.t("trash.btn_purge"),
+                           i18n.t("trash.purge_body", count=len(note_ids)),
+                           detail=i18n.t("trash.purge_detail"),
+                           action=i18n.t("trash.btn_purge"), danger=True):
+            return
+        self._purge_from_trash(list(note_ids))
+
+    def _ask_empty_trash(self) -> None:
+        if not self._trash_notes:
+            return
+        if not confirm.ask(self, i18n.t("trash.btn_empty"),
+                           i18n.t("trash.empty_body", count=len(self._trash_notes)),
+                           detail=i18n.t("trash.purge_detail"),
+                           action=i18n.t("trash.btn_empty"), danger=True):
+            return
+        self._empty_trash()
 
     def _on_trash_changed(self) -> None:
-        # 창을 열어 둔 동안에만 다시 묻는다(목록은 공유 PC 가 들고 있다).
-        if (self._trash_dialog is not None and self._trash_dialog.isVisible()
-                and self._connected):
+        # 휴지통을 보고 있을 때만 다시 묻는다(목록은 공유 PC 가 들고 있다).
+        if self._place == shell.PLACE_TRASH and self._connected:
             self._client.get_trash()
 
     def _restore_from_trash(self, note_ids: list) -> None:
@@ -3086,16 +4046,83 @@ class MainWindow(QMainWindow):
             self._selection_anchor = note_id
             self._refresh_bulk_bar()
             return
-        st = self._local.state.get_note_state(note_id)
-        if st.hidden:
-            self._set_note_visibility(note_id, True)
-        else:
-            # 아이콘으로 접어 둔 폴더 안의 메모면 폴더를 열어야 보인다.
-            self._open_folder_of(note_id)
+        self.toggle_note_out(note_id)
+
+    # ── 목록에서 메모 누르기: 꺼내기와 넣어 두기 ──
+
+    def toggle_note_out(self, note_id: str) -> None:
+        """목록(메인 창, 폴더 창)에서 메모를 눌렀다. 펼쳐진 채 눈앞에 보이면 넣어
+        두고, 아니면(숨김, 접힘, 닫힌 폴더 안, 다른 창에 가려짐) 펼쳐서 앞으로
+        꺼낸다. 어느 메모든 누를 때 일어나는 일이 같다."""
+        if note_id not in self._notes:
+            return
         w = self._stickies.get(note_id)
-        if w is not None:
-            # 접어 둔 메모는 펼쳐서 보여 준다.
-            w.reveal()
+        if w is not None and w.in_view():
+            self._put_note_away(note_id)
+        else:
+            self._take_note_out(note_id)
+
+    def _take_note_out(self, note_id: str) -> None:
+        note = self._notes.get(note_id)
+        if note is None:
+            return              # 찾기 창이나 알림을 누른 사이 지워졌다
+        st = self._local.state.get_note_state(note_id)
+        w = self._stickies.get(note_id)
+        in_closed = self._folder_closed(note.get("folder_id"))
+        if note_id not in self._taken_out:
+            # 꺼내기 전 상태. 가려져 있다가 다시 누른 때는 처음 것을 그대로 둔다.
+            self._taken_out[note_id] = {
+                "folder": in_closed and note_id not in self._peeked,
+                "hidden": st.hidden and not in_closed,
+                "folded": bool(w is not None and w.is_folded()),
+            }
+        if in_closed:
+            # 닫힌 폴더는 그대로 두고 이 메모만 꺼낸다(폴더 창에서 꺼내 보기와 같다).
+            self._peeked.add(note_id)
+            self._sync_note_shown(note_id)
+        elif st.hidden:
+            self._local.state.set_note_state(note_id, hidden=False)
+            self._local.save()
+            card = self._cards.get(note_id)
+            if card is not None:
+                card.set_visible(True)
+            self._sync_note_shown(note_id)
+            self._apply_search_filter()
+            self._refresh_folder_icons()
+        if w is None:
+            return
+        w.setWindowOpacity(1.0)
+        w.reveal()
+        w.bring_to_front()
+        w.flash()
+        self._note_viewed(note_id)
+
+    def _put_note_away(self, note_id: str) -> None:
+        origin = self._taken_out.pop(note_id, None) or {}
+        w = self._stickies.get(note_id)
+        if origin.get("folder"):
+            def back() -> None:
+                self._peeked.discard(note_id)
+                self._sync_note_shown(note_id, animate=True)
+        elif origin.get("folded") and not origin.get("hidden"):
+            if w is not None:
+                w.fold()
+            return
+        else:
+            def back() -> None:
+                self._set_note_visibility(note_id, False)
+        if origin.get("folded") and w is not None:
+            # 접혀 있던 메모는 다시 접은 뒤 넣는다(다음에 꺼낼 때도 접힌 채로).
+            w.fold()
+            self._after_fold(w, back)
+        else:
+            back()
+
+    def _after_fold(self, w, done, tries: int = 0) -> None:
+        if (w.is_folded() and not w.fold_busy()) or tries > 40:
+            done()
+            return
+        QTimer.singleShot(50, lambda: self._after_fold(w, done, tries + 1))
 
     def _toggle_visibility_from_card(self, note_id: str) -> None:
         st = self._local.state.get_note_state(note_id)
@@ -3147,11 +4174,13 @@ class MainWindow(QMainWindow):
     def _forget_undo(self) -> None:
         self._undo_snapshots = []
         self._undo_btn.hide()
+        self._refresh_status_bar()
 
     def _undo_delete(self) -> None:
         snapshots, self._undo_snapshots = self._undo_snapshots, []
         self._undo_timer.stop()
         self._undo_btn.hide()
+        self._refresh_status_bar()
         self._status.clearMessage()
         if not self._connected:
             # 끊긴 동안에는 만들 수 없다. 까닭을 알린다.
@@ -3176,7 +4205,7 @@ class MainWindow(QMainWindow):
     def _note_title(self, note: dict, limit: int = 40) -> str:
         """목록과 확인창에서 메모를 가리키는 이름: 첫 줄, 없으면 내용의 종류."""
         raw = note.get("content") or ""
-        first_line = (html_to_plain(raw).splitlines() or [""])[0].strip()
+        first_line = (html_to_plain(with_widgets_as_text(raw)).splitlines() or [""])[0].strip()
         if first_line:
             title = first_line
         elif has_non_checkbox_image(raw):
@@ -3223,6 +4252,8 @@ class MainWindow(QMainWindow):
             kind = "search"
         elif not total:
             kind = "none"
+        elif self._list_mode != LIST_ALL:
+            kind = self._list_mode
         else:
             kind = "folder"
         self._empty_kind = kind
@@ -3250,6 +4281,10 @@ class MainWindow(QMainWindow):
             self._empty_title.setText(i18n.t("main.empty_none_title"))
             self._empty_body.setText("")
             self._empty_action.setText(new_note)
+        elif kind in (LIST_SHOWN, LIST_HIDDEN, LIST_REMIND):
+            self._empty_title.setText(i18n.t(f"main.empty_{kind}_title"))
+            self._empty_body.setText("")
+            self._empty_action.setText(i18n.t("main.empty_show_all"))
         else:
             self._empty_title.setText(i18n.t("main.empty_folder_title"))
             self._empty_body.setText("")
@@ -3257,65 +4292,119 @@ class MainWindow(QMainWindow):
         self._empty_body.setVisible(bool(self._empty_body.text()))
 
     def _refresh_count(self) -> None:
-        """메모 수 단추의 글과, 목록이 비었을 때의 안내를 맞춘다."""
+        """머리 줄의 메모 수, 옆줄의 수, 목록이 비었을 때의 안내를 맞춘다."""
         total = len(self._notes)
         # isVisible() 은 창이 아직 뜨지 않았으면 늘 False 다. 숨겼는지를 본다.
         visible = sum(1 for c in self._cards.values() if not c.isHidden())
-        self._refresh_empty_panel(total, visible)
-        self._count_btn.setVisible(bool(total))
-        # 수는 지금 목록에 보이는 메모 수다(폴더와 검색어에 맞는 것 가운데).
-        self._count_btn.setText({
-            LIST_ALL: i18n.t("main.count_all", count=visible),
-            LIST_SHOWN: i18n.t("main.count_shown", count=visible),
-            LIST_HIDDEN: i18n.t("main.count_hidden", count=visible),
-        }[self._list_mode])
+        if self._place != shell.PLACE_TRASH:
+            self._refresh_empty_panel(total, visible)
+            self._place_count.setText(i18n.t("main.count_n", count=visible))
+        hidden = sum(1 for nid in self._notes
+                     if self._local.state.get_note_state(nid).hidden)
+        self._rail.set_counts({shell.PLACE_ALL: total,
+                               shell.PLACE_SHOWN: total - hidden,
+                               shell.PLACE_HIDDEN: hidden,
+                               shell.PLACE_REMIND: len(self._remind_note_ids())})
+        self._refresh_rail()
 
     def _hidden_note_ids(self) -> set[str]:
-        """지금 보는 폴더에서 바탕화면에 숨겨 둔 메모."""
+        """바탕화면에 숨겨 둔 메모."""
         notes = self._local.state.notes
-        return {nid for nid, note in self._notes.items()
-                if self._note_in_current_folder(note)
-                and nid in notes and notes[nid].hidden}
+        return {nid for nid in self._notes if nid in notes and notes[nid].hidden}
 
     def _list_mode_counts(self, hidden_ids: set[str]) -> dict[str, int]:
-        """지금 보는 폴더의 메모 수: 전체, 바탕화면에 표시한 것, 숨긴 것."""
-        total = sum(1 for note in self._notes.values()
-                    if self._note_in_current_folder(note))
+        """메모 수: 전체, 바탕화면에 표시한 것, 숨긴 것, 알림."""
+        total = len(self._notes)
         return {LIST_ALL: total, LIST_SHOWN: total - len(hidden_ids),
-                LIST_HIDDEN: len(hidden_ids)}
+                LIST_HIDDEN: len(hidden_ids), LIST_REMIND: len(self._remind_note_ids())}
 
-    def _cycle_list_mode(self) -> None:
-        """전체 → 표시 → 숨김 차례로 넘긴다. 메모가 없는 쪽은 건너뛴다."""
-        counts = self._list_mode_counts(self._hidden_note_ids())
-        at = LIST_MODES.index(self._list_mode)
-        for step in range(1, len(LIST_MODES) + 1):
-            mode = LIST_MODES[(at + step) % len(LIST_MODES)]
-            if mode == LIST_ALL or counts[mode]:
-                break
-        self._list_mode = mode
-        self._apply_search_filter()
+    def _on_search_typed(self, text: str) -> None:
+        if len(self._notes) > 80 and text.strip():
+            self._search_timer.start()
+        else:
+            self._search_timer.stop()
+            self._apply_search_filter(text)
+
+    def _note_plain(self, note_id: str, note: dict) -> str:
+        """찾기에 쓰는 메모의 평문(작은 글자). 글이 바뀔 때만 다시 만든다."""
+        content = note.get("content") or ""
+        cached = self._plain_cache.get(note_id)
+        if cached is not None and cached[0] is content:
+            return cached[1]
+        plain = html_to_plain(with_widgets_as_text(content)).lower()
+        self._plain_cache[note_id] = (content, plain)
+        return plain
 
     def _apply_search_filter(self, text: str | None = None) -> None:
-        """폴더 선택, 표시·숨김 고르기, 검색어를 AND 로 결합해 카드 가시성을 정한다."""
+        """고른 곳(폴더, 표시·숨김·알림)과 검색어를 AND 로 결합해 카드 가시성을 정한다."""
         if text is None:
             text = self._search_input.text()
         query = (text or "").strip().lower()
         self._search_query = query
+        if self._place == shell.PLACE_TRASH:
+            self._apply_trash_filter()
+            return
         hidden_ids = self._hidden_note_ids()
-        if not self._list_mode_counts(hidden_ids)[self._list_mode]:
-            # 고른 쪽에 메모가 없는 폴더다. 빈 목록으로 두지 않고 전체로 돌아간다.
-            self._list_mode = LIST_ALL
+        remind_ids = self._remind_note_ids() if self._list_mode == LIST_REMIND else set()
         for note_id, card in self._cards.items():
             note = self._notes.get(note_id, {})
-            matches = self._note_in_current_folder(note) and (
-                not query
-                or query in html_to_plain(note.get("content") or "").lower())
-            if self._list_mode == LIST_SHOWN:
-                matches = matches and note_id not in hidden_ids
-            elif self._list_mode == LIST_HIDDEN:
-                matches = matches and note_id in hidden_ids
-            card.setVisible(matches)
+            card.setVisible(self._card_matches(note_id, note, hidden_ids, remind_ids))
         self._refresh_count()
+
+    def _card_matches(self, note_id: str, note: dict, hidden_ids: set | None = None,
+                      remind_ids: set | None = None) -> bool:
+        """목록에 보일 카드인가: 고른 곳(폴더, 표시, 숨김, 알림)과 찾는 말."""
+        query = self._search_query
+        matches = self._note_in_current_folder(note) and (
+            not query or self._note_matches(note_id, note, query))
+        if not matches or self._list_mode not in (LIST_SHOWN, LIST_HIDDEN, LIST_REMIND):
+            return matches
+        if self._list_mode == LIST_REMIND:
+            ids = remind_ids if remind_ids is not None else self._remind_note_ids()
+            return note_id in ids
+        ids = hidden_ids if hidden_ids is not None else self._hidden_note_ids()
+        return (note_id not in ids) if self._list_mode == LIST_SHOWN else (note_id in ids)
+
+    def _note_tags(self, note_id: str, note: dict) -> list[str]:
+        """메모의 #태그(판마다 한 번 읽어 둔다)."""
+        from .. import text_detect as td
+        version = (note.get("version"), note.get("updated_at"))
+        cached = self._tag_cache.get(note_id)
+        if cached is not None and cached[0] == version:
+            return cached[1]
+        tags = td.tags_in(html_to_plain(note.get("content") or ""))
+        self._tag_cache[note_id] = (version, tags)
+        return tags
+
+    def _note_matches(self, note_id: str, note: dict, query: str) -> bool:
+        """찾는 말이 '#태그' 하나면 그 태그가 든 메모, 아니면 글에 든 메모."""
+        if query.startswith("#") and len(query) > 1 and " " not in query:
+            tag = query[1:]
+            return any(t.lower() == tag for t in self._note_tags(note_id, note))
+        if query in self._note_plain(note_id, note):
+            return True
+        # 위젯 안의 글(투표 항목, 메뉴, 일정)도 찾는다.
+        from .. import widgets
+        for nid, data in self._widget_store.values():
+            if nid == note_id:
+                kind = widgets.kind_of(data)
+                if kind is not None and query in kind.search_text(data).lower():
+                    return True
+        return False
+
+    def _refresh_tags(self) -> None:
+        """옆줄의 태그: 많이 쓴 것부터 열두 개."""
+        counts: dict[str, list] = {}
+        for nid, note in self._notes.items():
+            for tag in self._note_tags(nid, note):
+                key = tag.lower()
+                entry = counts.setdefault(key, [tag, 0])
+                entry[1] += 1
+        top = sorted(counts.values(), key=lambda e: (-e[1], e[0].lower()))[:12]
+        self._rail.set_tags([(t, n) for t, n in top])
+
+    def _choose_tag(self, tag: str) -> None:
+        self._search_input.setText("#" + tag)
 
     def _ensure_sticky(self, note: dict) -> None:
         note_id = note["id"]
@@ -3341,6 +4430,22 @@ class MainWindow(QMainWindow):
             w.positionChanged.connect(self._on_position_changed)
             w.sizeChanged.connect(self._on_size_changed)
             w.foldChanged.connect(self._on_fold_changed)
+            w.noticeRequested.connect(self._on_notice_requested)
+            w.dateReminderRequested.connect(self._on_date_reminder)
+            w.tallyToggled.connect(self._on_tally_toggled)
+            w.wrapToggled.connect(self._on_wrap_toggled)
+            w.attachRequested.connect(self._attach_note_to_window)
+            w.attachDropped.connect(self._attach_note_by_drop)
+            w.attached_hwnd = lambda nid=note_id: self._follower.targets.get(nid, 0)
+            w.widgetCreated.connect(self._on_widget_created)
+            w.widgetOp.connect(self._on_widget_op)
+            w.detachRequested.connect(self._detach_note_from_window)
+            w.printRequested.connect(lambda nid, how: self.print_notes([nid], how))
+            w.viewed.connect(self._note_viewed)
+            w.readListRequested.connect(self._show_read_list)
+            w.opacityChanged.connect(self._on_opacity_changed)
+            w.reminderRequested.connect(self._on_reminder_requested)
+            w.checkResetRequested.connect(self._on_check_reset_requested)
             w.set_dock_resolver(self._resolve_dock_slot)
             w.set_icon_resolver(self._resolve_icon_pos)
             w.set_drop_probe(self._on_icon_dragged)
@@ -3355,6 +4460,14 @@ class MainWindow(QMainWindow):
                                 dock=st.dock, dock_y=st.dock_y,
                                 fold_style=st.fold_style, fold_x=st.fold_x,
                                 fold_y=st.fold_y, fold_at=st.fold_at)
+            w.set_opacity(self._note_opacity(note_id))
+            self._remember_spot(note_id, only_new=True)
+            self._refresh_schedule_chips(note_id)
+            self._apply_notice(note_id)
+            w.set_tally(note_id in self._local.state.tally_notes)
+            w.set_word_wrap(self._note_wraps(note_id))
+            self._apply_widgets(note_id)
+            self._apply_attach_chip(note_id)
         elif not w.is_folded():
             w.move(st.x, st.y)
             if st.w and st.h:
@@ -3406,15 +4519,554 @@ class MainWindow(QMainWindow):
 
     def _on_position_changed(self, note_id: str, x: int, y: int) -> None:
         self._local.state.set_note_state(note_id, x=x, y=y)
+        self._remember_spot(note_id)
+        att = self._follower.attachments.get(note_id)
+        hwnd = self._follower.targets.get(note_id)
+        w = self._stickies.get(note_id)
+        info = wa.window_info(hwnd) if (att is not None and hwnd) else None
+        if info is not None and w is not None:
+            # 붙은 메모를 옮겼다. 그 창의 가장 가까운 모서리에서 다시 잰다.
+            att.corner, att.dx, att.dy = wa.offset_for(info.rect, self._note_physical_pos(w))
+            self._local.state.attachments[note_id] = att.to_dict()
         self._local.save()
+
+    # ── 모니터 구성별 자리 ──
+
+    def _remember_spot(self, note_id: str, only_new: bool = False) -> None:
+        """지금 모니터 구성에서 이 메모를 둔 자리를 적어 둔다."""
+        w = self._stickies.get(note_id)
+        if w is None:
+            return
+        spot = w.layout_spot()
+        if spot is None:
+            return
+        layouts = self._local.state.screen_layouts
+        key = self._screen_layouts.key
+        spots = layouts.setdefault(key, {})
+        if only_new and note_id in spots:
+            return
+        spots[note_id] = spot
+        keep_recent(layouts, key)
+
+    def _remember_all_spots(self) -> None:
+        for nid, w in self._stickies.items():
+            if w.isVisible():
+                self._remember_spot(nid)
+        self._local.save()
+
+    def _on_screen_layout_switched(self, _old: str, new: str) -> None:
+        """모니터를 꽂거나 뽑았다. 이 구성에서 쓰던 자리가 있으면 그리로 옮긴다.
+        바뀌기 전 구성의 자리는 그동안 적어 두었다."""
+        saved = dict(self._local.state.screen_layouts.get(new) or {})
+        moved = 0
+        for nid, spot in saved.items():
+            w = self._stickies.get(nid)
+            if w is not None and w.isVisible() and w.apply_layout_spot(spot):
+                moved += 1
+        if moved:
+            self.notify(i18n.t("main.layout_restored"))
+        # 처음 보는 구성이면 지금 자리(화면 안으로 모은 자리)를 그 구성의 자리로 적는다.
+        QTimer.singleShot(400, self._remember_all_spots)
+
+    # ── 알림과 체크 해제 예약(이 PC 만) ──
+
+    # 이보다 늦게 처리하는 회차는 놓친 것으로 본다(꺼져 있었거나 잠들어 있었다).
+    _LATE_MS = 2 * 60 * 1000
+
+    def _now(self) -> datetime:
+        """지금 때. 시험에서 바꿔 끼운다."""
+        return datetime.now()
+
+    def _arm_schedule_timer(self) -> None:
+        """다음 분의 0초 조금 뒤에 확인한다. 시계가 바뀌어도 다음 확인에서 맞춰진다."""
+        now = self._now()
+        wait = 60_000 - (now.second * 1000 + now.microsecond // 1000) + 300
+        self._schedule_timer.start(max(1_000, min(61_000, wait)))
+
+    def _on_schedule_tick(self) -> None:
+        try:
+            self._check_schedules()
+        finally:
+            self._arm_schedule_timer()
+
+    @staticmethod
+    def _schedule_base(entry: dict, now_ms: int) -> datetime:
+        """이 때 뒤의 회차부터 본다(건 때, 마지막으로 처리한 회차)."""
+        return rm.from_ms(max(entry.get("set_at", 0), entry.get("fired", 0)) or now_ms)
+
+    def _check_schedules(self) -> None:
+        if self._force_quit:
+            return
+        now = self._now()
+        now_ms = rm.to_ms(now)
+        st = self._local.state
+        changed = False
+        due, self._held_rings = list(self._held_rings), []
+        me = self._client.nickname()
+        for source, table in ((self._MINE, st.reminders), (self._SHARED, st.shared_reminders)):
+            for nid in list(table):
+                entry = table[nid]
+                if nid not in self._notes or not isinstance(entry, dict):
+                    continue        # 아직 받지 못했거나 휴지통에 있다
+                if source == self._SHARED and not rm.is_target(entry, me):
+                    continue        # 다른 사람에게 보낸 알림이다
+                rule = rm.Rule.from_dict(entry.get("rule"))
+                if rule is None:
+                    del table[nid]
+                    changed = True
+                    continue
+                try:
+                    changed |= self._check_one_schedule(source, table, nid, entry, rule,
+                                                        now, now_ms, due)
+                except (OSError, OverflowError, ValueError, TypeError):
+                    # 이 알림 하나가 잘못됐다. 나머지 알림은 그대로 확인한다.
+                    continue
+        changed |= self._run_check_resets(now, now_ms)
+        if due:
+            self._ring_due(due, now, now_ms)
+        if changed:
+            self._local.save()
+        self._refresh_schedule_chips()
+
+    def _check_one_schedule(self, source: str, table: dict, nid: str, entry: dict,
+                            rule, now: datetime, now_ms: int, due: list) -> bool:
+        """알림 하나: 울릴 때가 지났으면 ``due`` 에 더하고, 미리 알림을 울린다.
+        바꾼 것이 있으면 True."""
+        changed = False
+        hit = 0
+        last = rm.last_time(rule, self._schedule_base(entry, now_ms), now)
+        if last is not None:
+            hit = rm.to_ms(last)
+            entry["fired"] = hit
+            changed = True
+        snooze = entry.get("snooze", 0)
+        if snooze and snooze <= now_ms:
+            del entry["snooze"]
+            hit = max(hit, snooze)
+            changed = True
+        if hit:
+            due.append((hit, source, nid, rule.to_dict()))
+            # 공유 알림은 공유 PC 가 가진 것이다. 울린 회차만 적어 둔다.
+            if (source == self._MINE and rule.kind == rm.ONCE
+                    and not entry.get("snooze")):
+                del table[nid]
+            return changed
+        nxt = rm.next_time(rule, now)
+        if rule.lead and nxt is not None:
+            lead_at = rm.to_ms(nxt) - rule.lead * 60_000
+            if (lead_at <= now_ms and entry.get("set_at", 0) <= lead_at
+                    and entry.get("lead") != rm.to_ms(nxt)):
+                entry["lead"] = rm.to_ms(nxt)
+                changed = True
+                self._ring_lead(nid, nxt, now)
+        return changed
+
+    def _ring_due(self, due: list, now: datetime, now_ms: int) -> None:
+        due.sort()
+        late = [d for d in due if now_ms - d[0] > self._LATE_MS]
+        fresh = [d for d in due if now_ms - d[0] <= self._LATE_MS]
+        if len(late) == 1:
+            fresh, late = late + fresh, []
+        for item in fresh:
+            if not self._ring(*item, now=now):
+                self._held_rings.append(item)
+        if late and not self._ring_missed(late, now):
+            self._held_rings.extend(late)
+
+    def _ring(self, at_ms: int, source: str, nid: str, rule_dict: dict, *,
+              now: datetime) -> bool:
+        """알림 한 장을 띄운다. 띄우지 못했으면(전체 화면으로 쓰는 중) False."""
+        note = self._notes.get(nid)
+        rule = rm.Rule.from_dict(rule_dict)
+        if note is None or rule is None:
+            return True
+        at = rm.from_ms(at_ms)
+        if rm.to_ms(now) - at_ms > self._LATE_MS:
+            sub = reminder_dialog.short_when(at, now)
+        elif rule.kind == rm.ONCE:
+            sub = reminder_dialog.format_time(at.hour, at.minute)
+        else:
+            sub = reminder_dialog.describe(rule)
+        if source == self._SHARED:
+            sender = self._local.state.shared_reminders.get(nid, {}).get("set_by", "")
+            if sender and sender != self._client.nickname():
+                sub = i18n.t("reminder.sub_from", when=sub, name=sender)
+        toast = self._toasts.show_actions(
+            self._note_title(note), sub,
+            [(i18n.t("reminder.toast_snooze10"), "snooze10", False),
+             (i18n.t("reminder.toast_open"), "open", False),
+             (i18n.t("reminder.toast_done"), "done", True)],
+            menus={"snooze10": [(i18n.t("reminder.toast_snooze60"), "snooze60"),
+                                (i18n.t("reminder.toast_morning"), "morning")]})
+        if toast is None:
+            return False
+        toast.action.connect(
+            lambda key, s=source, n=nid, r=dict(rule_dict):
+            self._on_reminder_action(s, n, r, key))
+        self._ring_effects(nid)
+        return True
+
+    def _ring_effects(self, nid: str) -> None:
+        """알림 소리(설정에서 끌 수 있음)와, 접혀 있는 메모 살짝 흔들기."""
+        if getattr(self._settings, "reminder_sound", True):
+            play_reminder_sound()
+        w = self._stickies.get(nid)
+        if w is not None and w.isVisible() and w.is_folded():
+            w.shake()
+
+    def _ring_missed(self, late: list, now: datetime) -> bool:
+        lines = []
+        for at_ms, _source, nid, _rule in late[:5]:
+            note = self._notes.get(nid)
+            if note is not None:
+                lines.append(reminder_dialog.short_when(rm.from_ms(at_ms), now)
+                             + "  " + self._note_title(note, 24))
+        if not lines:
+            return True
+        shown = self._toasts.show_actions(
+            i18n.t("reminder.missed", count=len(late)), "\n".join(lines), []) is not None
+        if shown and getattr(self._settings, "reminder_sound", True):
+            play_reminder_sound()
+        return shown
+
+    def _ring_lead(self, nid: str, at: datetime, now: datetime) -> None:
+        note = self._notes.get(nid)
+        if note is None:
+            return
+        toast = self._toasts.show_actions(
+            self._note_title(note),
+            i18n.t("reminder.toast_lead", time=reminder_dialog.short_when(at, now)),
+            [(i18n.t("reminder.toast_open"), "open", False)], persistent=False)
+        if toast is not None:
+            toast.action.connect(lambda _key, n=nid: self._reveal_note(n))
+
+    def _on_reminder_action(self, source: str, nid: str, rule_dict: dict, key: str) -> None:
+        if key == "open":
+            self._reveal_note(nid)
+            return
+        st = self._local.state
+        now = self._now()
+        shared = st.shared_reminders.get(nid) if source == self._SHARED else None
+        if shared is not None:
+            if key == "done":
+                shared.pop("snooze", None)
+                rule = rm.Rule.from_dict(shared.get("rule"))
+                if rule is not None and rule.kind == rm.ONCE and self._connected:
+                    # 한 번 알림을 끝냈다. 받는 모두에게서 지운다.
+                    self._client.set_reminder(nid, None, done=True)
+            elif key in ("snooze10", "snooze60", "morning"):
+                minutes = {"snooze10": 10, "snooze60": 60}.get(key)
+                shared["snooze"] = rm.to_ms(rm.snooze_until(now, minutes))
+            else:
+                return
+            self._local.save()
+            self._refresh_schedule_chips(nid)
+            return
+        if source == self._SHARED and key == "done":
+            return              # 누가 이미 끝내 공유 PC 에서 지웠다
+        entry = st.reminders.get(nid)
+        if key == "done":
+            if entry is None:
+                return
+            entry.pop("snooze", None)
+            rule = rm.Rule.from_dict(entry.get("rule"))
+            if rule is None or rule.kind == rm.ONCE:
+                del st.reminders[nid]
+        elif key in ("snooze10", "snooze60", "morning"):
+            if nid not in self._notes:
+                return
+            if entry is None:
+                # 한 번 알림은 울릴 때 지웠다. 미루면 같은 규칙으로 다시 건다.
+                entry = st.reminders[nid] = {
+                    "rule": dict(rule_dict), "set_at": rm.to_ms(now), "fired": rm.to_ms(now)}
+            minutes = {"snooze10": 10, "snooze60": 60}.get(key)
+            entry["snooze"] = rm.to_ms(rm.snooze_until(now, minutes))
+        else:
+            return
+        self._local.save()
+        self._refresh_schedule_chips(nid)
+
+    def _run_check_resets(self, now: datetime, now_ms: int) -> bool:
+        """체크 해제 예약. 바꾼 것이 있으면 True(저장할 것)."""
+        st = self._local.state
+        changed = False
+        for nid in list(st.check_resets):
+            entry = st.check_resets[nid]
+            note = self._notes.get(nid)
+            if note is None:
+                continue
+            rule = rm.Rule.from_dict(entry.get("rule"))
+            if rule is None:
+                del st.check_resets[nid]
+                changed = True
+                continue
+            last = rm.last_time(rule, self._schedule_base(entry, now_ms), now)
+            if last is not None:
+                due_ms = entry["fired"] = rm.to_ms(last)
+                changed = True
+                if (now_ms - due_ms > self._LATE_MS
+                        and int(note.get("updated_at") or 0) > due_ms):
+                    # 꺼져 있던 동안 지난 회차인데 그 뒤에 누가 고쳤다(이미 그날 쓰는 중).
+                    entry.pop("wait", None)
+                    continue
+            elif "wait" not in entry:
+                continue
+            w = self._stickies.get(nid)
+            if w is None or not w.has_checked():
+                if entry.pop("wait", None) is not None:
+                    changed = True
+                continue
+            if not self._connected or not w.uncheck_all():
+                # 누가 편집 중이거나 공유 PC 와 끊겼다. 풀리면 해제한다.
+                if "wait" not in entry:
+                    entry["wait"] = entry.get("fired") or now_ms
+                    changed = True
+                continue
+            if entry.pop("wait", None) is not None:
+                changed = True
+        return changed
+
+    def _next_ring_at(self, entry: dict, rule: "rm.Rule", now: datetime) -> datetime | None:
+        times = []
+        if entry.get("snooze"):
+            times.append(rm.from_ms(entry["snooze"]))
+        nxt = rm.next_time(rule, now)
+        if nxt is not None:
+            times.append(nxt)
+        return min(times) if times else None
+
+    def _refresh_schedule_chips(self, only: str | None = None) -> None:
+        self._refresh_card_marks(only)
+        self._refresh_sticky_chips(only)
+        if self._list_mode == LIST_REMIND:
+            self._apply_search_filter()
+        else:
+            self._refresh_count()
+
+    def _refresh_sticky_chips(self, only: str | None = None) -> None:
+        """메모 머리 줄에 다음 알림과 다음 체크 해제 때를 적는다(매 분, 바꿀 때).
+        알림은 나만 건 것과 공유 알림(내가 받거나 내가 건 것) 가운데 먼저 오는 것."""
+        now = self._now()
+        st = self._local.state
+        me = self._client.nickname()
+        for nid in ([only] if only else list(self._stickies)):
+            w = self._stickies.get(nid)
+            if w is None:
+                continue
+            texts: list = [[], "", [], ""]
+            best = None
+            for source, entry in ((self._MINE, st.reminders.get(nid)),
+                                  (self._SHARED, st.shared_reminders.get(nid))):
+                if entry is None:
+                    continue
+                if source == self._SHARED and not (rm.is_target(entry, me)
+                                                   or entry.get("set_by") == me):
+                    continue
+                rule = rm.Rule.from_dict(entry.get("rule"))
+                at = self._next_ring_at(entry, rule, now) if rule else None
+                if at is not None and (best is None or at < best[0]):
+                    best = (at, source, entry, rule)
+            if best is not None:
+                at, source, entry, rule = best
+                texts[0] = reminder_dialog.when_forms(at, now)
+                texts[1] = (reminder_dialog.long_when(at) if rule.kind == rm.ONCE
+                            else reminder_dialog.describe(rule))
+                if source == self._SHARED:
+                    texts[1] = i18n.t("reminder.tip_to", when=texts[1],
+                                      who=self._targets_text(entry.get("targets") or []))
+            entry = st.check_resets.get(nid)
+            rule = rm.Rule.from_dict(entry.get("rule")) if entry else None
+            at = rm.next_time(rule, now) if rule else None
+            if at is not None:
+                texts[2] = reminder_dialog.when_forms(at, now)
+                texts[3] = i18n.t("sticky.reset_tip", when=reminder_dialog.describe(rule))
+            if any(texts) or any(w.schedule_texts()):
+                w.set_schedule(*texts)
+
+    def _on_reminder_requested(self, note_id: str) -> None:
+        self._ask_schedule(note_id, reminder_dialog.REMIND)
+
+    def _on_check_reset_requested(self, note_id: str) -> None:
+        self._ask_schedule(note_id, reminder_dialog.RESET)
+
+    def _on_date_reminder(self, note_id: str, when, has_time: bool) -> None:
+        """본문의 날짜를 눌렀다. 그 때로 알림 창을 연다(시각이 없으면 오전 9시)."""
+        at = when if has_time else when.replace(hour=9, minute=0)
+        preset = rm.Rule(rm.ONCE, at.date().isoformat(), f"{at.hour:02d}:{at.minute:02d}")
+        self._ask_schedule(note_id, reminder_dialog.REMIND, preset=preset)
+
+    def _ask_schedule(self, note_id: str, mode: str, preset: rm.Rule | None = None) -> None:
+        note = self._notes.get(note_id)
+        if note is None:
+            return
+        st = self._local.state
+        w = self._stickies.get(note_id)
+        parent = w if w is not None and w.isVisible() and not w.is_folded() else self
+        if mode != reminder_dialog.REMIND:
+            entry = st.check_resets.get(note_id)
+            rule = rm.Rule.from_dict(entry.get("rule")) if entry else None
+            action, new_rule, _targets = reminder_dialog.ask_reminder(parent, rule, mode)
+            if action == "clear":
+                st.check_resets.pop(note_id, None)
+            elif action == "save" and new_rule is not None:
+                st.check_resets[note_id] = {"rule": new_rule.to_dict(),
+                                            "set_at": rm.to_ms(self._now())}
+            else:
+                return
+            self._local.save()
+            self._refresh_schedule_chips(note_id)
+            return
+        # 알림: 공유 알림이 있으면 그것을, 없으면 이 PC 에만 건 것을 보인다.
+        share = self._share_state(note)
+        shared = st.shared_reminders.get(note_id) if share is not None else None
+        mine = st.reminders.get(note_id)
+        if shared is not None:
+            rule, targets = rm.Rule.from_dict(shared.get("rule")), list(shared["targets"])
+        elif mine is not None:
+            rule, targets = rm.Rule.from_dict(mine.get("rule")), None
+        else:
+            rule, targets = None, ([] if share == reminder_dialog.SHARE_OK else None)
+        fresh = rule is None
+        if preset is not None:
+            rule = preset
+        options = {"fresh": True} if fresh and preset is not None else {}
+        action, new_rule, new_targets = reminder_dialog.ask_reminder(
+            parent, rule, mode, targets=targets, me=self._client.nickname(),
+            people=self._reminder_people(targets or []), share=share, **options)
+        if action not in ("clear", "save") or (action == "save" and new_rule is None):
+            return
+        if shared is not None and (action == "clear" or new_targets is None):
+            self._client.set_reminder(note_id, None)        # 공유 알림을 거둔다
+        if action == "clear" or new_targets is not None:
+            st.reminders.pop(note_id, None)
+        if action == "save" and new_targets is None:
+            st.reminders[note_id] = {"rule": new_rule.to_dict(),
+                                     "set_at": rm.to_ms(self._now())}
+        elif action == "save":
+            # 공유 PC 가 받아 모두에게 알리면(reminder_changed) 머리 줄이 바뀐다.
+            self._client.set_reminder(note_id, {"rule": new_rule.to_dict(),
+                                                "targets": list(new_targets)})
+        self._local.save()
+        self._refresh_schedule_chips(note_id)
+
+    # ── 공유 알림(모두, 고른 사람) ──
+
+    _MINE, _SHARED = "mine", "shared"
+    _FIRST_SEEN_MS = 24 * 60 * 60 * 1000
+
+    def _share_state(self, note: dict) -> str | None:
+        """알림 창의 받는 사람 구역: 감춤(None), 고를 수 있음, 옛 공유 PC, 끊김."""
+        if self._solo or self._note_is_private(note):
+            return None
+        if not self._connected:
+            return reminder_dialog.SHARE_OFFLINE
+        if not self._shared_ok:
+            return reminder_dialog.SHARE_OLD
+        return reminder_dialog.SHARE_OK
+
+    def _reminder_people(self, extra: list[str]) -> list[str]:
+        """받는 사람으로 고를 수 있는 사람: 나, 그리고 이 PC 가 아는 사람(지금 붙은
+        사람, 전에 본 사람, 메모를 만들거나 고친 사람)."""
+        me = self._client.nickname()
+        names = set(self._local.state.users) | set(self._users) | set(extra)
+        for note in self._notes.values():
+            names.add(str(note.get("created_by") or ""))
+            names.add(str(note.get("updated_by") or ""))
+        names.discard("")
+        names.discard(me)
+        return [me] + sorted(names)
+
+    def _targets_text(self, targets: list[str]) -> str:
+        if not targets:
+            return i18n.t("reminder.to_all")
+        return i18n.t("reminder.days_sep").join(targets)
+
+    def _merge_shared(self, prev: dict | None, entry: dict, now_ms: int) -> dict:
+        """공유 PC 가 보낸 알림에 이 PC 의 처리 상태(울린 회차, 미루기)를 잇는다.
+
+        같은 알림이면 상태를 그대로 두고, 바뀌었으면 새로 센다. 처음 받는 알림은
+        하루보다 오래전 회차를 놓친 것으로 치지 않는다(새로 참여한 PC 가 지난
+        알림을 한꺼번에 받지 않게)."""
+        same = prev is not None and all(
+            prev.get(k) == entry[k] for k in ("rule", "targets", "set_by", "set_at"))
+        if same:
+            return {**entry, **{k: prev[k] for k in ("fired", "snooze", "lead") if k in prev}}
+        merged = dict(entry)
+        floor = now_ms - self._FIRST_SEEN_MS
+        if prev is None and entry["set_at"] < floor:
+            merged["fired"] = floor
+        return merged
+
+    def takeover_extras(self) -> dict:
+        """사본으로 공유를 이어받을 때 새 메모 파일에 함께 넣을 것: 이 PC 가 알던 공유 알림,
+        공지, 위젯 데이터(사본에는 메모와 폴더만 있다)."""
+        return {"reminders": dict(self._local.state.shared_reminders),
+                "notices": dict(self._notices),
+                "widgets": dict(self._widget_store)}
+
+    def _take_shared_reminders(self, data: dict) -> None:
+        """welcome 의 공유 알림으로 이 PC 의 사본을 맞춘다. 저장은 부르는 쪽이 한다."""
+        raw = data.get("reminders")
+        self._shared_ok = isinstance(raw, dict)
+        st = self._local.state
+        now_ms = rm.to_ms(self._now())
+        fresh: dict[str, dict] = {}
+        for nid, value in (raw if isinstance(raw, dict) else {}).items():
+            entry = rm.shared_from_dict(value)
+            if isinstance(nid, str) and entry is not None:
+                fresh[nid] = self._merge_shared(st.shared_reminders.get(nid), entry, now_ms)
+        st.shared_reminders = fresh
+
+    def _on_reminder_changed(self, note_id: str, entry, _by: str, _done: bool) -> None:
+        st = self._local.state
+        if entry is None:
+            if st.shared_reminders.pop(note_id, None) is None:
+                return
+        else:
+            st.shared_reminders[note_id] = self._merge_shared(
+                st.shared_reminders.get(note_id), entry, rm.to_ms(self._now()))
+        self._local.save()
+        self._refresh_schedule_chips(note_id)
+
+    def _reveal_note(self, note_id: str) -> None:
+        """알림의 '열기': 숨겼으면 보이고, 접혔으면 펴서 앞으로 부른다."""
+        if note_id not in self._notes:
+            return
+        st = self._local.state.get_note_state(note_id)
+        if st.hidden:
+            self._set_note_visibility(note_id, True)
+        else:
+            self._open_folder_of(note_id)
+        w = self._stickies.get(note_id)
+        if w is not None:
+            w.reveal()
+        self._note_viewed(note_id)
 
     def _on_size_changed(self, note_id: str, w: int, h: int) -> None:
         self._local.state.set_note_state(note_id, w=w, h=h)
         self._local.save()
 
+    def _note_opacity(self, note_id: str) -> int:
+        """메모 바탕의 불투명도(%): 이 PC 에서 메모마다 정한 값, 없으면 설정의 기본값."""
+        own = self._local.state.note_opacity.get(note_id)
+        if own is not None:
+            return own
+        return 100 - clamp_transparency(self._settings.note_transparency)
+
+    def _on_opacity_changed(self, note_id: str, percent: int) -> None:
+        if percent == 100 - clamp_transparency(self._settings.note_transparency):
+            self._local.state.note_opacity.pop(note_id, None)
+        else:
+            self._local.state.note_opacity[note_id] = int(percent)
+        self._local.save()
+
     def _on_fold_changed(self, note_id: str, state: dict) -> None:
         self._local.state.set_note_state(note_id, **state)
+        self._remember_spot(note_id)
         self._local.save()
+        if state.get("folded"):
+            self._taken_out.pop(note_id, None)
+        self._refresh_card_marks(note_id)
         # 펴거나 벽에 붙이면 더는 아이콘이 아니다. 고른 것에서 뺀다.
         self._icon_ctl.refresh()
 
@@ -3481,7 +5133,7 @@ class MainWindow(QMainWindow):
             win = FolderWindow(folder_id, self._settings,
                                wire_card=self._wire_folder_card,
                                icon=self._app_icon)
-            win.noteActivated.connect(self.peek_note)
+            win.noteActivated.connect(self.toggle_note_out)
             win.deleteRequested.connect(self.delete_notes)
             win.visibilityRequested.connect(self._set_notes_visibility)
             self._folder_windows[folder_id] = win
@@ -3539,7 +5191,7 @@ class MainWindow(QMainWindow):
     def _wire_folder_card(self, card: NoteCard) -> None:
         """폴더 창의 카드 한 장. 누르면 그 메모만 꺼내 보고, 나머지는 메인 창의
         목록에 있는 카드와 똑같이 된다."""
-        card.clicked.connect(self.peek_note)
+        card.clicked.connect(self.toggle_note_out)
         card.toggleVisibility.connect(self._toggle_visibility_from_card)
         card.deleteRequested.connect(self._delete_note_confirm)
         card.historyRequested.connect(self._open_history_for)
@@ -3715,6 +5367,8 @@ class MainWindow(QMainWindow):
 
     def _note_shown(self, note_id: str) -> bool:
         """이 메모가 지금 바탕 화면에 나와야 하는가."""
+        if note_id in self._follower.hidden:
+            return False            # 붙은 창이 닫혔거나 내려져 있다
         if note_id in self._peeked:
             return True
         if self._local.state.get_note_state(note_id).hidden:
@@ -3886,6 +5540,7 @@ class MainWindow(QMainWindow):
         return free_dock_slot(y, height, screen_rect, spans, side)
 
     def _set_note_visibility(self, note_id: str, visible: bool) -> None:
+        self._taken_out.pop(note_id, None)
         if not visible and note_id in self._peeked:
             # 폴더 창에서 꺼내 본 메모를 닫았다. 다시 폴더 안으로 들어갈 뿐이고,
             # 숨긴 메모로 바꾸지는 않는다.
@@ -3921,7 +5576,7 @@ class MainWindow(QMainWindow):
         self._client.get_history(None)
 
     def _refresh_status_text(self) -> None:
-        """상태줄 오른쪽의 연결 상태, 역할, 닉네임, 접속 인원을 다시 적는다."""
+        """연결 상태, 역할, 닉네임, 접속 인원을 본인 아이콘과 트레이에 적는다."""
         if self._connected and self._solo:
             state, text = "connected", i18n.t("main.state_solo")
         elif self._connected:
@@ -3941,7 +5596,60 @@ class MainWindow(QMainWindow):
             detail += "   " + i18n.t("main.status_online_count",
                                      count=len(self._users))
         self._conn_badge.set_state(state, text, detail)
+        me = self._client.nickname()
+        dot = (shell.STATE_SOLO if self._solo and self._connected
+               else {"connected": shell.STATE_OK,
+                     "disconnected": shell.STATE_OFF}.get(state, shell.STATE_WAIT))
+        role = i18n.t(f"me.role_{self._me_role()}")
+        self._me_btn.set_person(me, dot, i18n.t("me.tip", name=me, role=role, state=text))
         self._refresh_tray_state(state, text)
+
+    def _me_role(self) -> str:
+        if self._solo:
+            return "solo"
+        return "host" if self._role == "host" else "guest"
+
+    def _open_me_popup(self) -> None:
+        """본인 아이콘: 나, 연결 상태, 주소, 지금 접속한 사람, 접속 정보 바꾸기."""
+        if self._me_popup is not None and self._me_popup.isVisible():
+            self._me_popup.close()
+            return
+        ls = self._local.state
+        role = self._me_role()
+        if role == "host":
+            address = f"{_local_lan_ip()}:{ls.last_host_port}"
+        elif role == "guest":
+            address = f"{ls.last_host_ip}:{ls.last_host_port}"
+        else:
+            address = ""
+        editing: dict[str, str] = {}
+        for nid, holder in self._locks.items():
+            note = self._notes.get(nid)
+            if holder and note is not None:
+                editing.setdefault(holder, self._note_title(note, 18))
+        state = self._me_btn.state()
+        info = shell.MeInfo(nick=self._client.nickname(), role=role,
+                            state=shell.STATE_OK if state == shell.STATE_SOLO else state,
+                            state_text=self._conn_badge._state.text(),
+                            address=address,
+                            people=[(n, editing.get(n, "")) for n in self._users])
+        popup = shell.MePopup(info, self)
+        popup.changeConnectionRequested.connect(self._reset_connection)
+        popup.shareRequested.connect(self._start_sharing)
+        popup.reconnectRequested.connect(self._reconnect_now)
+        popup.destroyed.connect(lambda *_a: setattr(self, "_me_popup", None))
+        self._me_popup = popup
+        popup.open_below(self._me_btn)
+
+    def _reconnect_now(self) -> None:
+        resume = getattr(self._client, "resume", None)
+        if callable(resume):
+            resume()
+
+    def _refresh_status_bar(self) -> None:
+        """상태줄은 잠깐 뜨는 글이나 '되돌리기'가 있을 때만 보인다."""
+        status = self._status
+        status.setVisible(bool(status.currentMessage()) or not self._undo_btn.isHidden())
 
     def _build_tray(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -3960,7 +5668,7 @@ class MainWindow(QMainWindow):
     def _apply_tray_visibility(self) -> None:
         if self._tray is None:
             return
-        if self._settings.show_tray_icon:
+        if self._settings.show_tray_icon and not self._force_quit:
             self._tray.show()
         else:
             self._tray.hide()
@@ -4099,7 +5807,12 @@ class MainWindow(QMainWindow):
         '숨기기'로 받으므로, 이 채비 없이 종료가 시작되면 메모 하나가 숨김으로
         바뀌고 종료는 취소된다."""
         self._force_quit = True
+        self._global_keys.stop()
+        self._follower.stop()
+        if self._quick_find is not None:
+            self._quick_find.hide()
         self._gate_timer.stop()
+        self._schedule_timer.stop()
         self._desktop_grid.stop()
         self._icon_ctl.stop()
         self._close_folder_windows()
@@ -4114,6 +5827,73 @@ class MainWindow(QMainWindow):
         self._client.stop()
         QApplication.quit()
 
+    def nativeEvent(self, event_type, message):  # noqa: N802
+        # 메인 창이 뒤에 있을 때 목록의 카드를 누르면, Windows 가 메인 창을 먼저
+        # 앞으로 올려 겹쳐 있던 메모를 덮었다가 메모가 다시 앞으로 나왔다(깜빡임).
+        # 카드를 누를 때는 메인 창을 앞으로 올리지 않는다. 메모가 앞으로 나온다.
+        if nf.is_mouse_activate(message) and self._press_lands_on_card():
+            return True, nf.MA_NOACTIVATE
+        return super().nativeEvent(event_type, message)
+
+    def _press_lands_on_card(self) -> bool:
+        if self.isActiveWindow() or self._selection_mode:
+            return False
+        widget = QApplication.widgetAt(QCursor.pos())
+        while widget is not None and widget is not self:
+            if isinstance(widget, NoteCard):
+                return widget in self._cards.values()
+            if isinstance(widget, QAbstractButton):
+                return False
+            widget = widget.parentWidget()
+        return False
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "_rail"):
+            self._apply_narrow(self.width() < self._narrow_below())
+            if not self._narrow:
+                self._fit_search_width()
+
+    # 상단바 검색칸의 폭: 창 폭에 비례하되 이 사이, 오른쪽 단추들 자리는 남긴다.
+    _SEARCH_MIN, _SEARCH_MAX, _SEARCH_SHARE = 280, 720, 0.46
+
+    def _fit_search_width(self) -> None:
+        """검색칸 폭은 창 폭에 비례한다. 상단바가 비좁으면 검색칸이 너무 짧아지지 않게
+        시작 자리를 '전체 메모' 줄보다 앞당긴다(창 이름 쪽을 줄인다)."""
+        right = 230                                  # 본인 아이콘과 창 단추 자리
+        lead = shell.RAIL_WIDTH + 20
+        room = self.width() - lead - right
+        if room < self._SEARCH_FLOOR:
+            lead = max(self._LEAD_FLOOR, lead - (self._SEARCH_FLOOR - room))
+            room = self.width() - lead - right
+        self._title_bar.set_lead_width(lead)
+        width = int(self.width() * self._SEARCH_SHARE)
+        self._search_input.setFixedWidth(
+            max(min(self._SEARCH_FLOOR, room), min(width, self._SEARCH_MAX, room)))
+
+    _SEARCH_FLOOR, _LEAD_FLOOR = 220, 150
+    # 상단바의 앱 아이콘과 이름(다른 창은 22, 15).
+    _MARK_SIZE, _TITLE_PX = 26, 17
+
+    def _apply_narrow(self, narrow: bool) -> None:
+        """창이 좁으면 옆줄을 위의 펼침 칸으로 접고 검색칸을 목록 위로 옮긴다."""
+        if narrow == self._narrow:
+            return
+        self._narrow = narrow
+        self._rail.setVisible(not narrow)
+        self._narrow_bar.setVisible(narrow)
+        self._narrow_search.setVisible(narrow)
+        if narrow:
+            self._search_input.setMinimumWidth(0)
+            self._search_input.setMaximumWidth(16777215)
+            self._narrow_search_row.addWidget(self._search_input)
+            self._title_bar.set_lead_width(0)
+        else:
+            self._title_bar.insert_widget(0, self._search_input)
+            # 검색칸이 목록의 '전체 메모'와 같은 세로줄에서 시작한다(비좁으면 앞당긴다).
+            self._fit_search_width()
+        self._search_input.show()
+
     def closeEvent(self, event) -> None:
         # 트레이가 켜져 있으면 X 로 닫아도 숨기기만 해서 동기화를 유지한다.
         if (not self._force_quit
@@ -4127,10 +5907,12 @@ class MainWindow(QMainWindow):
                 self._settings.save()
                 self._toasts.show_text(i18n.t("main.tray_running_hint"))
             return
-        self._flush_pending_edits()
-        self._teardown_stickies()
+        # 프로그램을 끝낸다. 부모 없이 뜬 창(수정 이력, 폴더 창, 설정)이 남아 있으면 Qt 가
+        # 끝나지 않고 메모도 단축키도 없는 채로 남았다. 그 창들도 함께 닫는다.
+        self.prepare_quit()
         self._client.stop()
-        if self._tray is not None:
-            self._tray.hide()
+        for top in QApplication.topLevelWidgets():
+            if top is not self and top.isVisible() and not isinstance(top, QMenu):
+                top.close()
         super().closeEvent(event)
 

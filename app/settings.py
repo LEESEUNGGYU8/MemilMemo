@@ -5,6 +5,8 @@ import platform
 import re
 import sys
 from dataclasses import asdict, dataclass, field
+
+from . import hotkeys as _hotkeys
 from pathlib import Path
 
 from . import config, packaging, startup_task
@@ -45,6 +47,15 @@ def clamp_animation_speed(value) -> float:
     return round(speed, 1)
 
 
+def clamp_transparency(value) -> int:
+    """투명도(%)를 0 ~ 80 의 5 단위로 맞춘다. 모르는 값은 0(불투명)."""
+    try:
+        number = int(round(float(value) / 5.0)) * 5
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return max(0, min(100 - config.MIN_NOTE_OPACITY, number))
+
+
 @dataclass
 class AppSettings:
     # 빈 문자열 = 미선택 → 시작 시 OS 로케일을 감지해 적용한다.
@@ -55,6 +66,8 @@ class AppSettings:
     close_main_to_tray: bool = True
 
     move_checked_to_bottom: bool = False
+    # 메모 글을 메모 폭에서 자동으로 줄바꿈한다(메모마다 더 보기 메뉴에서 바꿀 수 있다).
+    word_wrap: bool = True
 
     # 메모 안 이미지를 더블 클릭했을 때 여는 방법.
     # "builtin" = 앱 자체 이미지 뷰어, "system" = OS 기본 이미지 뷰어(임시 파일 경유).
@@ -75,6 +88,10 @@ class AppSettings:
     animation_speed: float = 1.0
     # 접힌 메모의 기본 모양: "slip"(쪽지) 또는 "icon"(바탕화면 아이콘).
     fold_style: str = "slip"
+    # 메모 바탕의 기본 투명도(%, 0 ~ 80). 메모마다 더 보기 메뉴에서 따로 정할 수 있다.
+    note_transparency: int = 0
+    # 마우스를 올리면 투명한 메모도 진하게 보인다.
+    opacity_hover_solid: bool = True
     # 화면 가장자리에 붙인 메모(탭과 거기서 펼친 메모)를 다른 창 위에 둘지.
     dock_on_top: bool = True
 
@@ -95,6 +112,22 @@ class AppSettings:
     notify_new_note: bool = True
     # 다른 사람이 메모를 고치고 편집을 마치면 알린다.
     notify_note_edit: bool = True
+    # 리마인더가 울릴 때 Windows 알림 소리를 낸다.
+    reminder_sound: bool = True
+    # 공지를 읽었다는 것을 만든 사람에게 알리지 않는다.
+    hide_read_receipts: bool = False
+    # 메모 안 위젯 가운데 미니게임(오목)을 넣을 수 있게 한다.
+    widget_games: bool = True
+    # 메모를 다른 프로그램의 창에 붙이기(실험, 기본 꺼짐).
+    window_attach: bool = False
+    # 파일을 첨부할 때 종류마다 고른 방식({종류: 방식}). 없는 종류는 기본 방식.
+    attach_modes: dict = field(default_factory=dict)
+    # 인쇄와 PDF 를 메모 색 그대로 찍는다(꺼져 있으면 흰 바탕).
+    print_keep_color: bool = False
+    # 폴더를 인쇄할 때 메모마다 새 쪽에서 시작한다(꺼져 있으면 이어서).
+    print_one_per_page: bool = True
+    # 어디서나 쓰는 단축키: {일: {"key": 키보드 조합, "mouse": 마우스 조합}}.
+    hotkeys: dict = field(default_factory=lambda: _hotkeys.clean_bindings(None))
     # 새 메모를 '나만 보기'로 만든다. 꺼져 있으면 모두에게 공개한다.
     new_note_private: bool = False
 
@@ -137,8 +170,12 @@ class AppSettings:
             loaded.trash_view_layout = VIEW_LIST
         if loaded.trash_view_density not in VIEW_DENSITIES:
             loaded.trash_view_density = VIEW_STANDARD
+        loaded.note_transparency = clamp_transparency(loaded.note_transparency)
         if loaded.fold_style not in ("slip", "icon"):
             loaded.fold_style = "slip"
+        loaded.hotkeys = _hotkeys.clean_bindings(loaded.hotkeys)
+        if not isinstance(loaded.attach_modes, dict):
+            loaded.attach_modes = {}
         if isinstance(loaded.animation_speed, bool):
             loaded.animation_speed = 1.0
         loaded.animation_speed = clamp_animation_speed(loaded.animation_speed)

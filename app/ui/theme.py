@@ -16,15 +16,15 @@ from .. import config, i18n
 
 
 class RoundedScrollBar(QScrollBar):
-    """핸들을 항상 둥글게 표시하는 세로 스크롤바.
+    """핸들을 항상 둥글게 표시하는 스크롤바(기본은 세로, 가로도 된다).
 
     Windows 네이티브 스타일이 QSS 의 border-radius 를 무시하고 핸들을 각지게
     그리므로, 스타일이 계산한 슬라이더 영역에 알약형 핸들을 직접 페인팅한다.
     슬라이더 영역을 그대로 쓰므로 드래그 히트 영역과 그림이 어긋나지 않는다."""
 
     def __init__(self, handle: str = "#D4D4D4", hover: str = "#B4B4B4",
-                 parent=None) -> None:
-        super().__init__(Qt.Vertical, parent)
+                 parent=None, orientation=Qt.Vertical) -> None:
+        super().__init__(orientation, parent)
         self._handle = QColor(handle)
         self._hover = QColor(hover)
         self._hovered = False
@@ -49,7 +49,9 @@ class RoundedScrollBar(QScrollBar):
     def _slider_rect(self):
         opt = QStyleOptionSlider()
         opt.initFrom(self)
-        opt.orientation = Qt.Vertical
+        opt.orientation = self.orientation()
+        if self.orientation() == Qt.Horizontal:
+            opt.state |= QStyle.State_Horizontal
         opt.minimum = self.minimum()
         opt.maximum = self.maximum()
         opt.sliderPosition = self.sliderPosition()
@@ -66,7 +68,7 @@ class RoundedScrollBar(QScrollBar):
         if rect.width() <= 0 or rect.height() <= 0:
             return
         r = QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5)
-        radius = r.width() / 2.0
+        radius = min(r.width(), r.height()) / 2.0
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setPen(Qt.NoPen)
@@ -113,6 +115,15 @@ LIGHT_MENU_QSS = (
     "QMenu::separator { height: 1px; background: #EAEAEA; "
     "margin: 4px 6px; }"
 )
+
+
+# 그림 칸을 맞춘 메뉴: 보통 항목과 하위 메뉴 줄의 그림과 글이 CenteredMenuItem(그림 칸 40,
+# 글은 48)과 같은 세로줄에 온다.
+ALIGNED_MENU_QSS = LIGHT_MENU_QSS + (
+    "QMenu::item { padding: 6px 22px 6px 24px; }"
+    "QMenu::icon { padding-left: 32px; }"
+    "QMenu::indicator { left: 18px; width: 12px; height: 12px; }"
+    "QMenu::right-arrow { right: 12px; }")
 
 
 # 메모 색의 이름. 색 견본의 말풍선과 화면 낭독기가 헥스 코드 대신 이 이름을 읽는다.
@@ -167,17 +178,20 @@ def load_application_font(font_path: Path) -> str:
 def load_application_fonts(language: str) -> str:
     """언어별 기본 family 를 반환한다.
 
-    두 폰트를 모두 등록해 둬야 혼용 텍스트(예: 한국어 UI 안의 일본어 메모)가
-    폴백 체인으로 올바르게 렌더링된다."""
-    ko_family = load_application_font(config.FONT_PATH)
-    jp_family = load_application_font(config.FONT_PATH_JP)
-    if language == "ja" and jp_family:
-        return jp_family
-    return ko_family or jp_family
+    글꼴 하나를 등록하면 메모리가 크게 든다(가변 글꼴이라 Windows 가 여러 굵기를 따로 읽는다.
+    Pretendard 70MB, Pretendard JP 130MB 쯤). 그래서 화면 언어에 맞는 하나만 등록한다.
+    Pretendard JP 는 한글, 가나, 한자를 모두 담고, Pretendard 는 한글과 가나를 담는다.
+    한국어, 영어 화면의 한자는 폴백 체인의 시스템 글꼴(맑은 고딕 등)로 그린다.
+    언어는 다시 켜야 바뀌므로 켤 때 한 번 정하면 된다."""
+    if language == "ja":
+        jp_family = load_application_font(config.FONT_PATH_JP)
+        if jp_family:
+            return jp_family
+    return load_application_font(config.FONT_PATH) or load_application_font(config.FONT_PATH_JP)
 
 
-# 본문용 폰트 스택. 한·일 혼용을 처리하도록 두 Pretendard variant 를 먼저 두고
-# 시스템 폰트로 폴백한다.
+# 본문용 폰트 스택. 등록한 Pretendard(화면 언어에 따라 둘 중 하나)를 먼저 두고
+# 시스템 폰트로 폴백한다(등록하지 않은 이름은 건너뛴다).
 CONTENT_FONT_STACK = ("'Pretendard Variable', 'Pretendard JP Variable', "
                       "'Malgun Gothic', 'Meiryo', sans-serif")
 

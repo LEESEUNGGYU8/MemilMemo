@@ -9,7 +9,7 @@ from . import packaging
 APP_NAME = "SyncNotes"
 # 앱 버전의 단일 출처. 자동 업데이트가 이 값을 GitHub 릴리스 태그와 비교한다.
 # 메밀메모로 이름을 바꾸면서 1.0.0 부터 다시 센다(SyncNotes 는 1.0.7 까지였다).
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.1.0"
 # 닉네임의 길이 상한. 참여한 PC 마다 이 이름을 적어 두므로 끝없이 길면 안 된다.
 MAX_NICKNAME_LENGTH = 64
 
@@ -84,8 +84,14 @@ DISCOVERY_PORT = 5555
 
 DEFAULT_NOTE_WIDTH = 280
 DEFAULT_NOTE_HEIGHT = 260
-MIN_NOTE_WIDTH = 220
-MIN_NOTE_HEIGHT = 180
+# 메모를 줄일 수 있는 한도. 머리 줄 단추와 글 한 줄이 들어가는 크기다(한 줄짜리
+# 메모를 그만큼만 차지하게 둘 수 있다).
+MIN_NOTE_WIDTH = 160
+MIN_NOTE_HEIGHT = 84
+# 편집하는 동안의 한도. 서식 줄과 글 두어 줄이 들어가야 해서, 이보다 작은 메모는
+# 편집하는 동안만 잠시 넓혔다가 마치면 돌린다.
+EDIT_MIN_WIDTH = 220
+EDIT_MIN_HEIGHT = 150
 # 첨부 시 이 폭을 넘는 이미지는 여기까지 줄여 저장한다. 1920 은 FHD 스크린샷이
 # 손실 없이 들어가는 폭이다(2026-09 이전에는 520 이었고, 이미지 뷰어에서 크게 볼
 # 수 있도록 올렸다). 메모 안 표시는 RichTextEdit 이 표시 크기로 따로 줄여 그린다.
@@ -94,6 +100,9 @@ FORMAT_BAR_HEIGHT = 36
 
 TEXT_MARGINS = (18, 10, 18, 18)  # 좌, 상, 우, 하 (px)
 HANDLE_BAR_HEIGHT = 32
+# 메모 바탕을 가장 옅게 했을 때의 불투명도(%). 이보다 옅으면 바탕을 눌러도
+# 창이 잡히지 않는다(완전히 투명한 곳은 Windows 가 누름을 아래 창으로 넘긴다).
+MIN_NOTE_OPACITY = 20
 RESIZE_GRIP_SIZE = 12
 CORNER_RADIUS = 12
 

@@ -237,12 +237,12 @@ def test_long_title_is_cut_in_the_notice(window):
 def test_settings_dialog_has_a_section_list_and_an_icon_on_about(qapp):
     dlg = SettingsDialog(AppSettings(), role="host")
     titles = [dlg._nav.button(i).text() for i in range(dlg._pages.count())]
-    assert titles == ["일반", "메모", "접기", "알림", "네트워크", "백업", "정보"]
+    assert titles == ["일반", "단축키", "메모", "첨부", "접기", "알림", "네트워크", "백업", "정보"]
     assert dlg._pages.currentIndex() == 0 and dlg._nav.button(0).isChecked()
 
-    dlg.show_page(6)
-    assert dlg._pages.currentIndex() == 6 and dlg._nav.button(6).isChecked()
-    about = dlg._pages.widget(6)
+    dlg.show_page(8)
+    assert dlg._pages.currentIndex() == 8 and dlg._nav.button(8).isChecked()
+    about = dlg._pages.widget(8)
     labels = about.findChildren(QLabel)
     # 프로그램 이름 위에 큰 아이콘이 있다.
     icon = next(lbl for lbl in labels if lbl.pixmap() and not lbl.pixmap().isNull())
@@ -252,8 +252,8 @@ def test_settings_dialog_has_a_section_list_and_an_icon_on_about(qapp):
     assert any(config.APP_VERSION in lbl.text() for lbl in labels)
 
     # 구역을 누르면 그 쪽이 보인다.
-    dlg._nav.button(3).click()
-    assert dlg._pages.currentIndex() == 3
+    dlg._nav.button(5).click()
+    assert dlg._pages.currentIndex() == 5
     # 쓰는 법을 설명하는 글은 두지 않는다.
     every = " ".join(lbl.text() for lbl in dlg.findChildren(QLabel))
     assert "두 번 누르면" not in every and " · " not in every
@@ -291,7 +291,7 @@ def test_settings_dialog_saves_notice_and_update_options(qapp, monkeypatch):
 def test_switch_toggles_from_anywhere_on_its_row(qapp):
     dlg = SettingsDialog(AppSettings(), role="host")
     dlg.show()
-    dlg.show_page(3)
+    dlg.show_page(5)
     qapp.processEvents()
     switch = dlg._notify_new_note
     assert switch.isChecked()
@@ -590,6 +590,8 @@ def test_no_settings_control_sticks_out_of_its_row(qapp):
                         if not w.isVisibleTo(page):
                             continue
                         g, parent = w.geometry(), w.parentWidget()
+                        if parent.objectName() == "qt_scrollarea_viewport":
+                            continue        # 굴러가는 내용은 보이는 자리보다 길 수 있다
                         assert (g.left() >= 0 and g.top() >= 0
                                 and g.right() < parent.width()
                                 and g.bottom() < parent.height()), (

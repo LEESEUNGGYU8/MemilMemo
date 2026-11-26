@@ -35,6 +35,17 @@ MSG_GET_TRASH = "get_trash"
 MSG_RESTORE_NOTE = "restore_note"
 MSG_PURGE_NOTE = "purge_note"
 MSG_EMPTY_TRASH = "empty_trash"
+# 공유 알림을 걸거나 바꾸거나 지운다({"note_id", "reminder": 알림 또는 null, "done"}).
+# 이 메시지를 모르는 옛 공유 PC 는 그냥 넘긴다.
+MSG_SET_REMINDER = "set_reminder"
+# 1.2: 공지로 만들거나 푼다({"note_id", "on"}), 공지를 봤다({"note_id", "version"}).
+# 이 메시지를 모르는 옛 공유 PC 는 그냥 넘긴다(welcome 에 notices 가 없다).
+MSG_SET_NOTICE = "set_notice"
+MSG_SEEN = "seen"
+# 1.2: 메모 안 위젯. 넣기({"note_id", "widget_id", "data"}), 누르기({"widget_id", "op"}).
+# 공유 PC 가 받은 차례대로 적용해 widget_changed 로 나눈다(본문 잠금과 따로).
+MSG_WIDGET_PUT = "widget_put"
+MSG_WIDGET_OP = "widget_op"
 
 # 서버 → 클라이언트
 MSG_WELCOME = "welcome"
@@ -60,6 +71,17 @@ MSG_AUTH_FAILED = "auth_failed"
 # 휴지통에 든 메모들(그 참가자가 볼 수 있는 것만), 휴지통이 달라졌다는 알림.
 MSG_TRASH_LIST = "trash_list"
 MSG_TRASH_CHANGED = "trash_changed"
+# 공유 알림이 바뀌었다({"note_id", "reminder": 알림 또는 null, "by", "done"}).
+MSG_REMINDER_CHANGED = "reminder_changed"
+# 공지가 바뀌었다({"note_id", "owner": 만든 사람 또는 null, "by"}).
+MSG_NOTICE_CHANGED = "notice_changed"
+# 내 공지를 누가 봤는가({"note_id", "seen": {이름: {"version", "at"}}}). 만든 사람에게만.
+MSG_SEEN_CHANGED = "seen_changed"
+# 누가 메모에서 나를 불렀다({"note_id", "by", "at"}).
+MSG_MENTIONED = "mentioned"
+# 위젯이 바뀌었다({"note_id", "widget_id", "data", "by"}), 거절({"widget_id", "error"}).
+MSG_WIDGET_CHANGED = "widget_changed"
+MSG_WIDGET_ERROR = "widget_error"
 
 
 @dataclass

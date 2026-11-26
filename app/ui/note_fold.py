@@ -226,8 +226,11 @@ def _ear_size(rect: QRectF) -> float:
 
 def paint_slip(p: QPainter, rect: QRectF, color: str, title: str, *,
                dock: str = DOCK_NONE, private: bool = False,
-               hover: bool = False, font: QFont | None = None) -> None:
-    """접힌 쪽지(또는 가장자리 탭)를 ``rect`` 에 그린다."""
+               hover: bool = False, font: QFont | None = None,
+               progress: str = "", bell: bool = False) -> None:
+    """접힌 쪽지(또는 가장자리 탭)를 ``rect`` 에 그린다. ``progress`` 는 할 일
+    진행률('3/5')이다. 쪽지의 오른쪽에 적는다(폭이 좁은 탭에는 적지 않는다).
+    ``bell`` 이면 알림이 걸린 메모다. 제목 앞에 작은 종을 그린다."""
     p.save()
     p.setRenderHint(QPainter.Antialiasing)
     base = QColor(color)
@@ -298,6 +301,24 @@ def paint_slip(p: QPainter, rect: QRectF, color: str, title: str, *,
     text_rect = QRectF(body.left() + pad_l, body.top() + pad_t,
                        body.width() - pad_l - pad_r,
                        body.height() - pad_t - pad_b)
+    if progress and dock == DOCK_NONE and text_rect.width() > 80:
+        pf = QFont(f)
+        pf.setPixelSize(12)
+        width = QFontMetricsF(pf).horizontalAdvance(progress)
+        ink = QColor(fg)
+        ink.setAlphaF(0.72)
+        p.save()
+        p.setFont(pf)
+        p.setPen(ink)
+        p.drawText(QRectF(text_rect.right() - width, text_rect.top(), width,
+                          text_rect.height()), Qt.AlignVCenter | Qt.AlignRight, progress)
+        p.restore()
+        text_rect.setRight(text_rect.right() - width - 8)
+    if bell and text_rect.width() > 60:
+        icon = svg_icon("bell", color=fg).pixmap(13, 13)
+        p.drawPixmap(QPointF(text_rect.left(),
+                             text_rect.center().y() - 6.5), icon)
+        text_rect.setLeft(text_rect.left() + 18)
     if private and text_rect.width() > 60:
         icon = svg_icon("lock", color=fg).pixmap(13, 13)
         p.drawPixmap(QPointF(text_rect.left(),
@@ -534,8 +555,9 @@ def first_image_url(html: str) -> str:
     """본문의 첫 이미지(글머리와 체크 상자 그림은 뺀다)."""
     if not html or "<img" not in html.lower():
         return ""
+    from .rich_text import is_widget_url
     for m in _IMG_SRC.finditer(html):
-        if not is_marker_url(m.group(1)):
+        if not is_marker_url(m.group(1)) and not is_widget_url(m.group(1)):
             return m.group(1)
     return ""
 
@@ -880,8 +902,11 @@ def paint_icon(p: QPainter, cell: QRectF, color: str, title: str, *,
                thumb: QPixmap | None = None,
                icon: float | None = None, selected: bool = False,
                active: bool = True, tint: QRectF | None = None,
-               ink: QColor | None = None) -> None:
-    """접힌 메모를 바탕화면 아이콘 모양으로 그린다. ``icon`` 은 그림의 한 변이다
+               ink: QColor | None = None, progress: str = "",
+               bell: bool = False) -> None:
+    """접힌 메모를 바탕화면 아이콘 모양으로 그린다. ``bell`` 이면 그림 왼쪽 위에
+    작은 종 배지를 얹는다(알림이 걸린 메모). ``progress`` 는 할 일
+    진행률('3/5')로, 그림 오른쪽 아래에 흰 띠로 얹는다(폴더의 메모 수와 다른 모양). ``icon`` 은 그림의 한 변이다
     (바탕화면 아이콘의 크기). 고르거나 마우스를 올리면 진짜 아이콘처럼 뒤에 판이
     깔린다. ``ink`` 를 주면 창 안에 놓인 아이콘으로 그린다(이름은 그 색, 판은
     탐색기 창의 것)."""
@@ -895,6 +920,32 @@ def paint_icon(p: QPainter, cell: QRectF, color: str, title: str, *,
                              else native_plate.WINDOW))
     glyph = note_glyph_rect(icon_glyph_rect(cell, icon, _device_scale(p)))
     paint_note_glyph(p, glyph, color, private=private, thumb=thumb)
+    if progress and glyph.width() >= 24:
+        k = max(0.75, min(2.2, glyph.width() / ICON_DEFAULT))
+        f = QFont(font) if font is not None else QFont(p.font())
+        f.setPixelSize(max(9, int(round(10 * k))))
+        f.setBold(True)
+        fm = QFontMetricsF(f)
+        height = 16.0 * k
+        w = fm.horizontalAdvance(progress) + 10.0 * k
+        badge = QRectF(glyph.right() - w + 6.0 * k, glyph.bottom() - 12.0 * k, w, height)
+        p.setPen(QPen(QColor("#374151"), 1.2))
+        p.setBrush(QColor("#FFFFFF"))
+        p.drawRoundedRect(badge, height / 2.0, height / 2.0)
+        p.setFont(f)
+        p.setPen(QColor("#1F2937"))
+        p.drawText(badge, Qt.AlignCenter, progress)
+    if bell and glyph.width() >= 24:
+        k = max(0.75, min(2.2, glyph.width() / ICON_DEFAULT))
+        d = 16.0 * k
+        dot = QRectF(glyph.left() - 5.0 * k, glyph.top() - 4.0 * k, d, d)
+        p.setPen(QPen(QColor("#374151"), 1.2))
+        p.setBrush(QColor("#FFFFFF"))
+        p.drawEllipse(dot)
+        side = max(8, int(round(10 * k)))
+        pix = svg_icon("bell", color="#1F2937").pixmap(side, side)
+        p.drawPixmap(QPointF(dot.center().x() - side / 2.0,
+                             dot.center().y() - side / 2.0), pix)
     paint_icon_label(p, cell, title, font, icon, ink)
     _paint_marquee_tint(p, tint)
     p.restore()

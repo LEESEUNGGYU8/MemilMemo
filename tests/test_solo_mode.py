@@ -21,6 +21,7 @@ from app.settings import AppSettings  # noqa: E402
 from app.share_auth import ShareAuth  # noqa: E402
 from app.sync.history_tracker import HistoryTracker  # noqa: E402
 from app.sync.lock_manager import LockManager  # noqa: E402
+from app.ui import main_shell as shell  # noqa: E402
 from app.ui import confirm, password_dialog, settings_dialog, theme  # noqa: E402
 from app.ui.connect_dialog import ConnectDialog, ConnectionChoice  # noqa: E402
 from app.ui.main_window import MainWindow  # noqa: E402
@@ -140,7 +141,12 @@ def test_a_solo_start_opens_no_port_and_still_keeps_notes(qapp, tmp_path):
 
 def test_the_main_window_shows_no_participants_when_solo(qapp, tmp_path, monkeypatch):
     win = make_window(qapp, tmp_path, monkeypatch, solo=True)
-    assert win.is_solo() and win._sessions_btn.isHidden()
+    # 본인 아이콘에 연결 점이 없고, 접속 정보에는 사람 대신 '공유 시작'이 있다.
+    assert win.is_solo() and win._me_btn.state() == shell.STATE_SOLO
+    win._open_me_popup()
+    popup = win._me_popup
+    assert set(popup.actions) == {"share", "change"} and not hasattr(popup, "people_rows")
+    popup.close()
     assert win._conn_badge._state.text() == i18n.t("main.state_solo")
     assert i18n.t("main.status_online_count", count=1) not in \
         win._conn_badge._detail.text()
@@ -152,7 +158,10 @@ def test_the_main_window_shows_no_participants_when_solo(qapp, tmp_path, monkeyp
     close_window(qapp, win)
 
     shared = make_window(qapp, tmp_path, monkeypatch, solo=False)
-    assert not shared._sessions_btn.isHidden()
+    assert shared._me_btn.state() == shell.STATE_OK
+    shared._open_me_popup()
+    assert "share" not in shared._me_popup.actions
+    shared._me_popup.close()
     assert shared._conn_badge._state.text() == i18n.t("main.state_connected")
     menu = QMenu()
     shared._fill_tray_menu(menu)
@@ -197,29 +206,17 @@ def test_changing_the_connection_from_settings_asks_again_next_time(qapp, tmp_pa
 
 # ── 설정 ────────────────────────────────────────────────────────────────
 
-def test_the_network_page_has_the_two_actions(qapp, monkeypatch):
+def test_the_connection_actions_live_in_the_me_popup_not_in_settings(qapp, monkeypatch):
+    """'접속 정보 바꾸기'와 '공유 시작'은 상단바 본인 아이콘의 접속 정보에 있다."""
     monkeypatch.setattr(settings_dialog, "set_windows_autostart", lambda v: True)
     monkeypatch.setattr(shell_menu, "set_registered", lambda *a, **k: True)
     change, share = (i18n.t("main.tray_change_connection"),
                      i18n.t("settings.btn_share_start"))
-
-    def buttons(dlg) -> dict[str, QPushButton]:
-        return {b.text(): b for b in dlg.findChildren(QPushButton)}
-
-    solo = SettingsDialog(AppSettings(), role="host", solo=True)
-    fired: list[str] = []
-    solo.resetConnectionRequested.connect(lambda: fired.append("change"))
-    solo.shareRequested.connect(lambda: fired.append("share"))
-    assert change in buttons(solo) and share in buttons(solo)
-    buttons(solo)[share].click()
-    buttons(solo)[change].click()
-    assert fired == ["share", "change"]
-    # 공유 중이거나 참여 중이면 '공유 시작'은 없고 '접속 정보 바꾸기'만 있다.
-    for role in ("host", "guest"):
-        dlg = SettingsDialog(AppSettings(), role=role)
-        assert change in buttons(dlg) and share not in buttons(dlg)
+    for kw in ({"role": "host", "solo": True}, {"role": "host"}, {"role": "guest"}):
+        dlg = SettingsDialog(AppSettings(), **kw)
+        texts = {b.text() for b in dlg.findChildren(QPushButton)}
+        assert change not in texts and share not in texts
         dlg.deleteLater()
-    solo.deleteLater()
 
 
 def test_the_share_question_takes_an_optional_password(qapp):

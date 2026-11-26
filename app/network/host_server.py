@@ -11,6 +11,8 @@ from PySide6.QtNetwork import QHostAddress, QTcpServer, QTcpSocket
 from .. import html_guard
 
 from .. import config
+from .. import mentions
+from .. import reminders as rm
 from ..share_auth import ShareAuth, guest_proof, host_proof, new_nonce, same, valid_nonce
 from ..database import SqliteRepository
 from ..models import Folder, Note, now_ms
@@ -46,9 +48,20 @@ from ..protocol import (
     MSG_PING,
     MSG_PURGE_NOTE,
     MSG_RELEASE_LOCK,
+    MSG_REMINDER_CHANGED,
     MSG_RESTORE_NOTE,
     MSG_SET_NOTE_FOLDER,
     MSG_SET_NOTE_PRIVACY,
+    MSG_SET_REMINDER,
+    MSG_SET_NOTICE,
+    MSG_SEEN,
+    MSG_NOTICE_CHANGED,
+    MSG_SEEN_CHANGED,
+    MSG_MENTIONED,
+    MSG_WIDGET_PUT,
+    MSG_WIDGET_OP,
+    MSG_WIDGET_CHANGED,
+    MSG_WIDGET_ERROR,
     MSG_TRASH_CHANGED,
     MSG_TRASH_LIST,
     MSG_UPDATE_FOLDER,
@@ -94,6 +107,10 @@ MAX_QUEUED_REPLY = 8 * 1024 * 1024
 TRASH_SWEEP_MS = 60 * 60 * 1000
 
 LocalSubscriber = Callable[[str, dict], None]
+
+
+# 메모 하나에 넣을 수 있는 위젯의 수(지운 것의 데이터까지).
+MAX_WIDGETS_PER_NOTE = 40
 
 
 class HostServer(QObject):
@@ -183,6 +200,7 @@ class HostServer(QObject):
     def attach_local_host(self) -> None:
         self._local = _Session(socket=None, parser=FrameParser(),
                                nickname=self.host_nickname, hello_received=True)
+        self.repo.touch_participant(self.host_nickname)
         # 호스트는 항상 존재하는 기준 사용자이므로 user_joined 는 보내지 않는다.
 
     def handle_from_local(self, msg: Message) -> None:
@@ -207,7 +225,7 @@ class HostServer(QObject):
         for msg in session.parser.iter_feed(chunk):
             try:
                 self._handle(session, msg)
-            except (TypeError, ValueError, AttributeError, KeyError):
+            except (TypeError, ValueError, AttributeError, KeyError, OverflowError):
                 # 모양이 틀린 메시지 하나 때문에 같이 온 나머지를 버리지 않는다.
                 continue
         if session.parser.overflowed:
@@ -335,6 +353,10 @@ class HostServer(QObject):
         접근권을 유지한 사용자에게는 ``note_updated`` 만 보내 그 화면의 메모
         위젯을 깜빡임 없이 살려 둔다. 접근권을 잃은 사용자에게는 ``note_deleted``,
         새로 얻은 사용자에게는 ``note_created`` 를 보낸다."""
+        if new_owner is not None and self.repo.delete_notice(note_id):
+            # 나만 보는 메모가 됐다. 공지는 모두가 보는 메모에만 있다.
+            self._send_to_nickname(new_owner, make(
+                MSG_NOTICE_CHANGED, note_id=note_id, owner=None, by=actor))
         if prev_owner == new_owner:
             self._broadcast_for_owner(
                 make(MSG_NOTE_UPDATED, note=note_dict),
@@ -456,6 +478,16 @@ class HostServer(QObject):
             self._handle_purge(session, d.get("id", ""))
         elif t == MSG_EMPTY_TRASH:
             self._handle_empty_trash(session)
+        elif t == MSG_SET_REMINDER:
+            self._handle_set_reminder(session, d)
+        elif t == MSG_SET_NOTICE:
+            self._handle_set_notice(session, d)
+        elif t == MSG_SEEN:
+            self._handle_seen(session, d)
+        elif t == MSG_WIDGET_PUT:
+            self._handle_widget_put(session, d)
+        elif t == MSG_WIDGET_OP:
+            self._handle_widget_op(session, d)
 
     def _handle_hello(self, session: _Session, nickname: str,
                       d: dict | None = None) -> None:
@@ -475,6 +507,7 @@ class HostServer(QObject):
     def _admit(self, session: _Session, nickname: str, proof: str = "") -> None:
         session.nickname = nickname
         session.hello_received = True
+        self.repo.touch_participant(nickname)
         session.parser.max_frame = MAX_FRAME_FROM_GUEST
         self._send_welcome(session, proof)
         self._broadcast(make(MSG_USER_JOINED, nickname=session.nickname),
@@ -589,6 +622,24 @@ class HostServer(QObject):
             # 지운 메모를 휴지통에 두는 날 수. 이 값이 없는 공유 PC(옛 버전)는
             # 휴지통이 없어, 지우면 되살릴 수 없다.
             trash_days=config.TRASH_KEEP_DAYS,
+            # 그 참가자가 볼 수 있는 메모의 공유 알림. 이 값이 없는 공유 PC(옛
+            # 버전)는 공유 알림을 모른다(참여한 PC 는 '나만'만 걸게 한다).
+            reminders={nid: entry for nid, entry in self.repo.list_reminders().items()
+                       if nid in visible},
+            # 1.2: 공지(메모 id → 만든 사람), 내 공지를 본 기록, 꺼져 있던 동안 온
+            # @이름 알림. 이 값이 없는 공유 PC(옛 버전)는 공지를 모른다.
+            notices={nid: owner for nid, owner in self.repo.list_notices().items()
+                     if nid in visible},
+            seen={nid: self.repo.list_seen(nid)
+                  for nid, owner in self.repo.list_notices().items()
+                  if owner == session.nickname and nid in visible},
+            mentions=[m for m in self.repo.take_mentions(session.nickname)
+                      if m["note_id"] in visible],
+            # 그 사람이 볼 수 있는 메모의 위젯(위젯 id → 메모 id 와 데이터). 이 값이 없는
+            # 공유 PC(옛 버전)의 위젯은 그림으로만 보인다.
+            widgets={wid: {"note_id": nid, "data": data}
+                     for wid, (nid, data) in self.repo.list_widgets().items()
+                     if nid in visible},
             **({"auth": proof} if proof else {}),
         ))
 
@@ -618,6 +669,12 @@ class HostServer(QObject):
         if owner and owner != session.nickname:
             self._send_to(session, make(MSG_LOCK_DENIED, note_id=note_id,
                                          holder="", reason="forbidden"))
+            return
+        notice_owner = self._notice_owner_blocking(note_id, session)
+        if notice_owner:
+            self._send_to(session, make(MSG_LOCK_DENIED, note_id=note_id,
+                                         holder="", reason="notice",
+                                         owner=notice_owner))
             return
         granted, holder = self.locks.acquire(note_id, session.nickname)
         if granted:
@@ -692,6 +749,10 @@ class HostServer(QObject):
             self._send_to(session, make(MSG_ERROR, message="not allowed"))
             return
         holder = self.locks.holder(note_id)
+        # 공지가 되기 전부터 잠금을 쥐고 쓰던 사람의 저장은 받는다(글을 잃지 않게).
+        if holder != session.nickname and self._notice_owner_blocking(note_id, session):
+            self._send_to(session, make(MSG_ERROR, message="notice"))
+            return
         if holder and holder != session.nickname:
             self._send_to(session, make(MSG_ERROR,
                 message=f"note locked by {holder}"))
@@ -714,6 +775,8 @@ class HostServer(QObject):
             return
         self._broadcast_for_note(
             updated.id, make(MSG_NOTE_UPDATED, note=updated.to_dict()))
+        if existing is not None:
+            self._send_mentions(existing, updated, session.nickname)
 
     def _handle_delete(self, session: _Session, note_id: str) -> None:
         if not isinstance(note_id, str):
@@ -725,6 +788,9 @@ class HostServer(QObject):
             return
         existing = self.repo.get_note(note_id)
         if existing is None or existing.deleted:
+            return
+        if self._notice_owner_blocking(note_id, session):
+            self._send_to(session, make(MSG_ERROR, message="notice"))
             return
         # soft-delete 가 소유자를 지우기 전에 캡처해야 삭제 이벤트를 원래 청중에게 보낼 수 있다.
         owner = self._effective_owner_for_note(existing)
@@ -826,6 +892,9 @@ class HostServer(QObject):
             self._send_to(session, make(MSG_ERROR,
                 message="not allowed"))
             return
+        if self._notice_owner_blocking(note_id, session):
+            self._send_back(session, existing)
+            return
         target_folder = (self.repo.get_folder(folder_id)
                          if folder_id else None)
         if folder_id and (target_folder is None or target_folder.deleted):
@@ -857,6 +926,10 @@ class HostServer(QObject):
         existing = self.repo.get_note(note_id)
         if existing is None or existing.deleted:
             return
+        if self._notice_owner_blocking(note_id, session):
+            self._send_back(session, existing)
+            return
+        # 공지는 나만 보는 메모가 될 때 _propagate_audience_change 가 지운다.
         owner = self._effective_owner_for_note(existing)
         # 이미 비공개인 메모는 소유자만 바꿀 수 있으나 공개 메모는 누구든 비공개로 전환할 수 있다.
         if owner and owner != session.nickname:
@@ -1012,6 +1085,186 @@ class HostServer(QObject):
                            if prev_owner is not None and new_eff is None
                            else make(MSG_NOTE_CREATED, note=refreshed.to_dict()))
                 self._broadcast_for_owner(created, private_owner=new_eff)
+
+    # ── 공지, 읽음, @이름 (1.2) ──
+
+    def _notice_owner_blocking(self, note_id: str, session: _Session) -> str:
+        """공지라서 이 사람이 고치거나 지우거나 옮길 수 없으면 만든 사람의 이름.
+        나만 보는 메모는 공지로 막지 않는다(그 주인만 보는 메모다)."""
+        owner = self.repo.list_notices().get(note_id, "")
+        if not owner or owner == session.nickname:
+            return ""
+        note = self.repo.get_note(note_id)
+        if note is None or self._effective_owner_for_note(note) is not None:
+            return ""
+        return owner
+
+    def _handle_set_notice(self, session: _Session, d: dict) -> None:
+        """공지로 만드는 것은 메모를 만든 사람만(모두가 보는 메모일 때). 푸는 것은
+        만든 사람과 공유 PC 사용자(만든 사람이 떠났을 때를 위해)."""
+        note_id = d.get("note_id")
+        note = (self.repo.get_note(note_id)
+                if isinstance(note_id, str) and note_id else None)
+        if note is None or note.deleted:
+            return
+        on = d.get("on") is True
+        current = self.repo.list_notices().get(note_id)
+        if on:
+            if (note.created_by != session.nickname
+                    or self._effective_owner_for_note(note) is not None):
+                self._send_to(session, make(MSG_ERROR, message="not allowed"))
+                return
+            if current == session.nickname:
+                return
+            # 다른 사람이 편집 중이면 공지로 만들지 않는다(그 사람의 저장이 막힌다).
+            if self._locked_by_other(note_id, session):
+                return
+            self.repo.set_notice(note_id, session.nickname)
+            owner = session.nickname
+        else:
+            if current is None:
+                return
+            if current != session.nickname and session is not self._local:
+                self._send_to(session, make(MSG_ERROR, message="not allowed"))
+                return
+            self.repo.delete_notice(note_id)
+            owner = None
+        self._broadcast_for_note(note_id, make(
+            MSG_NOTICE_CHANGED, note_id=note_id, owner=owner, by=session.nickname))
+
+    def _handle_seen(self, session: _Session, d: dict) -> None:
+        """공지를 봤다. 만든 사람에게 본 기록을 보낸다(다른 사람에게는 보내지 않는다)."""
+        note_id = d.get("note_id")
+        if not isinstance(note_id, str):
+            return
+        owner = self.repo.list_notices().get(note_id)
+        note = self.repo.get_note(note_id)
+        if (not owner or owner == session.nickname or note is None or note.deleted
+                or self._effective_owner_for_note(note) is not None):
+            return
+        try:
+            version = int(d.get("version"))
+        except (TypeError, ValueError):
+            return
+        self.repo.set_seen(note_id, session.nickname, max(1, min(version, note.version)))
+        self._send_to_nickname(owner, make(
+            MSG_SEEN_CHANGED, note_id=note_id, seen=self.repo.list_seen(note_id)))
+
+    def _widget_note_ok(self, session: _Session, note_id) -> bool:
+        note = (self.repo.get_note(note_id)
+                if isinstance(note_id, str) and note_id else None)
+        return (note is not None and not note.deleted
+                and self._effective_owner_for_note(note) in (None, session.nickname))
+
+    def _handle_widget_put(self, session: _Session, d: dict) -> None:
+        """메모에 위젯을 넣었다. 만든 사람은 보낸 사람이다(보낸 값을 믿지 않는다)."""
+        from .. import widgets
+        note_id, wid, data = d.get("note_id"), d.get("widget_id"), d.get("data")
+        if not widgets.valid_id(wid) or not isinstance(data, dict):
+            self._send_to(session, make(MSG_WIDGET_ERROR, widget_id=str(wid or ""),
+                                         error="invalid"))
+            return
+        if not self._widget_note_ok(session, note_id):
+            self._send_to(session, make(MSG_WIDGET_ERROR, widget_id=wid, error="not_allowed"))
+            return
+        if self.repo.get_widget(wid) is not None:
+            self._send_to(session, make(MSG_WIDGET_ERROR, widget_id=wid, error="exists"))
+            return
+        # 메모 하나에 넣을 수 있는 위젯의 수. 지운 위젯의 데이터도 메모가 완전히 지워질
+        # 때까지 남으므로, 끝없이 쌓이지 않게 막는다.
+        if self.repo.count_widgets(note_id) >= MAX_WIDGETS_PER_NOTE:
+            self._send_to(session, make(MSG_WIDGET_ERROR, widget_id=wid, error="limit"))
+            return
+        kind = widgets.kind_of(data)
+        try:
+            if kind is None:
+                raise widgets.WidgetError("invalid")
+            clean = kind.validate(dict(data, owner=session.nickname))
+        except widgets.WidgetError as error:
+            self._send_to(session, make(MSG_WIDGET_ERROR, widget_id=wid, error=error.key))
+            return
+        self.repo.put_widget(wid, note_id, clean)
+        self._broadcast_for_note(note_id, make(
+            MSG_WIDGET_CHANGED, note_id=note_id, widget_id=wid, data=clean,
+            by=session.nickname))
+
+    def _handle_widget_op(self, session: _Session, d: dict) -> None:
+        """위젯을 눌렀다(한 표, 한 수). 받은 차례대로 하나씩 적용한다."""
+        from .. import widgets
+        wid, op = d.get("widget_id"), d.get("op")
+        stored = self.repo.get_widget(wid) if widgets.valid_id(wid) else None
+        if stored is None or not isinstance(op, dict):
+            self._send_to(session, make(MSG_WIDGET_ERROR, widget_id=str(wid or ""),
+                                         error="not_found"))
+            return
+        note_id, data = stored
+        if not self._widget_note_ok(session, note_id):
+            self._send_to(session, make(MSG_WIDGET_ERROR, widget_id=wid, error="not_allowed"))
+            return
+        kind = widgets.kind_of(data)
+        if kind is None:
+            return
+        new, error = kind.apply_op(data, kind.prepare_op(op), session.nickname, now_ms())
+        if error:
+            self._send_to(session, make(MSG_WIDGET_ERROR, widget_id=wid, error=error))
+            return
+        self.repo.put_widget(wid, note_id, new)
+        self._broadcast_for_note(note_id, make(
+            MSG_WIDGET_CHANGED, note_id=note_id, widget_id=wid, data=new,
+            by=session.nickname))
+
+    def _known_users(self) -> set[str]:
+        """'@이름' 으로 부를 수 있는 사람: 붙은 적이 있는 사람과 메모를 만들거나 고친 사람."""
+        names = set(self._current_users()) | set(self.repo.list_participants())
+        names |= self.repo.list_authors()
+        names.discard("")
+        return names
+
+    def _send_mentions(self, before: Note, after: Note, by: str) -> None:
+        """고친 글에 새로 생긴 '@이름' 을 그 사람에게 알린다. 꺼져 있으면 적어 두었다가
+        다음 접속(welcome)에 보낸다. 모두가 보는 메모만."""
+        if self._effective_owner_for_note(after) is not None:
+            return
+        if "@" not in (after.content or ""):
+            return              # 저장할 때마다 사람 목록을 읽지 않는다
+        for name in mentions.new_mentions(before.content or "", after.content or "",
+                                          self._known_users()):
+            if name == by:
+                continue
+            if self._has_session(name):
+                self._send_to_nickname(name, make(
+                    MSG_MENTIONED, note_id=after.id, by=by, at=now_ms()))
+            else:
+                self.repo.add_mention(name, after.id, by)
+
+    def _handle_set_reminder(self, session: _Session, d: dict) -> None:
+        """공유 알림을 걸거나 바꾸거나 지운다. 그 메모를 볼 수 있는 사람이면 누구나
+        한다(메모 글을 고칠 수 있는 것과 같다). 그 메모를 보는 모두에게 알린다."""
+        note_id = d.get("note_id")
+        note = (self.repo.get_note(note_id)
+                if isinstance(note_id, str) and note_id else None)
+        if (note is None or note.deleted
+                or self._effective_owner_for_note(note) not in (None, session.nickname)):
+            self._send_to(session, make(MSG_ERROR, message="not allowed"))
+            return
+        raw = d.get("reminder")
+        if raw is None:
+            if not self.repo.delete_reminder(note_id):
+                return
+            entry = None
+        else:
+            entry = (rm.shared_from_dict({"rule": raw.get("rule"),
+                                          "targets": raw.get("targets", []),
+                                          "set_by": session.nickname,
+                                          "set_at": now_ms()})
+                     if isinstance(raw, dict) else None)
+            if entry is None:
+                self._send_to(session, make(MSG_ERROR, message="bad reminder"))
+                return
+            self.repo.set_reminder(note_id, entry)
+        self._broadcast_for_note(note_id, make(
+            MSG_REMINDER_CHANGED, note_id=note_id, reminder=entry,
+            by=session.nickname, done=bool(d.get("done"))))
 
     def _handle_get_history(self, session: _Session, note_id: str | None) -> None:
         if (session.socket is not None

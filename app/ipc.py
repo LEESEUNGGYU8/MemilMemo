@@ -25,12 +25,16 @@ AT_CURSOR_FLAG = "--at-cursor"
 LINK_NOTE_FLAG = "--link-note"
 # 바탕 화면 우클릭 메뉴의 '새 메모 폴더 추가'가 넘기는 표시.
 NEW_FOLDER_FLAG = "--new-folder"
+# 바탕 화면과 파일 우클릭 메뉴의 '클립보드로 새 메모'가 넘기는 표시.
+CLIP_NOTE_FLAG = "--clip-note"
 
 # 떠 있는 인스턴스에 넘기는 명령.
 CMD_NEW_NOTE = "new-note"
 CMD_NEW_NOTE_HERE = "new-note-here"
 # 우클릭한 자리에 메모 폴더를 만들고 아이콘으로 둔다.
 CMD_NEW_FOLDER_HERE = "new-folder-here"
+# 클립보드의 글이나 그림으로 우클릭한 자리에 새 메모를 만든다.
+CMD_CLIP_NOTE_HERE = "clip-note-here"
 CMD_SHOW = "show"
 # 뒤에 빈칸 하나를 두고 경로가 온다(한 줄에 경로 하나).
 CMD_LINK_NOTE = "link-note"
@@ -48,6 +52,11 @@ def new_note_command(argv: list[str]) -> str | None:
 def new_folder_command(argv: list[str]) -> str | None:
     """실행 인자가 '새 메모 폴더 추가' 요청이면 넘길 명령을, 아니면 None."""
     return CMD_NEW_FOLDER_HERE if NEW_FOLDER_FLAG in argv else None
+
+
+def clip_note_command(argv: list[str]) -> str | None:
+    """실행 인자가 '클립보드로 새 메모' 요청이면 넘길 명령을, 아니면 None."""
+    return CMD_CLIP_NOTE_HERE if CLIP_NOTE_FLAG in argv else None
 
 
 def link_note_paths(argv: list[str]) -> list[str]:

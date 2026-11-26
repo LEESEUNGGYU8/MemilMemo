@@ -380,23 +380,26 @@ def test_store_edition_keeps_the_shell_menu_in_a_file(places, store, no_registry
     assert not marker.exists()
 
     assert shell_menu.set_registered(True, "새 메모 추가", "새 메모에 링크로 넣기",
-                                     "새 메모 폴더 추가")
+                                     "새 메모 폴더 추가", "클립보드로 새 메모")
     assert shell_menu.is_registered()
     # 메뉴 DLL 이 읽는 꼴: UTF-8, 첫 줄이 바탕 화면의 새 메모, 둘째 줄이 파일 항목,
-    # 셋째 줄이 바탕 화면의 새 메모 폴더(나중에 생긴 줄이라 맨 뒤다).
+    # 셋째 줄이 바탕 화면의 새 메모 폴더, 넷째 줄이 클립보드로 새 메모(나중에 생긴 줄이라 뒤).
     assert marker.read_bytes() == (
-        "새 메모 추가\n새 메모에 링크로 넣기\n새 메모 폴더 추가\n".encode("utf-8"))
+        "새 메모 추가\n새 메모에 링크로 넣기\n새 메모 폴더 추가\n클립보드로 새 메모\n"
+        .encode("utf-8"))
 
     # 화면 언어가 바뀌면 메뉴의 글자도 따라간다.
-    shell_menu.refresh("Add New Note", "Link in a New Note", "Add New Note Folder")
+    shell_menu.refresh("Add New Note", "Link in a New Note", "Add New Note Folder",
+                       "New note from clipboard")
     assert marker.read_text(encoding="utf-8") == (
-        "Add New Note\nLink in a New Note\nAdd New Note Folder\n")
+        "Add New Note\nLink in a New Note\nAdd New Note Folder\nNew note from clipboard\n")
 
-    # 옛 버전이 적어 둔 두 줄짜리 파일은 켤 때 세 줄로 고쳐 적는다.
+    # 옛 버전이 적어 둔 두 줄짜리 파일은 켤 때 네 줄로 고쳐 적는다.
     marker.write_text("새 메모\n새 메모에 링크로 넣기\n", encoding="utf-8")
-    shell_menu.refresh("새 메모 추가", "새 메모에 링크로 넣기", "새 메모 폴더 추가")
+    shell_menu.refresh("새 메모 추가", "새 메모에 링크로 넣기", "새 메모 폴더 추가",
+                       "클립보드로 새 메모")
     assert marker.read_text(encoding="utf-8").splitlines() == [
-        "새 메모 추가", "새 메모에 링크로 넣기", "새 메모 폴더 추가"]
+        "새 메모 추가", "새 메모에 링크로 넣기", "새 메모 폴더 추가", "클립보드로 새 메모"]
 
     assert shell_menu.set_registered(False, "새 메모", "")
     assert not marker.exists() and not shell_menu.is_registered()
@@ -472,7 +475,7 @@ def test_store_settings_switch_the_startup_task_and_the_menu(
     dlg._on_accept()
     assert task["state"] == startup_task.ENABLED
     assert (new / shell_menu.MARKER_NAME).read_text(encoding="utf-8") == (
-        "새 메모 추가\n새 메모에 링크로 넣기\n새 메모 폴더 추가\n")
+        "새 메모 추가\n새 메모에 링크로 넣기\n새 메모 폴더 추가\n클립보드로 새 메모\n")
     dlg.deleteLater()
 
     again = SettingsDialog(settings, role="host")
@@ -688,24 +691,28 @@ def test_menu_dll_and_package_manifest_agree_on_the_menu_entries():
     # DLL 이 아는 클래스와 묶음에 적는 클래스가 같아야 탐색기가 메뉴를 띄운다.
     assert _clsids_in_dll_source() == {
         "CLSID_NewNote": msix.CLSID_NEW_NOTE, "CLSID_LinkNote": msix.CLSID_LINK_NOTE,
-        "CLSID_NewFolder": msix.CLSID_NEW_FOLDER}
-    assert len({msix.CLSID_NEW_NOTE, msix.CLSID_LINK_NOTE, msix.CLSID_NEW_FOLDER}) == 3
+        "CLSID_NewFolder": msix.CLSID_NEW_FOLDER, "CLSID_ClipNote": msix.CLSID_CLIP_NOTE}
+    assert len({msix.CLSID_NEW_NOTE, msix.CLSID_LINK_NOTE, msix.CLSID_NEW_FOLDER,
+                msix.CLSID_CLIP_NOTE}) == 4
 
     text = msix.MANIFEST.format(
         identity='"Test.App"', publisher='"CN=Test"', version='"1.0.0.0"',
         publisher_display="Test", languages='    <Resource Language="ko-KR" />',
         exe=msix.EXE_NAME, task=msix.STARTUP_TASK_ID, alias=msix.ALIAS, port=5555,
         find_port=5555, menu_dll=msix.MENU_DLL, clsid_new=msix.CLSID_NEW_NOTE,
-        clsid_link=msix.CLSID_LINK_NOTE, clsid_folder=msix.CLSID_NEW_FOLDER)
+        clsid_link=msix.CLSID_LINK_NOTE, clsid_folder=msix.CLSID_NEW_FOLDER,
+        clsid_clip=msix.CLSID_CLIP_NOTE)
     root = ElementTree.fromstring(text.encode("utf-8"))
     com = "{http://schemas.microsoft.com/appx/manifest/com/windows10}"
     d10 = "{http://schemas.microsoft.com/appx/manifest/desktop/windows10/10}"
     classes = [el.get("Id") for el in root.iter(com + "Class")]
-    assert classes == [msix.CLSID_NEW_NOTE, msix.CLSID_LINK_NOTE, msix.CLSID_NEW_FOLDER]
+    assert classes == [msix.CLSID_NEW_NOTE, msix.CLSID_LINK_NOTE, msix.CLSID_NEW_FOLDER,
+                       msix.CLSID_CLIP_NOTE]
     # 바탕 화면 메뉴: '새 메모 추가' 다음에 '새 메모 폴더 추가'.
     desktop = [el for el in root.iter(d10 + "ItemType")
                if el.get("Type") == "DesktopBackground"]
     assert len(desktop) == 1
     verbs = [(v.get("Id"), v.get("Clsid")) for v in desktop[0]]
     assert verbs == [("MemilNewNote", msix.CLSID_NEW_NOTE),
+                     ("MemilNewNoteClip", msix.CLSID_CLIP_NOTE),
                      ("MemilNewNoteFolder", msix.CLSID_NEW_FOLDER)]

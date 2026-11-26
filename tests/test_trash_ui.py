@@ -18,6 +18,7 @@ from app.datetime_fmt import fmt_relative  # noqa: E402
 from app.local_state import LocalStateStore  # noqa: E402
 from app.network.client_base import ClientBase  # noqa: E402
 from app.settings import AppSettings  # noqa: E402
+from app.ui import main_shell as shell  # noqa: E402
 from app.ui import confirm  # noqa: E402
 from app.ui.main_window import MainWindow  # noqa: E402
 from app.ui.sticky_note import StickyNoteWidget  # noqa: E402
@@ -96,8 +97,6 @@ def open_window(qapp, tmp_path, monkeypatch, *, trash_days=config.TRASH_KEEP_DAY
 
 def close_window(qapp, win) -> None:
     win._force_quit = True
-    if win._trash_dialog is not None:
-        win._trash_dialog.close()
     win._teardown_stickies()
     win.close()
     win.deleteLater()
@@ -136,9 +135,10 @@ def test_an_older_host_still_asks_before_deleting(qapp, tmp_path, monkeypatch):
         asked = refuse_questions(monkeypatch)
         win._delete_note_confirm("a")
         assert len(asked) == 1 and client.of("delete") == []
-        # 휴지통이 없으니 휴지통 창도 열리지 않는다.
+        # 휴지통이 없으니 옆줄에도 없고 열리지도 않는다.
         win.open_trash()
-        assert win._trash_dialog is None and client.of("get_trash") == []
+        assert win._place != shell.PLACE_TRASH and client.of("get_trash") == []
+        assert win._rail.trash_button.isHidden()
     finally:
         close_window(qapp, win)
 
@@ -205,43 +205,56 @@ def test_trashed_places_survive_a_restart_and_expire(tmp_path):
     assert (kept.fold_x, kept.fold_y, kept.fold_at) == (5, 6, True)
 
 
-def test_the_trash_window_lists_and_asks_the_host(window, monkeypatch):
+def test_the_trash_place_lists_and_asks_the_host(window, monkeypatch):
+    """휴지통은 메인 창의 한 곳이다. 메모 목록과 같은 보기(목록, 격자)로 보인다."""
     win, client = window
     win.open_trash()
-    dlg = win._trash_dialog
-    assert dlg is not None and client.of("get_trash") == [("get_trash",)]
+    assert win._place == shell.PLACE_TRASH and client.of("get_trash") == [("get_trash",)]
+    assert win._scroll.widget() is win._trash_container and not win._trash_bar.isHidden()
+    assert win._rail.trash_button.isChecked() and win._place_title.text() == "휴지통"
 
     now = int(time.time() * 1000)
     client._dispatch("trash_list", {"notes": [
         dict(live("x", "<p>견적서</p>"), deleted_at=now - 3 * DAY, deleted_by=OTHER),
         dict(live("y", "<p>회식</p>"), deleted_at=now - DAY, deleted_by=ME),
     ], "keep_days": 30})
-    assert dlg.note_ids() == ["y", "x"]                   # 방금 버린 것부터
-    assert dlg.icon_view().ids() == ["y", "x"] and set(dlg.cards()) == {"x", "y"}
+    assert list(win._trash_cards) == ["y", "x"]               # 방금 버린 것부터
+    assert win._place_count.text() == "2개" and win._rail.trash_button.count_text() == "2"
+    assert win._trash_cards["x"]._timestamp.text() == i18n.t("trash.days_left", days=27)
     # 파일처럼, 고르기 전에는 아무것도 골라져 있지 않다.
-    assert dlg.selected_ids() == [] and not dlg._restore_btn.isEnabled()
-    dlg.select(["y"])
-
-    dlg._restore()
+    assert win._trash_selected() == [] and not win._trash_restore_btn.isEnabled()
+    win._trash_cards["y"].clicked.emit("y")
+    assert win._trash_selected() == ["y"] and win._trash_restore_btn.isEnabled()
+    win._trash_restore_btn.click()
     assert client.of("restore") == [("restore", "y")]
 
     # 완전히 지우기는 묻는다. 거절하면 아무것도 보내지 않는다.
     asked = refuse_questions(monkeypatch)
-    dlg._purge()
-    dlg._empty_all()
+    win._trash_purge_btn.click()
+    win._trash_empty_btn.click()
     assert len(asked) == 2 and client.of("purge") == [] and client.of("empty") == []
     monkeypatch.setattr(confirm, "ask", lambda *a, **k: True)
-    dlg._purge()
-    dlg._empty_all()
+    win._trash_purge_btn.click()
+    win._trash_empty_btn.click()
     assert client.of("purge") == [("purge", "y")] and client.of("empty") == [("empty",)]
 
-    # 누가 휴지통을 바꾸면 열어 둔 창이 다시 묻는다.
+    # 메모 목록과 같은 보기를 쓴다.
+    win._set_view_mode(layout="grid")
+    assert win._trash_layout.square() > 0 and win._trash_cards["x"]._square
+
+    # 누가 휴지통을 바꾸면 보고 있는 동안 다시 묻는다.
     client._dispatch("trash_changed", {})
     assert len(client.of("get_trash")) == 2
     client._dispatch("trash_list", {"notes": []})
-    assert dlg.note_ids() == [] and dlg._stack.currentWidget() is dlg._empty
-    assert dlg.selected_ids() == []
-    assert not dlg._restore_btn.isEnabled() and not dlg._empty_btn.isEnabled()
+    assert win._trash_cards == {} and not win._empty_panel.isHidden()
+    assert win._empty_title.text() == i18n.t("trash.empty")
+    assert not win._trash_restore_btn.isEnabled() and not win._trash_empty_btn.isEnabled()
+
+    # 다른 곳을 고르면 메모 목록으로 돌아온다.
+    win._rail.places["all"].click()
+    assert win._scroll.widget() is win._cards_container and win._trash_bar.isHidden()
+    client._dispatch("trash_changed", {})
+    assert len(client.of("get_trash")) == 2                   # 안 볼 때는 묻지 않는다
 
 
 def test_days_left_counts_down_to_zero():

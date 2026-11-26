@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import datetime_fmt, i18n
+from . import window_frame
 from . import confirm, theme
 from .rich_text import has_non_checkbox_image, html_to_plain, is_marker_url
 from .safe_text import SafeTextDocument, safe_color
@@ -341,9 +342,20 @@ class HistoryViewer(QDialog):
 
         right = QFrame()
         right.setFrameShape(QFrame.NoFrame)
-        right_v = QVBoxLayout(right)
-        right_v.setContentsMargins(16, 0, 0, 0)
+        right_outer = QVBoxLayout(right)
+        right_outer.setContentsMargins(16, 0, 0, 0)
+        right_outer.setSpacing(0)
+        # 아무것도 고르지 않았을 때: 오른쪽 자리의 위아래 가운데에 한 줄.
+        self._prompt = QLabel(i18n.t("history.select_prompt"))
+        self._prompt.setAlignment(Qt.AlignCenter)
+        self._prompt.setStyleSheet("font-size: 15px; font-weight: 600; color: #6B6B6B;")
+        right_outer.addWidget(self._prompt, 1)
+        self._detail_box = QWidget()
+        right_v = QVBoxLayout(self._detail_box)
+        right_v.setContentsMargins(0, 0, 0, 0)
         right_v.setSpacing(10)
+        right_outer.addWidget(self._detail_box, 1)
+        self._detail_box.hide()
 
         self._header = QLabel(i18n.t("history.select_prompt"))
         # 고친 사람의 닉네임이 들어간다. 글자 그대로 보인다.
@@ -396,6 +408,8 @@ class HistoryViewer(QDialog):
         splitter.setStretchFactor(1, 2)
         splitter.setSizes([300, 620])
         root.addWidget(splitter, 1)
+        # 메인 창과 따로 노는 창이다(주인 창 없음, 작업 표시줄에 따로 보인다).
+        window_frame.install(self, window_frame.WINDOW)
 
     def set_notes(self, notes: list[dict[str, Any]]) -> None:
         self._notes = {n["id"]: n for n in notes}
@@ -486,6 +500,8 @@ class HistoryViewer(QDialog):
                 self._list.setCurrentItem(item)
 
     def _on_select(self, current: QListWidgetItem | None, _prev) -> None:
+        self._prompt.setVisible(current is None)
+        self._detail_box.setVisible(current is not None)
         if current is None:
             self._header.setText(i18n.t("history.select_prompt"))
             self._meta.setText("")

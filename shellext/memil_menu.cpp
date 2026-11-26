@@ -6,10 +6,12 @@
 //   * NewNote   : 바탕 화면 빈 곳의 '새 메모 추가'     → SyncNotes.exe --new-note --at-cursor
 //   * NewFolder : 바탕 화면 빈 곳의 '새 메모 폴더 추가' → SyncNotes.exe --new-folder --at-cursor
 //   * LinkNote  : 파일과 폴더의 '새 메모에 링크로 넣기' → SyncNotes.exe --link-note "경로" ...
+//   * ClipNote  : 바탕 화면과 파일의 '클립보드로 새 메모' → SyncNotes.exe --clip-note --at-cursor
 //
 // 메뉴를 보일지와 메뉴의 글자는 앱이 적어 두는 파일 하나로 정한다
 // (사용자 폴더\MemilMemo\shell-menu.txt, UTF-8, 첫 줄이 '새 메모 추가', 둘째 줄이
-// '새 메모에 링크로 넣기', 셋째 줄이 '새 메모 폴더 추가'). 파일이 없으면 메뉴를
+// '새 메모에 링크로 넣기', 셋째 줄이 '새 메모 폴더 추가', 넷째 줄이 '클립보드로 새 메모').
+// 파일이 없으면 메뉴를
 // 감춘다. 앱의 설정에서 켜고 끈다.
 //
 // 메뉴를 그리는 동안 불리므로 빠르게 끝나야 한다. 작은 파일 하나만 읽는다.
@@ -35,12 +37,14 @@ const CLSID CLSID_LinkNote = {0x82DA3587, 0xDE72, 0x4930,
                               {0x89, 0x43, 0x9A, 0xD6, 0xAA, 0xDB, 0x32, 0xC3}};
 const CLSID CLSID_NewFolder = {0xC3A1F6B2, 0x5D0E, 0x4B7A,
                                {0x9E, 0x64, 0x2F, 0x81, 0xD7, 0xC0, 0x5A, 0x39}};
+const CLSID CLSID_ClipNote = {0x5B8E2C47, 0x1D3A, 0x4F60,
+                              {0xA2, 0x9B, 0x6E, 0x4C, 0x71, 0x0D, 0x83, 0xF5}};
 
 const wchar_t kExeName[] = L"SyncNotes.exe";
 const wchar_t kDataFolder[] = L"MemilMemo";
 const wchar_t kMarkerName[] = L"shell-menu.txt";
 
-enum class Kind { NewNote, LinkNote, NewFolder };
+enum class Kind { NewNote, LinkNote, NewFolder, ClipNote };
 
 std::wstring ModuleDir() {
     wchar_t path[MAX_PATH * 2] = {};
@@ -62,9 +66,9 @@ std::wstring MarkerPath() {
     return out;
 }
 
-// 앱이 적어 둔 글자 세 줄을 읽는다. 파일이 없으면 false(메뉴를 감춘다).
+// 앱이 적어 둔 글자 네 줄을 읽는다. 파일이 없으면 false(메뉴를 감춘다).
 bool ReadTitles(std::wstring* new_note, std::wstring* link_note,
-                std::wstring* new_folder = nullptr) {
+                std::wstring* new_folder = nullptr, std::wstring* clip_note = nullptr) {
     std::wstring path = MarkerPath();
     if (path.empty()) return false;
     HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
@@ -83,7 +87,7 @@ bool ReadTitles(std::wstring* new_note, std::wstring* link_note,
     if (!text.empty() && text[0] == 0xFEFF) text.erase(0, 1);
     std::vector<std::wstring> lines;
     size_t start = 0;
-    while (start <= text.size() && lines.size() < 3) {
+    while (start <= text.size() && lines.size() < 4) {
         size_t end = text.find(L'\n', start);
         if (end == std::wstring::npos) end = text.size();
         std::wstring line = text.substr(start, end - start);
@@ -97,6 +101,7 @@ bool ReadTitles(std::wstring* new_note, std::wstring* link_note,
     if (new_note) *new_note = lines.size() > 0 ? lines[0] : L"";
     if (link_note) *link_note = lines.size() > 1 ? lines[1] : L"";
     if (new_folder) *new_folder = lines.size() > 2 ? lines[2] : L"";
+    if (clip_note) *clip_note = lines.size() > 3 ? lines[3] : L"";
     return true;
 }
 
@@ -167,14 +172,16 @@ public:
     // IExplorerCommand
     IFACEMETHODIMP GetTitle(IShellItemArray*, PWSTR* title) override {
         if (!title) return E_POINTER;
-        std::wstring new_note, link_note, new_folder;
-        ReadTitles(&new_note, &link_note, &new_folder);
+        std::wstring new_note, link_note, new_folder, clip_note;
+        ReadTitles(&new_note, &link_note, &new_folder, &clip_note);
         const std::wstring& text = kind_ == Kind::NewNote ? new_note
                                    : kind_ == Kind::NewFolder ? new_folder
+                                   : kind_ == Kind::ClipNote ? clip_note
                                    : link_note;
         if (!text.empty()) return SHStrDupW(text.c_str(), title);
         return SHStrDupW(kind_ == Kind::NewNote ? L"Add New Note"
                          : kind_ == Kind::NewFolder ? L"Add New Note Folder"
+                         : kind_ == Kind::ClipNote ? L"New Note from Clipboard"
                          : L"Link in a New Note",
                          title);
     }
@@ -193,17 +200,19 @@ public:
     }
     IFACEMETHODIMP GetState(IShellItemArray*, BOOL, EXPCMDSTATE* state) override {
         if (!state) return E_POINTER;
-        std::wstring new_folder;
-        bool shown = ReadTitles(nullptr, nullptr, &new_folder);
-        // 옛 버전이 적어 둔 파일에는 폴더 항목의 글자가 없다. 앱이 켜지며 고쳐
-        // 적을 때까지 그 항목은 감춘다(다른 언어의 글자로 보이지 않게).
+        std::wstring new_folder, clip_note;
+        bool shown = ReadTitles(nullptr, nullptr, &new_folder, &clip_note);
+        // 옛 버전이 적어 둔 파일에는 폴더(셋째 줄)나 클립보드(넷째 줄) 항목의 글자가
+        // 없다. 앱이 켜지며 고쳐 적을 때까지 그 항목은 감춘다(다른 언어로 보이지 않게).
         if (kind_ == Kind::NewFolder && new_folder.empty()) shown = false;
+        if (kind_ == Kind::ClipNote && clip_note.empty()) shown = false;
         *state = shown ? ECS_ENABLED : ECS_HIDDEN;
         return S_OK;
     }
     IFACEMETHODIMP Invoke(IShellItemArray* items, IBindCtx*) override {
         if (kind_ == Kind::NewNote) return Launch(L"--new-note --at-cursor");
         if (kind_ == Kind::NewFolder) return Launch(L"--new-folder --at-cursor");
+        if (kind_ == Kind::ClipNote) return Launch(L"--clip-note --at-cursor");
         std::wstring arguments = L"--link-note";
         DWORD count = 0;
         if (items) items->GetCount(&count);
@@ -300,6 +309,8 @@ STDAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void** out) {
         kind = Kind::LinkNote;
     } else if (clsid == CLSID_NewFolder) {
         kind = Kind::NewFolder;
+    } else if (clsid == CLSID_ClipNote) {
+        kind = Kind::ClipNote;
     } else {
         return CLASS_E_CLASSNOTAVAILABLE;
     }

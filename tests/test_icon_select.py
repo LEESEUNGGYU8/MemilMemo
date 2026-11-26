@@ -31,6 +31,14 @@ from app.ui.sticky_note import StickyNoteWidget  # noqa: E402
 ME, OTHER = "지우", "민수"
 
 
+def _wait_for(done, ms: int) -> None:
+    """``done()`` 가 참이 될 때까지(길어야 ``ms``) 이벤트를 돌린다. 정해 둔 시간만 기다리면
+    바쁜 PC 에서 타이머가 늦게 울려 시험이 가끔 틀렸다."""
+    deadline = time.monotonic() + ms / 1000
+    while not done() and time.monotonic() < deadline:
+        QTest.qWait(20)
+
+
 @pytest.fixture(scope="module")
 def qapp():
     app = QApplication.instance() or QApplication([])
@@ -353,7 +361,7 @@ def test_dragging_a_memo_icon_takes_the_selected_real_icons_along(ctl):
     assert desk.did("move_by") == [("move_by", [3, 7], 152, 100)]
     assert c._grid.lifted[-1] == []
     assert host.icons[B].calls == [("snap", 228, 105)]
-    QTest.qWait(500)
+    _wait_for(lambda: ("realign",) in host.calls, 3000)      # 바쁜 PC 에서도 타이머를 기다린다
     assert ("realign",) in host.calls
 
 
@@ -386,7 +394,7 @@ def test_a_real_move_that_went_wrong_is_put_back(ctl):
     c.drag_began(A)
     c.drag_ended(A, True, QPoint(152, 0))
     desk.now = {3: (466, 2), 7: (1400, 700)}    # 하나가 엉뚱한 데로 갔다
-    QTest.qWait(500)
+    _wait_for(lambda: desk.did("place"), 3000)      # 바쁜 PC 에서도 타이머를 기다린다
     assert desk.did("place") == [("place", {3: (314, 2), 7: (314, 102)})]
     assert ("realign",) in host.calls
 
@@ -416,7 +424,7 @@ def test_a_move_under_auto_arrange_is_not_checked_against_the_drop(ctl):
     c.drag_began(A)
     c.drag_ended(A, True, QPoint(152, 0))
     desk.now = {3: (14, 702)}                   # 줄의 끝으로 갔다
-    QTest.qWait(500)
+    _wait_for(lambda: ("realign",) in host.calls, 3000)      # 바쁜 PC 에서도 타이머를 기다린다
     assert desk.did("move_by") == [("move_by", [3], 152, 0)]
     assert desk.did("place") == [] and ("realign",) in host.calls
 
@@ -594,7 +602,7 @@ def test_dragging_files_with_memos_onto_the_recycle_bin_trashes_the_memos_too(mi
     probe.pos = (490, 40)                               # 휴지통 위로 끌었다
     c.marquee._tick()
     release_real(c, probe)
-    QTest.qWait(500)
+    _wait_for(lambda: host.icons[A].calls, 3000)      # 바쁜 PC 에서도 타이머를 기다린다
     assert host.icons[A].calls == [("place", 0, 5)]     # 우선 제자리로
     assert not [call for call in host.calls if call[0] == "delete_notes"]
     desk.count = 2                                      # 탐색기가 파일을 지웠다
@@ -664,7 +672,7 @@ def test_dragging_a_selected_real_icon_takes_our_icons_along(mixed):
         icon=48, spacing=(76, 100), items=((466, 102), (466, 202), (618, 2)),
         snap=True, window=1234, dpi=96, offset=(-14, 3), indices=(3, 7, 9), bin=9)
     release_real(c, probe)
-    QTest.qWait(500)
+    _wait_for(lambda: ("realign",) in host.calls, 3000)      # 바쁜 PC 에서도 타이머를 기다린다
     assert ("realign",) in host.calls           # 따라간 자리의 칸에 맞춰 놓는다
     assert host.icons[A].calls == [] and c.selection.keys() == [A, B]
 
@@ -678,7 +686,7 @@ def test_our_icons_go_back_when_the_real_icons_did_not_move(mixed):
     c.marquee._tick()
     assert host.icons[A].pos() != QPoint(0, 5)
     release_real(c, probe)                      # 다른 창에 놓았거나 그만뒀다
-    QTest.qWait(500)
+    _wait_for(lambda: host.icons[A].calls, 3000)      # 바쁜 PC 에서도 타이머를 기다린다
     assert host.icons[A].calls == [("place", 0, 5)]
     assert ("realign",) not in host.calls
 
@@ -952,7 +960,7 @@ def test_marquee_with_ctrl_adds_to_what_was_selected(ctl):
 def test_after_real_icons_were_dragged_ours_get_out_of_the_way(qapp, ctl):
     c, host = ctl
     c.marquee.finished.emit(True)
-    QTest.qWait(500)
+    _wait_for(lambda: ("realign",) in host.calls, 3000)      # 바쁜 PC 에서도 타이머를 기다린다
     assert ("realign",) in host.calls
 
 

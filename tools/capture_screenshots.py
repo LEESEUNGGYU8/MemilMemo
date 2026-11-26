@@ -42,6 +42,8 @@ def _parse_args() -> argparse.Namespace:
                     help="데모 호스트가 쓸 포트(실행 중인 앱과 겹치지 않게).")
     ap.add_argument("--keep", action="store_true",
                     help="임시 데이터 폴더를 지우지 않는다(디버그용).")
+    ap.add_argument("--only", default="",
+                    help="readme 묶음에서 이 장면만 찍는다(쉼표로 여럿, 예: hero,notice).")
     return ap.parse_args()
 
 
@@ -181,6 +183,53 @@ def _draw_chart() -> QImage:
     return img
 
 
+def _weekday_ahead(weekday: int):
+    """오늘이나 그 뒤의 가장 가까운 그 요일(월=0)의 날짜."""
+    import datetime
+    today = datetime.date.today()
+    return today + datetime.timedelta(days=(weekday - today.weekday()) % 7)
+
+
+# 메모 안 위젯: 위젯 id → (메모 id, 데이터). 데이터는 seed() 가 만든다(그리기에
+# QApplication 이 필요하다).
+WIDGETS: dict[str, tuple[str, dict]] = {}
+
+
+def _build_widgets() -> None:
+    """투표(표가 들어온 것), D-day, 그래프의 데이터. 공유 PC 를 거친 것처럼 동작을
+    차례로 적용해 만든다."""
+    from app import widgets
+    party, sales = TEXT["party"], TEXT["sales"]
+    vote = widgets.get("vote")
+    data = vote.new_data(USER_B, question=party["question"],
+                         options=list(party["options"]))
+    for user, option in ((USER_A, 1), (USER_B, 2), (HOST, 1), (USER_OLD, 3)):
+        data, err = vote.apply_op(data, {"op": "vote", "option": option}, user, NOW_MS)
+        assert err is None, err
+    WIDGETS["w_vote"] = ("n_party", data)
+    dday = widgets.get("dday")
+    WIDGETS["w_dday"] = ("n_party", dday.new_data(
+        USER_B, label=party["dday"], date=_weekday_ahead(4).isoformat()))
+    graph = widgets.get("graph")
+    WIDGETS["w_sales"] = ("n_sales", graph.new_data(
+        USER_A, title=sales["chart"], chart="bar", labels=list(sales["labels"]),
+        series=[{"name": sales["series"][0], "values": [465, 510, 488, 560]},
+                {"name": sales["series"][1], "values": [400, 455, 470, 492]}]))
+
+
+def _widget_html(wid: str, color: str, width: int) -> str:
+    """본문에 저장되는 위젯 그림(위젯 id 를 품은 PNG). 앱이 불러올 때 위젯 칸으로 바꾼다."""
+    import datetime
+    from app import widgets
+    _nid, data = WIDGETS[wid]
+    kind = widgets.kind_of(data)
+    img = kind.render(data, width, viewer="", today=datetime.date.today(),
+                      background=color)
+    png = widgets.to_png(img, wid, label=widgets.label_of(data))
+    return (f'<p><img src="{widgets.to_data_url(png)}" width="{img.width()}" '
+            f'height="{img.height()}" /></p>')
+
+
 def _notes() -> list[dict]:
     from app.ui.rich_text import bullet_url_for, checkbox_url, image_to_data_url
 
@@ -203,6 +252,7 @@ def _notes() -> list[dict]:
     t = TEXT
     meeting, todo, layout, info = t["meeting"], t["todo"], t["plan"], t["info"]
     me, lunch, closing, reply = t["me"], t["lunch"], t["closing"], t["reply"]
+    notice, party, sales = t["notice"], t["party"], t["sales"]
     return [
         dict(id="n_meeting", color="#FFE066", folder="f_work", by=USER_A,
              upd_by=HOST, age=4 * MIN, pos=(60, 60), size=(300, 250),
@@ -262,6 +312,26 @@ def _notes() -> list[dict]:
                  f'<p>{reply["text2"]}'
                  '<span style="text-decoration: underline;">'
                  f'{reply["underlined"]}</span></p>')),
+        # 1.1 의 새 기능에 쓰는 메모: 공지, 위젯(투표와 D-day, 그래프).
+        dict(id="n_notice", color="#C4CBFF", folder="f_work", by=HOST,
+             upd_by=HOST, age=35 * MIN, pos=(60, 60), size=(360, 236),
+             content=(
+                 f'<p><span {title}>{notice["title"]}</span></p>'
+                 + "".join(bul(item) for item in notice["items"])
+                 + f'<p>{notice["ask"].format(a="@" + USER_A, b="@" + USER_B)}</p>')),
+        dict(id="n_party", color="#D7F29B", folder=None, by=USER_B,
+             upd_by=USER_B, age=15 * MIN, pos=(390, 60), size=(310, 440),
+             content=(
+                 f'<p><span {title}>{party["title"]}</span></p>'
+                 f'<p>{party["text"].format(me="@" + HOST)}</p>'
+                 + _widget_html("w_vote", "#D7F29B", 262)
+                 + _widget_html("w_dday", "#D7F29B", 262))),
+        dict(id="n_sales", color="#A6E8E0", folder="f_store", by=USER_A,
+             upd_by=USER_A, age=2 * HOUR + 10 * MIN, pos=(700, 60), size=(340, 360),
+             content=(
+                 f'<p><span {title}>{sales["title"]}</span></p>'
+                 + _widget_html("w_sales", "#A6E8E0", 292)
+                 + f'<p>{sales["text"]}</p>')),
     ]
 
 
@@ -296,8 +366,19 @@ def seed() -> None:
         "close_main_to_tray": False,
     }, ensure_ascii=False), encoding="utf-8")
 
+    from app import i18n
+    from app import reminders as rm
+    today = time.strftime("%Y-%m-%d")
+    # 본문에 저장하는 위젯 그림과 그 이름(목록의 미리 보기 글)은 그린 PC 의 언어로
+    # 적힌다. 앱이 언어를 정하기 전이므로 여기서 먼저 정한다.
+    i18n.set_language(ARGS.lang)
+    _build_widgets()
     notes = _notes()
     (app_dir / "local_state.json").write_text(json.dumps({
+        # 할 일 메모: 매주 월요일 아침에 체크를 푼다(방금 건 것이라 아직 울리지 않는다).
+        "check_resets": {"n_todo": {
+            "rule": rm.Rule(rm.WEEKLY, today, "08:30", [0]).to_dict(),
+            "set_at": NOW_MS - MIN}},
         "nickname": HOST,
         "last_host_ip": "192.168.0.12",
         "last_host_port": PORT,
@@ -364,6 +445,19 @@ def seed() -> None:
                      session_end=NOW_MS - 50 * MIN),
     ):
         repo.insert_history(entry)
+    # 공지(내가 올린 것)와 그것을 본 사람(민호는 아직 안 봤다).
+    repo.set_notice("n_notice", HOST)
+    for user, ago in ((USER_A, 21 * MIN), (USER_B, 8 * MIN)):
+        repo._conn.execute(
+            "INSERT OR REPLACE INTO note_seen (note_id, user, version, seen_at) "
+            "VALUES (?, ?, ?, ?)", ("n_notice", user, 3, NOW_MS - ago))
+    repo._conn.commit()
+    # 할 일 메모의 공유 알림: 매주 금요일 오후 4시, 10분 전에 미리, 고른 세 사람에게.
+    repo.set_reminder("n_todo", {
+        "rule": rm.Rule(rm.WEEKLY, today, "16:00", [4], lead=10).to_dict(),
+        "targets": [HOST, USER_A, USER_B], "set_by": HOST, "set_at": NOW_MS - MIN})
+    for wid, (nid, data) in WIDGETS.items():
+        repo.put_widget(wid, nid, data)
     repo.close()
 
 
@@ -651,6 +745,14 @@ def main() -> int:
     # 작업 표시줄의 '새 메모'가 이 촬영용 인스턴스로 올 수 있다.
     from app import ipc
     ipc.ipc_name = lambda: f"SyncNotesShots-IPC-{os.getpid()}"
+    # 촬영용 공유 포트는 이 PC 안에서만 연다(내부망의 다른 PC 가 들어올 수 없다).
+    from PySide6.QtNetwork import QHostAddress
+    from app.network import host_server
+
+    class _Loopback(QHostAddress):
+        Any = QHostAddress.SpecialAddress.LocalHost
+
+    host_server.QHostAddress = _Loopback
     _hook_qapp()
     try:
         return app_main.main()

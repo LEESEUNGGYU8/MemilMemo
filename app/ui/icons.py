@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+
 from PySide6.QtCore import QByteArray, Qt
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtSvg import QSvgRenderer
@@ -125,6 +127,22 @@ _SVG = {
         'stroke="{color}" stroke-width="2" fill="none" stroke-linecap="round"/>'
         '<path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" '
         'stroke="{color}" stroke-width="2" fill="none" stroke-linecap="round"/></svg>'
+    ),
+    "table": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<rect x="3.5" y="4.5" width="17" height="15" rx="2" stroke="{color}" '
+        'stroke-width="2" fill="none"/>'
+        '<path d="M3.5 9.5h17M3.5 14.5h17M10 4.5v15" stroke="{color}" stroke-width="2"/></svg>'
+    ),
+    # 체크 해제 예약: 돌아가는 화살표 안의 체크.
+    "check_reset": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<path d="M19.5 12a7.5 7.5 0 1 1-2.4-5.5" stroke="{color}" stroke-width="2" '
+        'fill="none" stroke-linecap="round"/>'
+        '<path d="M19.5 3.5v4h-4" stroke="{color}" stroke-width="2" fill="none" '
+        'stroke-linecap="round" stroke-linejoin="round"/>'
+        '<path d="M8.5 12.2l2.4 2.4 4.4-4.6" stroke="{color}" stroke-width="2" '
+        'fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>'
     ),
     # 넣기(이미지·파일 링크): 종이 집게.
     "attach": (
@@ -271,6 +289,23 @@ _SVG = {
     ),
     # 메모 접기(종이 아래쪽을 위로 접어 올리는 모양)와 펼치기.
     # 접힌 쪽지와 같은 모양: 오른쪽 위 모서리를 접어 넣은 납작한 종이.
+    "opacity": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<circle cx="12" cy="12" r="8" stroke="{color}" stroke-width="1.8" fill="none"/>'
+        '<path d="M12 4a8 8 0 0 1 0 16z" fill="{color}"/></svg>'
+    ),
+    "wrap": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<path d="M4 6.5h16M4 12h12.5a3.2 3.2 0 0 1 0 6.4H12M4 17.5h4.5" stroke="{color}" '
+        'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/>'
+        '<path d="M14.2 16.2 12 18.4l2.2 2.2" stroke="{color}" stroke-width="1.8" '
+        'stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>'
+    ),
+    "tally": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<path d="M17.5 5.5h-11l6.2 6.5-6.2 6.5h11" stroke="{color}" stroke-width="1.8" '
+        'stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>'
+    ),
     "fold": (
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
         '<path d="M5 7.5h10.5L20.5 12.5V15.5a1.5 1.5 0 0 1-1.5 1.5H5'
@@ -340,6 +375,54 @@ _SVG = {
         '<rect x="8.5" y="8.5" width="7" height="7" rx="1.2" fill="{color}"/></svg>'
     ),
     # 설정 창의 구역 표시.
+    "hash": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<path d="M9.5 4l-2 16M16.5 4l-2 16M5 9h15M4 15h15" stroke="{color}" '
+        'stroke-width="2" stroke-linecap="round" fill="none"/></svg>'
+    ),
+    "widgets": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<rect x="3.5" y="3.5" width="7" height="7" rx="1.8" stroke="{color}" stroke-width="2" fill="none"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.8" stroke="{color}" stroke-width="2" fill="none"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.8" stroke="{color}" stroke-width="2" fill="none"/><path d="M17 13.5v7M13.5 17h7" stroke="{color}" stroke-width="2" stroke-linecap="round"/></svg>'
+    ),
+    "w_vote": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<rect x="3.5" y="4" width="17" height="16" rx="2.5" stroke="{color}" stroke-width="1.8" fill="none"/><circle cx="8" cy="9.5" r="1.6" fill="{color}"/><path d="M11.5 9.5h5.5" stroke="{color}" stroke-width="1.8" stroke-linecap="round"/><circle cx="8" cy="15" r="1.6" stroke="{color}" stroke-width="1.4" fill="none"/><path d="M11.5 15h4" stroke="{color}" stroke-width="1.8" stroke-linecap="round"/></svg>'
+    ),
+    "w_order": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<path d="M6 3.5h12v17l-2-1.4-2 1.4-2-1.4-2 1.4-2-1.4-2 1.4z" stroke="{color}" stroke-width="1.8" fill="none" stroke-linejoin="round"/><path d="M9 8.5h6M9 12h6M9 15.5h3.5" stroke="{color}" stroke-width="1.8" stroke-linecap="round"/></svg>'
+    ),
+    "w_ladder": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<path d="M7 3.5v17M17 3.5v17M7 8h10M7 13.5h10M7 18h5" stroke="{color}" stroke-width="1.8" stroke-linecap="round"/></svg>'
+    ),
+    "w_dday": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<rect x="3.5" y="5" width="17" height="15" rx="2.5" stroke="{color}" stroke-width="1.8" fill="none"/><path d="M8 3v4M16 3v4M3.5 9.5h17" stroke="{color}" stroke-width="1.8" stroke-linecap="round"/><path d="M12 12.2v4.6M9.7 14.5h4.6" stroke="{color}" stroke-width="1.8" stroke-linecap="round"/></svg>'
+    ),
+    "w_calendar": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<rect x="3.5" y="5" width="17" height="15" rx="2.5" stroke="{color}" stroke-width="1.8" fill="none"/><path d="M8 3v4M16 3v4M3.5 9.5h17" stroke="{color}" stroke-width="1.8" stroke-linecap="round"/><circle cx="8" cy="13.5" r="1" fill="{color}"/><circle cx="12" cy="13.5" r="1" fill="{color}"/><circle cx="16" cy="13.5" r="1" fill="{color}"/><circle cx="8" cy="17" r="1" fill="{color}"/><circle cx="12" cy="17" r="1" fill="{color}"/></svg>'
+    ),
+    "w_graph": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<path d="M3.5 20.2h17" stroke="{color}" stroke-width="1.8" stroke-linecap="round"/><rect x="5.6" y="11.5" width="3.4" height="6.6" rx="0.9" stroke="{color}" stroke-width="1.6" fill="none"/><rect x="10.3" y="4.5" width="3.4" height="13.6" rx="0.9" stroke="{color}" stroke-width="1.6" fill="none"/><rect x="15" y="8.5" width="3.4" height="9.6" rx="0.9" stroke="{color}" stroke-width="1.6" fill="none"/></svg>'
+    ),
+    "w_omok": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<rect x="3.5" y="3.5" width="17" height="17" rx="2.5" stroke="{color}" stroke-width="1.8" fill="none"/><path d="M9.2 3.5v17M14.8 3.5v17M3.5 9.2h17M3.5 14.8h17" stroke="{color}" stroke-width="1" opacity="0.55"/><circle cx="9.2" cy="9.2" r="2.4" fill="{color}"/><circle cx="14.8" cy="14.8" r="2.4" fill="#FFFFFF" stroke="{color}" stroke-width="1.5"/></svg>'
+    ),
+    "printer": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<path d="M7 9V4h10v5" stroke="{color}" stroke-width="1.8" fill="none" stroke-linejoin="round"/><rect x="3.5" y="9" width="17" height="8" rx="2" stroke="{color}" stroke-width="1.8" fill="none"/><rect x="7" y="14" width="10" height="6" rx="1" stroke="{color}" stroke-width="1.8" fill="#FFFFFF"/></svg>'
+    ),
+    "keyboard": (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        '<rect x="2.5" y="6" width="19" height="12" rx="2.5" stroke="{color}" '
+        'stroke-width="2" fill="none"/>'
+        '<path d="M6.5 10h1M10.5 10h1M14.5 10h1M8 14h8" stroke="{color}" '
+        'stroke-width="2" stroke-linecap="round"/></svg>'
+    ),
     "bell": (
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
         '<path d="M6 16.5V11a6 6 0 0 1 12 0v5.5l1.5 2h-15z" stroke="{color}" '
@@ -376,9 +459,30 @@ _SVG = {
 }
 
 
+_ICON_CACHE: "OrderedDict[tuple, QIcon]" = OrderedDict()
+_ICON_CACHE_MAX = 512
+
+
 def svg_icon(name: str, size: int = 18, color: str = "#333333") -> QIcon:
     """SVG 아이콘. 125~200% 배율 화면에서 흐리지 않도록 1배와 2배 그림을
-    함께 넣는다(Qt 가 화면 배율에 맞는 쪽을 골라 그린다)."""
+    함께 넣는다(Qt 가 화면 배율에 맞는 쪽을 골라 그린다).
+
+    같은 (이름, 크기, 색)은 한 번만 그린다. 메모 창과 카드마다 같은 그림을 여러 번
+    그리던 것이 켤 때와 목록을 그릴 때 시간과 메모리를 많이 썼다. QIcon 은 내용을
+    나눠 쓰는 값이라 돌려준 것을 고쳐도 저장한 것은 바뀌지 않는다."""
+    key = (name, int(size), str(color))
+    cached = _ICON_CACHE.get(key)
+    if cached is not None:
+        _ICON_CACHE.move_to_end(key)
+        return QIcon(cached)
+    icon = _render_svg_icon(name, size, color)
+    _ICON_CACHE[key] = icon
+    if len(_ICON_CACHE) > _ICON_CACHE_MAX:
+        _ICON_CACHE.popitem(last=False)
+    return QIcon(icon)
+
+
+def _render_svg_icon(name: str, size: int, color: str) -> QIcon:
     svg_str = _SVG[name].format(color=color)
     renderer = QSvgRenderer(QByteArray(svg_str.encode("utf-8")))
     icon = QIcon()

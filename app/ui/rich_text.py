@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import (
+    QSize,
+    QPoint,
     QBuffer,
     QByteArray,
     QIODevice,
@@ -42,6 +44,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QLabel, QTextEdit
 
 from .. import config, html_guard
+from ..i18n import t as i18n_t
 from .. import file_links as fl
 from . import font_colors
 from .link_icons import link_icon_pixmap
@@ -226,6 +229,20 @@ def is_bullet_url(url: str) -> bool:
 
 def is_marker_url(url: str) -> bool:
     return is_checkbox_url(url) or is_bullet_url(url)
+
+
+def is_widget_url(url: str) -> bool:
+    """메모 안 위젯의 그림인가(그림 첨부로 치지 않는다)."""
+    if not url or not url[:22].lower().startswith("data:image/png;base64,"):
+        return False
+    from ..widgets import id_from_data_url
+    return id_from_data_url(url) is not None
+
+
+def with_widgets_as_text(html: str) -> str:
+    """본문의 위젯 그림을 그 이름 글로 바꾼 것(제목과 찾기에 쓴다)."""
+    from ..widgets import widgets_as_text
+    return widgets_as_text(html)
 
 
 def _render_bullet_icon(name: str, fill: QColor | None = None) -> QImage:
@@ -686,7 +703,8 @@ def has_non_marker_image(html: str) -> bool:
     import re
     pattern = re.compile(r'<img[^>]*src=["\']([^"\']+)["\']', re.IGNORECASE)
     for match in pattern.finditer(html):
-        if not is_marker_url(match.group(1)):
+        url = match.group(1)
+        if not is_marker_url(url) and not is_widget_url(url):
             return True
     return False
 
@@ -807,9 +825,14 @@ class _MarkerAwareDocument(SafeTextDocument):
         return super().loadResource(resource_type, name)
 
 
+# #태그의 글자 색과 바탕(어두운 글자의 메모, 밝은 글자의 메모). 링크의 파랑과 다른 남색.
+TAG_INK = ("#3730A3", "#C7D2FE")
+TAG_FILL = ((67, 56, 202, 30), (165, 180, 252, 48))
+
+
 class _DoneHighlighter(QSyntaxHighlighter):
-    """끝낸 할 일의 글자를 흐리게 하고 줄을 긋는다. 화면에만 입히는 서식이라
-    문서(저장 내용, 되돌리기)는 바뀌지 않는다."""
+    """끝낸 할 일의 글자를 흐리게 하고 줄을 긋는다. #태그는 남색 글자로. 화면에만
+    입히는 서식이라 문서(저장 내용, 되돌리기)는 바뀌지 않는다."""
 
     def __init__(self, document: QTextDocument):
         super().__init__(document)
@@ -825,6 +848,15 @@ class _DoneHighlighter(QSyntaxHighlighter):
             return
         block = self.currentBlock()
         if block.blockFormat().intProperty(MARKER_PROP) != MARKER_CHECK1:
+            if "#" in text:
+                from .. import text_detect as td
+                hits = td.find_tags(text)
+                if hits:
+                    fmt = QTextCharFormat()
+                    fmt.setForeground(QColor(TAG_INK[1] if self._light else TAG_INK[0]))
+                    for h in hits:
+                        a, b = _utf16(text, h.start), _utf16(text, h.end)
+                        self.setFormat(a, b - a, fmt)
             return
         ink = QColor("#FFFFFF") if self._light else QColor("#1F1F1F")
         ink.setAlphaF(0.46)
@@ -859,6 +891,87 @@ def auto_link_target(word: str) -> tuple[str, str] | None:
 
 class RichTextEdit(QTextEdit):
     imageInserted = Signal()
+    # 파일을 글이나 표로 첨부했다(시작, 끝). 메모 창이 그 범위의 목록 표시를 바꾼다.
+    attachedRange = Signal(int, int)
+
+    # ── 본문 자동 인식(app/text_detect.py) ──
+
+    def refresh_smart(self, now) -> None:
+        """보기 상태의 본문에서 날짜와 연락처를 찾아 둔다(편집 중에는 비운다). 줄마다
+        찾으므로 줄을 넘는 것은 없다."""
+        from .. import text_detect as td
+        hits: list[SmartHit] = []
+        if self.isReadOnly():
+            block = self.document().begin()
+            while block.isValid():
+                text = block.text()
+                if text.strip():
+                    base = block.position()
+                    for h in td.find_dates(text, now):
+                        hits.append(SmartHit("date", base + _utf16(text, h.start),
+                                             base + _utf16(text, h.end), h.when, h.has_time))
+                    for h in td.find_contacts(text):
+                        hits.append(SmartHit("contact", base + _utf16(text, h.start),
+                                             base + _utf16(text, h.end), h.value, False))
+                block = block.next()
+        self._smart_hits = hits
+        self.viewport().update()
+
+    def smart_hits(self) -> list:
+        return list(getattr(self, "_smart_hits", []))
+
+    def smart_at(self, pos) -> "SmartHit | None":
+        """보기 상태에서 이 자리(뷰포트 좌표)에 있는 날짜나 연락처."""
+        hits = getattr(self, "_smart_hits", None)
+        if not hits or not self.isReadOnly():
+            return None
+        cursor = self.cursorForPosition(pos)
+        at = cursor.position()
+        rect = self.cursorRect(cursor)
+        if abs(rect.center().y() - pos.y()) > rect.height():
+            return None
+        for hit in hits:
+            if hit.start <= at <= hit.end:
+                left = self.cursorRect(self._cursor_at(hit.start)).left()
+                right = self.cursorRect(self._cursor_at(hit.end)).left()
+                if left - 2 <= pos.x() <= right + 2:
+                    return hit
+        return None
+
+    def _repaint_hint_band(self) -> None:
+        vp = self.viewport()
+        cr = self.cursorRect()
+        band = QRect(0, cr.top() - 2, vp.width(), cr.height() + 4)
+        old, self._hint_band = self._hint_band, band
+        if not old.isNull() and old != band:
+            vp.update(old)
+        vp.update(band)
+
+    def calc_hint(self):
+        """편집 중, 커서가 '=' 로 끝나는 줄 끝에 있으면 그 줄의 계산 결과."""
+        if self.isReadOnly():
+            return None
+        cursor = self.textCursor()
+        if cursor.hasSelection():
+            return None
+        block = cursor.block()
+        text = block.text()
+        rel = cursor.position() - block.position()
+        if text[rel:].strip() or not text.rstrip().endswith("="):
+            return None
+        from .. import text_detect as td
+        return td.calc_line(text.rstrip())
+
+    def accept_calc(self) -> bool:
+        """계산 결과를 '=' 뒤에 넣는다(Tab). 넣었으면 True."""
+        hint = self.calc_hint()
+        if hint is None:
+            return False
+        cursor = self.textCursor()
+        before = cursor.block().text()[:cursor.position() - cursor.block().position()]
+        cursor.insertText(("" if before.endswith(" ") else " ") + hint.text)
+        self.setTextCursor(cursor)
+        return True
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -868,6 +981,16 @@ class RichTextEdit(QTextEdit):
         self._anim = AnimationDriver(self)
         self.document().contentsChange.connect(self._on_contents_change)
         register_bullet_resources(self.document())
+        # 다음 글을 치면 '첨부 방식' 단추는 사라진다(첨부하는 동안 바뀐 것은 빼고).
+        self._attach_busy = False
+        self._attach_button = None
+        self.document().contentsChange.connect(
+            lambda *_a: None if self._attach_busy else self._hide_attach_button())
+        # 계산 줄의 결과는 커서를 따라 다시 그린다. 커서가 있던 줄과 간 줄만 다시 그린다
+        # (메모 전체를 다시 그리면 긴 메모에서 칠 때마다 느리다).
+        self._smart_hits = []
+        self._hint_band = QRect()
+        self.cursorPositionChanged.connect(self._repaint_hint_band)
 
         # 파일 링크. 아이콘 자리 맞추기(sync_link_icons)는 편집 직후 한 번 미뤄
         # 돌리고, 되돌리기(undo)로 생긴 변화에는 돌리지 않는다.
@@ -924,11 +1047,14 @@ class RichTextEdit(QTextEdit):
         self._size_popup_timer.start(900)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
-        """Qt 는 글머리 마커를 끌 수 있는 image-object 로 다룬다. 글머리
+        """다른 곳을 누르면 '첨부 방식' 단추는 사라진다.
+
+        Qt 는 글머리 마커를 끌 수 있는 image-object 로 다룬다. 글머리
         좌클릭을 redirect 해 커서를 마커 바로 뒤로 보내면, 선택 가능한
         이미지가 아니라 접두 글리프처럼 동작한다. 체크박스는 redirect
         하지 않는다. StickyNoteWidget 이벤트 필터가 토글을 위해 클릭을
         가로채므로 이 메서드까지 오지 않는다."""
+        self._hide_attach_button()
         if event.button() == Qt.LeftButton:
             local_pos = (event.position().toPoint()
                          if hasattr(event, "position") else event.pos())
@@ -972,6 +1098,83 @@ class RichTextEdit(QTextEdit):
         advance = 2 if len(text) > 1 and text[1] == " " else 1
         return block.position() + advance
 
+    # 고른 글의 U+FFFC(그림, 위젯 칸) 마다 하나씩: {"id": 위젯 id 또는 "", "pic": 위젯 그림}.
+    # 평문의 U+FFFC 자리에 차례로 놓인다.
+    WIDGET_MIME = "application/x-memil-widgets"
+    # 메모 창이 정한다: 이 위젯을 다시 위젯 칸으로 넣어도 되는가(이 메모의 위젯이고 본문에
+    # 아직 없을 때). 아니면 위젯 그림(widget_picture)을 그림으로 넣는다.
+    widget_ok = None
+    widget_picture = None
+    widget_mine = None          # 이 메모의 위젯인가(같은 메모 안의 복사는 그림을 만들지 않는다)
+
+    def createMimeDataFromSelection(self):  # noqa: N802
+        mime = super().createMimeDataFromSelection()
+        cursor = self.textCursor()
+        if not cursor.hasSelection():
+            return mime
+        import json
+        from . import widget_object as wobj
+        doc = self.document()
+        lo, hi = cursor.selectionStart(), cursor.selectionEnd()
+        at = {pos: w for w, pos, _f in wobj.find_objects(doc) if lo <= pos < hi}
+        if not at:
+            return mime
+        picture = self.widget_picture if callable(self.widget_picture) else None
+        entries = []
+        for pos in range(lo, hi):
+            if doc.characterAt(pos) != wobj.CHAR:
+                continue
+            wid = at.get(pos, "")
+            entries.append({"id": wid, "pic": picture(wid) if wid and picture else ""})
+        mime.setData(self.WIDGET_MIME, json.dumps(entries).encode())
+        return mime
+
+    def _widget_entries(self, source) -> list[dict]:
+        import json
+        if not source.hasFormat(self.WIDGET_MIME):
+            return []
+        try:
+            entries = json.loads(bytes(source.data(self.WIDGET_MIME)).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return []
+        return [e if isinstance(e, dict) else {} for e in entries] \
+            if isinstance(entries, list) else []
+
+    def _insert_text_with_widgets(self, cursor: QTextCursor, text: str, source) -> None:
+        """평문을 넣는다. U+FFFC 자리는 옮겨 온 위젯이면 위젯 칸으로, 다른 메모의 위젯이면
+        그 그림으로 넣고, 그 밖(그림 등 평문으로 옮길 수 없는 것)은 뺀다."""
+        from . import widget_object as wobj
+        # 고른 글 위에 붙이면 먼저 지운다: 지우기 전에는 그 안의 위젯이 아직 본문에
+        # 있어 '다시 넣어도 되는가' 가 거짓이 되어 위젯이 사라졌다.
+        if cursor.hasSelection():
+            cursor.removeSelectedText()
+        if wobj.CHAR not in text:
+            cursor.insertText(text)
+            return
+        entries = self._widget_entries(source)
+        plain = self._plain_format(cursor.charFormat())
+        parts = text.split(wobj.CHAR)
+        for i, part in enumerate(parts):
+            if part:
+                cursor.insertText(part, plain)
+            if i == len(parts) - 1:
+                break
+            entry = entries[i] if i < len(entries) else {}
+            wid = entry.get("id") if isinstance(entry.get("id"), str) else ""
+            ok = self.widget_ok
+            if wid and callable(ok) and ok(wid):
+                cursor.insertText(wobj.CHAR, wobj.object_format(wid))
+                continue
+            pic = entry.get("pic")
+            mine = self.widget_mine
+            if callable(mine) and mine(wid):
+                continue            # 이 메모에 이미 있는 위젯의 복사: 두 벌 만들지 않는다
+            if wid and isinstance(pic, str) and pic.startswith("data:image/"):
+                image = data_url_image(pic)
+                if not image.isNull():
+                    # 다시 그려 넣어 위젯 id 가 빠진 그냥 그림이 된다.
+                    self.insert_image(image, cursor)
+
     def canInsertFromMimeData(self, source) -> bool:  # noqa: N802
         if source.hasImage():
             return True
@@ -981,26 +1184,210 @@ class RichTextEdit(QTextEdit):
                     return True
         return super().canInsertFromMimeData(source)
 
-    def insertFromMimeData(self, source) -> None:  # noqa: N802
-        # 로컬 이미지 파일 URL 을 먼저 처리해야 원본 바이트와 애니메이션
-        # 프레임을 그대로 얻는다.
-        if source.hasUrls():
-            inserted = False
-            others: list[str] = []
-            for url in source.urls():
-                if not url.isLocalFile():
-                    continue
-                path = url.toLocalFile()
-                if _is_image_file(path):
-                    if self._insert_image_from_path(path):
-                        inserted = True
-                else:
-                    others.append(path)
-            # 그림이 아닌 파일과 폴더는 본문에 넣지 않고 바로 가기 링크로 건다.
-            if others:
-                self.insert_file_links(others)
+    # ── 파일 첨부: 종류마다 알맞은 방식(app/file_insert.py) ──
+
+    def set_attach_modes(self, overrides: dict | None) -> None:
+        """설정의 '파일을 첨부할 때'(종류 → 방식)."""
+        self._attach_overrides = dict(overrides or {})
+
+    def attach_files(self, paths: list[str], mode: str | None = None) -> bool:
+        """파일과 폴더를 놓은 차례대로 첨부한다. ``mode`` 를 주면 그 방식이 있는 파일은
+        그 방식으로(오른쪽 단추로 끌어다 놓기). 네트워크 경로(\\서버\…)는 읽느라
+        멈추지 않게 지금처럼 링크로 건다. 마지막 첨부에 '첨부 방식' 단추를 둔다."""
+        import os
+        from .. import file_insert
+        overrides = getattr(self, "_attach_overrides", {})
+        inserted = False
+        last = None
+        for raw in paths:
+            path = os.path.normpath(raw)
+            if fl.is_unc(path):
+                self.insert_file_links([path])
                 inserted = True
-            if inserted:
+                continue
+            kind = file_insert.kind_of_path(path)
+            chosen = mode if mode in file_insert.modes_for(kind) else None
+            att = file_insert.attach(path, chosen, overrides=overrides,
+                                     checkbox_urls=(checkbox_url(False), checkbox_url(True)),
+                                     font_pt=self.font().pointSizeF() or 11.0)
+            span = self._put_attachment(att)
+            if span is not None:
+                inserted = True
+                last = (att, span)
+        self._show_attach_button(last)
+        return inserted
+
+    def _put_attachment(self, att) -> tuple[int, int] | None:
+        """첨부 하나를 커서 자리에 넣고 넣은 범위를 돌려준다."""
+        from .. import file_insert
+        cursor = self.textCursor()
+        self._attach_busy = True
+        cursor.beginEditBlock()
+        try:
+            if att.mode == file_insert.M_IMAGE:
+                start = cursor.position()
+                if not self._insert_image_from_path(att.source):
+                    return None
+                return start, self.textCursor().position()
+            if att.mode == file_insert.M_LINK or not att.html:
+                start = cursor.position()
+                self.insert_file_links([att.path])
+                return start, self.textCursor().position()
+            if cursor.block().length() > 1:
+                cursor.insertBlock()
+            start = cursor.position()
+            cursor.insertHtml(att.html)
+            end = cursor.position()
+            self.setTextCursor(cursor)
+            self.attachedRange.emit(start, end)
+            return start, self.textCursor().position()
+        finally:
+            cursor.endEditBlock()
+            self._attach_busy = False
+
+    def _show_attach_button(self, last) -> None:
+        """첨부한 자리 아래에 '첨부 방식' 단추. 고를 방식이 하나뿐이면 두지 않는다."""
+        from PySide6.QtWidgets import QMenu, QToolButton
+        self._hide_attach_button()
+        if last is None or len(last[0].modes) < 2:
+            return
+        att, (start, end) = last
+        button = QToolButton(self.viewport())
+        button.setText(i18n_t("attach.mode_button"))
+        from .icons import svg_icon
+        button.setIcon(svg_icon("chevron_down", size=10, color="#3A3A3A"))
+        button.setIconSize(QSize(10, 10))
+        button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        button.setLayoutDirection(Qt.RightToLeft)       # 그림은 글 오른쪽
+        button.setCursor(Qt.PointingHandCursor)
+        button.setFocusPolicy(Qt.NoFocus)
+        button.setStyleSheet(
+            "QToolButton { background: #FFFFFF; border: 1px solid #D4D4D4; border-radius: 6px;"
+            " padding: 3px 8px; font-size: 11px; color: #3A3A3A; }"
+            "QToolButton:hover { background: #F3F3F3; }")
+        menu = QMenu(button)
+        menu.setAttribute(Qt.WA_NoMouseReplay)
+        for m in att.modes:
+            act = menu.addAction(i18n_t("attach.mode_" + m))
+            act.setCheckable(True)
+            act.setChecked(m == att.mode)
+            act.triggered.connect(lambda _c=False, mm=m: self._switch_attachment(mm))
+        button.clicked.connect(lambda: menu.exec(button.mapToGlobal(
+            QPoint(0, button.height() + 2))))
+        self._attach_last = (att, start, end)
+        self._attach_button = button
+        rect = self.cursorRect(self._cursor_at(end))
+        button.adjustSize()
+        x = max(4, min(rect.left(), self.viewport().width() - button.width() - 4))
+        y = min(rect.bottom() + 4, self.viewport().height() - button.height() - 4)
+        button.move(x, max(4, y))
+        button.show()
+
+    def _paint_smart(self) -> None:
+        """날짜 아래 점선(보기 상태), 계산 줄의 결과(편집 중, '=' 뒤에 옅게)."""
+        hits = [h for h in getattr(self, "_smart_hits", []) if h.kind == "date"]
+        hint = self.calc_hint()
+        if not hits and hint is None:
+            return
+        p = QPainter(self.viewport())
+        ink = QColor(marker_ink(getattr(self, "_marker_light", False)))
+        if hits and self.isReadOnly():
+            line = QColor(ink)
+            line.setAlpha(150)
+            pen = QPen(line, 1, Qt.DotLine)
+            p.setPen(pen)
+            for h in hits:
+                a = self.cursorRect(self._cursor_at(h.start))
+                b = self.cursorRect(self._cursor_at(h.end))
+                if a.top() != b.top():
+                    continue
+                y = a.bottom()
+                p.drawLine(a.left(), y, b.left(), y)
+        if hint is not None:
+            ghost = QColor(ink)
+            ghost.setAlpha(110)
+            p.setPen(ghost)
+            p.setFont(self.currentCharFormat().font())
+            rect = self.cursorRect()
+            text = self.textCursor().block().text()
+            gap = "" if text.endswith(" ") else " "
+            p.drawText(QRectF(rect.right() + 1, rect.top(), 600, rect.height()),
+                       Qt.AlignLeft | Qt.AlignVCenter, gap + hint.text)
+        p.end()
+
+    def _cursor_at(self, pos: int):
+        c = self.textCursor()
+        c.setPosition(max(0, min(pos, self.document().characterCount() - 1)))
+        return c
+
+    def _hide_attach_button(self) -> None:
+        button = getattr(self, "_attach_button", None)
+        if button is not None:
+            button.hide()
+            button.deleteLater()
+        self._attach_button = None
+
+    def attach_button(self):
+        """지금 떠 있는 '첨부 방식' 단추(시험용)."""
+        return getattr(self, "_attach_button", None)
+
+    def _switch_attachment(self, mode: str) -> None:
+        """방금 첨부한 것을 다른 방식으로 바꾼다(한 번의 되돌리기로 묶는다)."""
+        from .. import file_insert
+        last = getattr(self, "_attach_last", None)
+        if last is None:
+            return
+        att, start, end = last
+        new = file_insert.attach(att.path, mode,
+                                 overrides=getattr(self, "_attach_overrides", {}),
+                                 checkbox_urls=(checkbox_url(False), checkbox_url(True)),
+                                 font_pt=self.font().pointSizeF() or 11.0)
+        # 지우고 다시 넣는 것을 한 번의 되돌리기로 묶는다(바깥 편집 묶음).
+        outer = self.textCursor()
+        outer.beginEditBlock()
+        try:
+            cursor = self.textCursor()
+            self._attach_busy = True
+            cursor.setPosition(start)
+            cursor.setPosition(min(end, self.document().characterCount() - 1),
+                               QTextCursor.MoveMode.KeepAnchor)
+            cursor.removeSelectedText()
+            self.setTextCursor(cursor)
+            self._attach_busy = False
+            span = self._put_attachment(new)
+        finally:
+            outer.endEditBlock()
+            self._attach_busy = False
+        if span is not None:
+            self._show_attach_button((new, span))
+
+    def _drop_mode_menu(self, paths: list[str]) -> str | None:
+        """오른쪽 단추로 끌어다 놓았다. 놓을 때 방식을 고른다. 취소면 None."""
+        from PySide6.QtGui import QCursor
+        from PySide6.QtWidgets import QMenu
+        from .. import file_insert
+        kinds = [file_insert.kind_of_path(p) for p in paths]
+        modes: list[str] = []
+        for k in kinds:
+            for m in file_insert.modes_for(k):
+                if m not in modes:
+                    modes.append(m)
+        menu = QMenu(self)
+        picked = {}
+        for m in modes:
+            menu.addAction(i18n_t("attach.mode_" + m)).triggered.connect(
+                lambda _c=False, mm=m: picked.setdefault("mode", mm))
+        menu.addSeparator()
+        menu.addAction(i18n_t("common.btn_cancel"))
+        menu.exec(QCursor.pos())
+        return picked.get("mode")
+
+    def insertFromMimeData(self, source) -> None:  # noqa: N802
+        # 파일과 폴더는 종류마다 알맞은 방식으로 첨부한다. 그림은 원본 바이트와
+        # 애니메이션 프레임을 그대로 얻도록 파일에서 읽는다.
+        if source.hasUrls():
+            paths = [url.toLocalFile() for url in source.urls() if url.isLocalFile()]
+            if paths and self.attach_files(paths):
                 return
 
         text = source.text() if source.hasText() else ""
@@ -1017,7 +1404,7 @@ class RichTextEdit(QTextEdit):
             try:
                 if has_text:
                     start = cursor.selectionStart()
-                    cursor.insertText(text)
+                    self._insert_text_with_widgets(cursor, text, source)
                     end = cursor.position()
                     added = self.linkify_range(start, end)
                     if added:
@@ -1033,32 +1420,56 @@ class RichTextEdit(QTextEdit):
 
         super().insertFromMimeData(source)
 
+    @staticmethod
+    def _carries_files(mime) -> bool:
+        """파일이나 그림을 끌어 왔는가(글만이면 Qt 의 끌어 놓기에 맡긴다)."""
+        if mime.hasImage():
+            return True
+        return mime.hasUrls() and any(u.isLocalFile() for u in mime.urls())
+
     def dragEnterEvent(self, event) -> None:  # noqa: N802
-        if self.canInsertFromMimeData(event.mimeData()):
+        if self._carries_files(event.mimeData()):
             event.acceptProposedAction()
             return
         super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event) -> None:  # noqa: N802
-        if self.canInsertFromMimeData(event.mimeData()):
+        # 오른쪽 단추로 끌고 있는가(놓을 때 첨부 방식을 묻는다).
+        self._right_drag = bool(event.buttons() & Qt.RightButton)
+        if self._carries_files(event.mimeData()):
             event.acceptProposedAction()
             return
         super().dragMoveEvent(event)
 
     def dropEvent(self, event) -> None:  # noqa: N802
-        if self.canInsertFromMimeData(event.mimeData()):
-            self.insertFromMimeData(event.mimeData())
+        mime = event.mimeData()
+        if self._carries_files(mime):
+            # 놓은 자리에 넣는다.
+            self.setTextCursor(self.cursorForPosition(event.position().toPoint()))
+            paths = ([u.toLocalFile() for u in mime.urls() if u.isLocalFile()]
+                     if mime.hasUrls() else [])
+            if paths and getattr(self, "_right_drag", False):
+                self._right_drag = False
+                mode = self._drop_mode_menu(paths)
+                if mode is not None:
+                    self.attach_files(paths, mode)
+                event.acceptProposedAction()
+                return
+            self.insertFromMimeData(mime)
             event.acceptProposedAction()
             return
+        # 글: Qt 가 놓은 자리에 커서를 두고(메모 안에서 옮기면 원래 자리의 글을 지운 뒤)
+        # insertFromMimeData 를 부른다.
         super().dropEvent(event)
 
-    def insert_image(self, image: QImage) -> None:
+    def insert_image(self, image: QImage, cursor: QTextCursor | None = None) -> None:
         data_url = image_to_data_url(image)
         if not data_url:
             return
         self.document().addResource(
             QTextDocument.ImageResource, QUrl(data_url), image)
-        cursor = self.textCursor()
+        if cursor is None:
+            cursor = self.textCursor()
         cursor.beginEditBlock()
         try:
             cursor.insertHtml(f'<img src="{data_url}" />')
@@ -1139,6 +1550,13 @@ class RichTextEdit(QTextEdit):
         out.clearProperty(QTextFormat.FontLetterSpacingType)
         out.setFontUnderline(False)
         out.clearForeground()
+        # 그림이나 위젯 칸 바로 뒤의 서식이어도 글자로 넣는다.
+        out.clearProperty(QTextFormat.ObjectType)
+        out.clearProperty(QTextFormat.ImageName)
+        out.clearProperty(QTextFormat.ImageWidth)
+        out.clearProperty(QTextFormat.ImageHeight)
+        for prop in range(QTextFormat.UserProperty + 701, QTextFormat.UserProperty + 705):
+            out.clearProperty(prop)
         return out
 
     def _link_formats(self, href: str, base: QTextCharFormat | None = None
@@ -2312,8 +2730,54 @@ class RichTextEdit(QTextEdit):
         if self.isVisible():
             self.fit_images_to_viewport()
 
+    def tag_spans(self) -> list[tuple[int, int]]:
+        """본문의 #태그 자리(문서 위치의 시작, 끝). 글이 바뀔 때만 다시 찾는다."""
+        doc = self.document()
+        rev = doc.revision()
+        cached = getattr(self, "_tag_cache", None)
+        if cached is not None and cached[0] == rev:
+            return cached[1]
+        from .. import text_detect as td
+        spans: list[tuple[int, int]] = []
+        block = doc.begin()
+        while block.isValid():
+            text = block.text()
+            if "#" in text and block.blockFormat().intProperty(MARKER_PROP) != MARKER_CHECK1:
+                base = block.position()
+                for h in td.find_tags(text):
+                    spans.append((base + _utf16(text, h.start), base + _utf16(text, h.end)))
+            block = block.next()
+        self._tag_cache = (rev, spans)
+        return spans
+
+    def _paint_tag_backs(self) -> None:
+        """#태그 뒤에 옅은 둥근 칸(글자보다 먼저 그려 글자가 위에 온다)."""
+        spans = self.tag_spans()
+        if not spans:
+            return
+        light = getattr(self._done, "_light", False)
+        fill = QColor(*TAG_FILL[1 if light else 0])
+        view_h = self.viewport().height()
+        p = QPainter(self.viewport())
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(fill)
+        for start, end in spans:
+            a = self.cursorRect(self._cursor_at(start))
+            if a.bottom() < 0 or a.top() > view_h:
+                continue
+            b = self.cursorRect(self._cursor_at(end))
+            if a.top() != b.top():
+                continue                    # 줄이 꺾인 태그는 바탕 없이 색만
+            # 옆 태그와 바탕이 붙지 않게 좌우로 조금만 넓힌다.
+            p.drawRoundedRect(QRectF(a.left() - 1.5, a.top() + 1.5, b.left() - a.left() + 2,
+                                     a.height() - 3), 4, 4)
+        p.end()
+
     def paintEvent(self, event) -> None:  # noqa: N802
+        self._paint_tag_backs()
         super().paintEvent(event)
+        self._paint_smart()
         doc = self.document()
         view = self.viewport().rect()
         ink = marker_ink(self._marker_light)
@@ -2377,3 +2841,19 @@ class RichTextEdit(QTextEdit):
             event.accept()
             return
         super().wheelEvent(event)
+
+
+@dataclass
+class SmartHit:
+    """본문에서 알아본 것 하나: 종류("date", "contact"), 문서 위치, 값(때 또는 복사할 글)."""
+    kind: str
+    start: int
+    end: int
+    value: object
+    has_time: bool = False
+
+
+def _utf16(text: str, index: int) -> int:
+    """파이썬 글자 위치를 문서 위치(UTF-16 단위)로."""
+    head = text[:index]
+    return len(head) + sum(1 for ch in head if ord(ch) > 0xFFFF)

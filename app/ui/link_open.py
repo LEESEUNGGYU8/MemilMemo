@@ -74,6 +74,7 @@ def _warn(parent: QWidget | None, title: str, body: str) -> None:
     box.setText(body)
     box.addButton(i18n.t("link.btn_ok"), QMessageBox.AcceptRole)
     confirm.arrange(box)
+    confirm.frame_box(box)
     box.exec()
 
 
@@ -90,6 +91,7 @@ def confirm_run(parent: QWidget | None, path: str) -> bool:
     box.setDefaultButton(cancel)
     box.setEscapeButton(cancel)
     confirm.arrange(box)
+    confirm.frame_box(box)
     box.exec()
     return box.clickedButton() is run
 

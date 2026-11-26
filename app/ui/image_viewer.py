@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import i18n
+from . import window_frame
 from .icons import svg_icon
 from .rich_text import data_url_image, data_url_payload, is_animated_data_url
 
@@ -303,6 +304,7 @@ class ImageViewerWindow(QWidget):
         root.addWidget(bar)
 
         self.setFocusPolicy(Qt.StrongFocus)
+        window_frame.install(self, window_frame.WINDOW)
 
     # ── 공개 API ──
 

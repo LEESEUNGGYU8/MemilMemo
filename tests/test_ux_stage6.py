@@ -375,11 +375,14 @@ def test_note_menu_while_resting(qapp, monkeypatch):
     w, _sent, locks = make_sticky(qapp, "회의는 3시")
     w._show_text_menu(w._text.viewport().rect().center(), w.mapToGlobal(w.rect().center()))
     # 서식은 보기 상태에서도 뜰 수 있다. 입히는 것은 편집 중일 때만 나온다.
-    assert seen[-1] == [("편집", True), ("전체 복사", True), ("서식 복사", True)]
+    # 끝에는 접기 두 가지(쪽지, 아이콘).
+    assert seen[-1] == [("편집", True), ("전체 복사", True), ("서식 복사", True),
+                        ("쪽지로 접기", True), ("아이콘으로 접기", True)]
 
     w.set_lock_holder(OTHER)
     w._show_text_menu(w._text.viewport().rect().center(), w.mapToGlobal(w.rect().center()))
-    assert seen[-1] == [("편집", False), ("전체 복사", True), ("서식 복사", True)]
+    assert seen[-1] == [("편집", False), ("전체 복사", True), ("서식 복사", True),
+                        ("쪽지로 접기", True), ("아이콘으로 접기", True)]
     w._teardown = True
     w.close()
 
@@ -392,7 +395,7 @@ def test_note_menu_while_editing_is_in_the_app_language(qapp, monkeypatch):
     w._show_text_menu(w._text.viewport().rect().center(), w.mapToGlobal(w.rect().center()))
     texts = [t for t, _on in seen[-1]]
     assert texts == ["실행 취소", "다시 실행", "잘라내기", "복사", "붙여넣기", "모두 선택",
-                     "서식 복사", "서식 붙여넣기"]
+                     "서식 복사", "서식 붙여넣기", "쪽지로 접기", "아이콘으로 접기"]
     assert dict(seen[-1])["잘라내기"] and dict(seen[-1])["복사"]
     assert not dict(seen[-1])["실행 취소"]           # 아직 고친 것이 없다
     w._teardown = True

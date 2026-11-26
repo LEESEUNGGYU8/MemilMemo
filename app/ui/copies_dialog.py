@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 from .. import i18n
 from ..datetime_fmt import fmt_relative
 from ..replica import CopyInfo, missing_notes, read_source, source_from_file
+from . import window_frame
 from . import confirm
 from .icons import color_swatch_icon
 from .note_card import note_title_and_lines
@@ -183,6 +184,7 @@ class CopiesDialog(QDialog):
 
         self._pick.currentIndexChanged.connect(self._load_copy)
         self._fill_pick()
+        window_frame.install(self, window_frame.DIALOG)
 
     # ── 고를 것들 ──
 

@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 
 from .. import i18n
 from ..share_auth import MAX_PASSWORD_LENGTH, clean_password
+from . import window_frame
 from . import confirm
 from .icons import svg_icon
 from .theme import COLOR_TEXT_SUBTLE, refresh_style
@@ -108,6 +109,7 @@ class PasswordDialog(QDialog):
             lambda text: self._ok.setEnabled(bool(clean_password(text))))
         self._field.setFocus()
         self.setFixedWidth(_WIDTH)
+        window_frame.install(self, window_frame.DIALOG)
 
     def note(self) -> str:
         return self._note.text() if self._note.isVisibleTo(self) or self._note.text() else ""
@@ -165,6 +167,7 @@ class ShareStartDialog(QDialog):
         buttons.addWidget(ok)
         buttons.addWidget(cancel)
         root.addLayout(buttons)
+        window_frame.install(self, window_frame.DIALOG)
 
     def password(self) -> str:
         return clean_password(self._field.text())

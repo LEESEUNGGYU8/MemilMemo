@@ -14,7 +14,7 @@ from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QLabel, QToolButton  # noqa: E402
 
 from app import i18n  # noqa: E402
-from app.ui import image_viewer, theme  # noqa: E402
+from app.ui import image_viewer, theme, window_frame  # noqa: E402
 from app.ui.image_viewer import ImageViewerWindow  # noqa: E402
 
 
@@ -59,8 +59,12 @@ def viewer(qapp):
 
 def test_bar_has_no_instructions(viewer):
     v = viewer([BIG, TALL])
-    labels = [w.text() for w in v.findChildren(QLabel) if w.isVisibleTo(v)]
-    # 보이는 글은 몇 번째 이미지인지와 배율뿐이다. 쓰는 법을 적어 두지 않는다.
+    bar = window_frame.bar_of(v)
+    assert bar is not None and bar.kind == window_frame.WINDOW and bar.title() == "이미지 보기"
+    labels = [w.text() for w in v.findChildren(QLabel)
+              if w.isVisibleTo(v) and not bar.isAncestorOf(w)]
+    # 상단바의 창 이름 말고 보이는 글은 몇 번째 이미지인지와 배율뿐이다.
+    # 쓰는 법을 적어 두지 않는다.
     assert sorted(labels) == sorted(["1 / 2", v._zoom_lbl.text()])
     assert v._zoom_lbl.text().endswith("%")
     assert v.windowTitle() == "이미지 보기"

@@ -624,6 +624,7 @@ def test_undo_turns_the_new_link_back_into_text(qapp):
 
 def test_list_menu_starts_with_square_and_has_numbers(qapp):
     w = _note(qapp)
+    w._fill_list_menu()
     labels = [a.text() for a in w._list_menu.actions() if not a.isSeparator()]
     assert labels == [i18n.t("sticky.menu_square"), i18n.t("sticky.menu_circle"),
                       i18n.t("sticky.menu_arrow"), i18n.t("sticky.menu_info"),

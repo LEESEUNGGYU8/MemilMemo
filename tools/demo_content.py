@@ -67,6 +67,29 @@ DEMO = {
             "text2": "교환과 반품은 수령 후 7일 이내에 접수해 주세요. ",
             "underlined": "단순 변심은 왕복 배송비가 부과됩니다.",
         },
+        # 공지로 올린 메모. ask 의 {a}, {b} 에는 '@이름' 이 들어간다.
+        "notice": {
+            "title": "사무실 공지",
+            "items": ("12월 1일부터 새 출입 카드를 씁니다",
+                      "금요일 오후 3시에 소방 점검이 있습니다"),
+            "ask": "{a} {b} 회의실 예약표를 확인해 주세요",
+        },
+        # 위젯이 든 메모: 투표와 D-day. text 의 {me} 에는 '@이름' 이 들어간다.
+        "party": {
+            "title": "금요일 회식",
+            "text": "{me} 투표가 끝나면 식당 예약 부탁해요",
+            "question": "회식 메뉴",
+            "options": ("삼겹살", "회", "중식"),
+            "dday": "회식",
+        },
+        # 그래프가 든 메모
+        "sales": {
+            "title": "월별 매출",
+            "chart": "매출 (만 원)",
+            "labels": ("8월", "9월", "10월", "11월"),
+            "series": ("올해", "작년"),
+            "text": "11월은 행사 매대 효과로 지난해보다 14% 늘었습니다.",
+        },
         # 접힌 모양 그림에 적는 짧은 제목: 쪽지, 가장자리 탭, 아이콘
         "faces": ("주간 회의", "할 일", "점심 주문 받아요"),
         "search": ("주문", "없는 검색어"),
@@ -134,6 +157,26 @@ DEMO = {
             "text2": "Please request exchanges and returns within 7 days of delivery. ",
             "underlined": "Returns for a change of mind are charged round-trip shipping.",
         },
+        "notice": {
+            "title": "Office Notice",
+            "items": ("New access cards start on December 1",
+                      "Fire inspection on Friday at 3 PM"),
+            "ask": "{a} {b} please check the meeting room schedule",
+        },
+        "party": {
+            "title": "Friday Team Dinner",
+            "text": "{me} please book a table once the poll closes",
+            "question": "Dinner menu",
+            "options": ("Korean BBQ", "Sushi", "Chinese"),
+            "dday": "Team dinner",
+        },
+        "sales": {
+            "title": "Monthly Sales",
+            "chart": "Sales ($K)",
+            "labels": ("Aug", "Sep", "Oct", "Nov"),
+            "series": ("This year", "Last year"),
+            "text": "November is up 14% from last year thanks to the promo display.",
+        },
         "faces": ("Weekly Meeting", "To-Do", "Lunch Orders"),
         "search": ("order", "no such text"),
         "quote_file": "C:\\Users\\Public\\Documents\\Quote.xlsx",
@@ -194,6 +237,26 @@ DEMO = {
                       "当日出荷いたします。離島など一部地域は1〜2日多くかかる場合があります。"),
             "text2": "交換と返品は商品到着後7日以内にご連絡ください。",
             "underlined": "お客様都合の場合は往復送料をご負担いただきます。",
+        },
+        "notice": {
+            "title": "オフィスのお知らせ",
+            "items": ("12月1日から新しい入館カードを使います",
+                      "金曜の午後3時に消防点検があります"),
+            "ask": "{a} {b} 会議室の予約表を確認してください",
+        },
+        "party": {
+            "title": "金曜の食事会",
+            "text": "{me} 投票が終わったらお店の予約をお願いします",
+            "question": "食事会のメニュー",
+            "options": ("焼肉", "寿司", "中華"),
+            "dday": "食事会",
+        },
+        "sales": {
+            "title": "月別の売上",
+            "chart": "売上（万円）",
+            "labels": ("8月", "9月", "10月", "11月"),
+            "series": ("今年", "昨年"),
+            "text": "11月は特設コーナーの効果で昨年より14%増えました。",
         },
         "faces": ("週次ミーティング", "やること", "ランチの注文"),
         "search": ("注文", "ない言葉"),

@@ -339,14 +339,38 @@ def missing_notes(copy_notes: list[dict[str, Any]],
     return out
 
 
+def _put_extras(repo, extras: dict, note_ids: set, owner) -> None:
+    """이어받는 PC 가 알던 공유 알림, 공지, 위젯을 새 메모 파일에 넣는다. 사본에 있는
+    메모의 것만, 확인을 통과하는 것만 넣는다(하나가 잘못돼도 나머지는 넣는다)."""
+    from . import reminders as rm
+    from . import widgets
+    for nid, raw in (extras.get("reminders") or {}).items():
+        entry = rm.shared_from_dict(raw)
+        if nid in note_ids and entry is not None:
+            repo.set_reminder(nid, entry)
+    for nid, who in (extras.get("notices") or {}).items():
+        if nid in note_ids and isinstance(who, str) and who:
+            repo.set_notice(nid, owner(who))
+    for wid, pair in (extras.get("widgets") or {}).items():
+        try:
+            nid, data = pair
+            if nid in note_ids and widgets.valid_id(wid):
+                repo.put_widget(wid, nid, widgets.validate_any(data))
+        except (TypeError, ValueError, widgets.WidgetError):
+            continue
+
+
 def build_host_database(copy_path: Path | str, db_path: Path | str,
-                        nickname: str) -> Path | None:
+                        nickname: str, extras: dict | None = None) -> Path | None:
     """사본으로 공유 PC 의 메모 파일을 새로 만든다(이 PC 가 공유를 이어받는다).
 
     이 PC 에 메모 파일이 이미 있으면 지우지 않고 옆으로 옮겨 둔다. 옮겨 둔 파일의
     경로를 돌려준다. 사본을 받을 때와 닉네임이 달라졌으면 '나만 보기' 메모의
     주인을 지금 닉네임으로 바꿔, 주인이 자기 메모를 못 보게 되는 일을 막는다.
-    수정 이력은 사본에 없으므로 따라오지 않는다."""
+    수정 이력은 사본에 없으므로 따라오지 않는다.
+
+    ``extras`` 는 이 PC 가 알던 공유 알림, 공지, 위젯 데이터다(사본에는 메모와 폴더만
+    있다). 넣지 않으면 이어받은 공유에서 사라지고, 다른 PC 의 공유 알림 사본도 비워진다."""
     from .backup import set_aside
     from .database import SqliteRepository
 
@@ -387,6 +411,8 @@ def build_host_database(copy_path: Path | str, db_path: Path | str,
             note.created_by = note.created_by or nickname
             note.updated_by = note.updated_by or note.created_by
             repo.insert_note(note)
+        _put_extras(repo, extras or {}, {n.get("id") for n in notes if isinstance(n, dict)},
+                    owner)
         # 그 공유에 참여하던 다른 PC 가 이 PC 를 찾았을 때 알아보게 한다.
         repo.set_took_over_from(meta.get("host_id", ""))
     finally:

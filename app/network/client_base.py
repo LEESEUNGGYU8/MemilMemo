@@ -4,6 +4,8 @@ from typing import Any
 
 from PySide6.QtCore import QObject, Signal
 
+from .. import reminders as rm
+
 
 class ClientBase(QObject):
     """게스트(TCP)와 호스트(in-process)가 같은 시그널을 제공해, UI가
@@ -23,6 +25,16 @@ class ClientBase(QObject):
     userJoined = Signal(str)
     userLeft = Signal(str)
     historyAppended = Signal(dict)
+    # 공유 알림이 바뀌었다(메모 id, 알림 dict 또는 None, 바꾼 사람, 완료로 지웠는가).
+    reminderChanged = Signal(str, object, str, bool)
+    # 1.2: 공지가 바뀌었다(메모 id, 만든 사람 또는 None, 바꾼 사람), 내 공지를 본
+    # 기록(메모 id, {이름: {"version", "at"}}), 누가 나를 불렀다(메모 id, 부른 사람, 때).
+    noticeChanged = Signal(str, object, str)
+    seenChanged = Signal(str, dict)
+    mentioned = Signal(str, str, int)
+    # 위젯이 바뀌었다(메모 id, 위젯 id, 데이터, 바꾼 사람), 위젯 동작을 거절했다(위젯 id, 까닭).
+    widgetChanged = Signal(str, str, dict, str)
+    widgetError = Signal(str, str)
     # 누군가 메모를 새로 만들었다(이력 항목). 지운 메모를 되돌린 경우는 빠진다.
     noteAnnounced = Signal(dict)
     # 누군가 나만 보던 메모를 공개로 바꿨다({"user": 바꾼 사람, "note_id": 메모}).
@@ -98,8 +110,18 @@ class ClientBase(QObject):
     def restore_note(self, note_id: str) -> None: ...
     def purge_note(self, note_id: str) -> None: ...
     def empty_trash(self) -> None: ...
+    # 공유 알림(공유 PC 가 welcome 에 reminders 를 보낼 때만 답한다).
+    # ``reminder`` 는 {"rule", "targets"} 또는 None(지움).
+    def set_reminder(self, note_id: str, reminder: dict | None,
+                     done: bool = False) -> None: ...
+    # 공지와 읽음(공유 PC 가 welcome 에 notices 를 보낼 때만 답한다).
+    def set_notice(self, note_id: str, on: bool) -> None: ...
+    def send_seen(self, note_id: str, version: int) -> None: ...
+    # 위젯(공유 PC 가 welcome 에 widgets 를 보낼 때만 답한다).
+    def put_widget(self, note_id: str, widget_id: str, data: dict) -> None: ...
+    def widget_op(self, widget_id: str, op: dict) -> None: ...
 
-    def _dispatch(self, msg_type: str, data: dict[str, Any]) -> None:
+    def _dispatch(self, msg_type: str, data: dict[str, Any]) -> None:  # noqa: C901
         if msg_type == "welcome":
             self.welcomed.emit(data)
         elif msg_type == "note_created":
@@ -150,7 +172,56 @@ class ClientBase(QObject):
             # 글자를 칠 때마다 오지 않는다. 옛 버전 호스트도 같다.
             elif entry.get("action") == "update":
                 self.noteEdited.emit(entry)
+        elif msg_type == "reminder_changed":
+            note_id = data.get("note_id")
+            raw = data.get("reminder")
+            entry = rm.shared_from_dict(raw) if raw is not None else None
+            if not isinstance(note_id, str) or not note_id or (raw is not None and entry is None):
+                return
+            by = data.get("by")
+            self.reminderChanged.emit(note_id, entry, by if isinstance(by, str) else "",
+                                      data.get("done") is True)
+        elif msg_type == "notice_changed":
+            note_id = data.get("note_id")
+            owner = data.get("owner")
+            by = data.get("by")
+            if isinstance(note_id, str) and note_id and (owner is None or isinstance(owner, str)):
+                self.noticeChanged.emit(note_id, owner or None,
+                                        by if isinstance(by, str) else "")
+        elif msg_type == "seen_changed":
+            note_id = data.get("note_id")
+            seen = data.get("seen")
+            if isinstance(note_id, str) and note_id and isinstance(seen, dict):
+                self.seenChanged.emit(note_id, clean_seen(seen))
+        elif msg_type == "widget_changed":
+            note_id, wid, wdata = data.get("note_id"), data.get("widget_id"), data.get("data")
+            by = data.get("by")
+            if (isinstance(note_id, str) and isinstance(wid, str) and wid
+                    and isinstance(wdata, dict)):
+                self.widgetChanged.emit(note_id, wid, wdata, by if isinstance(by, str) else "")
+        elif msg_type == "widget_error":
+            wid, error = data.get("widget_id"), data.get("error")
+            if isinstance(wid, str) and isinstance(error, str):
+                self.widgetError.emit(wid, error)
+        elif msg_type == "mentioned":
+            note_id, by, at = data.get("note_id"), data.get("by"), data.get("at")
+            if isinstance(note_id, str) and note_id and isinstance(by, str):
+                self.mentioned.emit(note_id, by, at if isinstance(at, int) else 0)
         elif msg_type == "history_list":
             self.historyList.emit(data.get("note_id", "") or "", data.get("entries", []))
         elif msg_type == "error":
             self.errorOccurred.emit(data.get("message", ""))
+
+
+def clean_seen(raw) -> dict[str, dict]:
+    """공유 PC 가 보낸 본 기록을 고친다({이름: {"version": 정수, "at": 정수}})."""
+    out: dict[str, dict] = {}
+    if not isinstance(raw, dict):
+        return out
+    for name, entry in raw.items():
+        if not isinstance(name, str) or not name or not isinstance(entry, dict):
+            continue
+        v, at = entry.get("version"), entry.get("at")
+        if isinstance(v, int) and isinstance(at, int):
+            out[name] = {"version": v, "at": at}
+    return out

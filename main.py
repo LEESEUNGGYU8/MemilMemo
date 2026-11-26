@@ -17,7 +17,7 @@ from app.datetime_fmt import fmt_relative
 from app.ipc import (
     CMD_NEW_NOTE_HERE, CMD_SHOW, IpcReceiver, claim_boot, forward_command,
     forward_when_ready, link_note_command, link_note_paths, new_folder_command,
-    new_note_command,
+    new_note_command, clip_note_command,
 )
 from app.local_state import LocalStateStore
 from app.network.discovery import Responder
@@ -328,8 +328,12 @@ def main() -> int:
     new_folder_cmd = new_folder_command(sys.argv)
     if new_folder_cmd and forward_command(new_folder_cmd):
         return 0
+    # 바탕 화면이나 파일 우클릭 메뉴의 '클립보드로 새 메모'로 실행됐는가.
+    clip_cmd = clip_note_command(sys.argv)
+    if clip_cmd and forward_command(clip_cmd):
+        return 0
     if _already_running(sys.argv,
-                        bool(new_note_cmd or link_paths or new_folder_cmd)):
+                        bool(new_note_cmd or link_paths or new_folder_cmd or clip_cmd)):
         return 0
     # 여기부터는 앱을 켠다. 파일을 여럿 골랐으면 같은 실행이 동시에 여러 개
     # 뜨므로 하나만 켜고, 나머지는 그쪽이 뜨기를 기다렸다가 넘기고 끝난다.
@@ -352,7 +356,7 @@ def main() -> int:
     # 다른 데 가 있으므로 지금 적어 둔다.
     new_note_spot = (QCursor.pos()
                      if (new_note_cmd == CMD_NEW_NOTE_HERE or link_paths
-                         or new_folder_cmd)
+                         or new_folder_cmd or clip_cmd)
                      else None)
 
     # 스토어판을 처음 켰으면 설치판이 쓰던 메모와 설정을 가져온다(설정을 읽기
@@ -379,7 +383,8 @@ def main() -> int:
     # 바탕 화면 우클릭 메뉴를 넣어 둔 경우 실행 파일 경로와 글자를 지금 것으로 맞춘다.
     shell_menu.refresh(i18n.t("shell.new_note_title"),
                        i18n.t("shell.link_note_title"),
-                       i18n.t("shell.new_folder_title"))
+                       i18n.t("shell.new_folder_title"),
+                       i18n.t("shell.clip_note_title"))
 
     local_store = LocalStateStore()
 
@@ -590,7 +595,8 @@ def main() -> int:
                             Path(copy_path), config.default_db_path())
                     else:
                         build_host_database(Path(copy_path),
-                                            config.default_db_path(), nickname)
+                                            config.default_db_path(), nickname,
+                                            extras=window.takeover_extras())
                 except (OSError, sqlite3.Error, ValueError) as e:
                     confirm.notify(
                         parent, i18n.t("boot.start_failed_title"),
@@ -662,6 +668,18 @@ def main() -> int:
             if not window._connected:
                 _create_after_welcome()
         QTimer.singleShot(NEW_NOTE_HOST_WAIT_MS, _create_without_host)
+
+    if clip_cmd:
+        # '클립보드로 새 메모'로 켜졌다. 붙은 뒤에(붙지 못하면 잠깐 기다려 이 PC 에) 만든다.
+        def _clip_after_welcome(_data=None):
+            try:
+                client.welcomed.disconnect(_clip_after_welcome)
+            except (RuntimeError, TypeError):
+                return              # 이미 만들었다
+            QTimer.singleShot(0, lambda: window.handle_clip_note_request(new_note_spot))
+        client.welcomed.connect(_clip_after_welcome)
+        QTimer.singleShot(NEW_NOTE_HOST_WAIT_MS,
+                          lambda: None if window._connected else _clip_after_welcome())
 
     if new_folder_cmd:
         # '새 메모 폴더 추가'로 켜졌다. 폴더는 공유 PC 에 만들므로 붙은 뒤에 만든다.
@@ -769,6 +787,7 @@ def _prompt_and_install(app: QApplication, window: MainWindow,
                                     QMessageBox.RejectRole)
     cancel_btn.setProperty("secondary", True)
     progress.setEscapeButton(cancel_btn)
+    confirm.frame_box(progress)
 
     downloader = UpdateDownloader(info, parent=app)
     finished = {"done": False}

@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 from .. import config, i18n
 from ..network.discovery import Searcher
 from ..share_auth import clean_password
+from . import window_frame
 from .icons import svg_icon
 from .number_field import DecimalField, IntField, with_unit
 from .password_dialog import password_field
@@ -139,7 +140,7 @@ class ConnectDialog(QDialog):
                  last_port: int = config.DEFAULT_PORT,
                  parent: QWidget | None = None):
         super().__init__(parent)
-        self.setWindowTitle(i18n.t("connect.window_title", app=i18n.t("app.name")))
+        self.setWindowTitle(i18n.t("connect.window_title"))
         self.setModal(True)
 
         root = QVBoxLayout(self)
@@ -212,6 +213,7 @@ class ConnectDialog(QDialog):
         # 내부망에서 공유 중인 PC 를 찾는다(참여를 골랐을 때).
         self._searcher = Searcher(parent=self)
         self._searcher.finished.connect(self._show_found)
+        window_frame.install(self, window_frame.DIALOG)
 
     def _set_mode(self, idx: int) -> None:
         self._mode = idx

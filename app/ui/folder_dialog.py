@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import config, i18n
+from . import window_frame
 from .icons import color_swatch_icon
 from .theme import color_name, refresh_style
 
@@ -102,6 +103,7 @@ class FolderEditDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+        window_frame.install(self, window_frame.DIALOG)
 
     def _select(self, color: str) -> None:
         self._selected_color = color

@@ -15,6 +15,7 @@ from PySide6.QtGui import QFont, QFontMetrics, QTextLayout, QTextOption
 from PySide6.QtWidgets import QLabel, QMessageBox, QPushButton, QWidget
 
 from .. import i18n
+from . import window_frame
 from .theme import refresh_style
 
 # 글 한 줄의 최대 폭(px). 이보다 긴 글만 줄을 나눈다.
@@ -145,6 +146,21 @@ def arrange(box: QMessageBox) -> None:
             main.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
 
+def frame_box(box: QMessageBox) -> None:
+    """확인창에 앱의 상단바(닫기만)를 입힌다. 묻는 말이 곧 제목이라 제목은 그리지
+    않는다. 확인창은 글을 바꿀 때마다 레이아웃을 새로 만든다. 상단바 자리는
+    레이아웃의 여백이 아니라 창의 안쪽 여백으로 비워 둔다."""
+    if window_frame.bar_of(box) is not None:
+        return
+    bar = window_frame.install(box, window_frame.BARE)
+    lay = box.layout()
+    if lay is not None:
+        m = lay.contentsMargins()
+        lay.setContentsMargins(m.left(), max(0, m.top() - bar.height()),
+                               m.right(), m.bottom())
+    box.setContentsMargins(0, bar.height(), 0, 0)
+
+
 def build_ask(parent: QWidget | None, title: str, text: str, *,
               action: str, detail: str = "", cancel: str = "",
               danger: bool = False
@@ -172,6 +188,7 @@ def build_ask(parent: QWidget | None, title: str, text: str, *,
     box.setDefaultButton(can)
     box.setEscapeButton(can)
     arrange(box)
+    frame_box(box)
     return box, act, can
 
 
@@ -197,6 +214,7 @@ def build_notify(parent: QWidget | None, title: str, text: str, *,
     ok = box.addButton(i18n.t("main.btn_ok"), QMessageBox.AcceptRole)
     ok.setMinimumWidth(96)
     arrange(box)
+    frame_box(box)
     return box
 
 

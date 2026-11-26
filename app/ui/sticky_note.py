@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import platform
 import re
 from typing import Any
 
 from PySide6.QtCore import (
     QCoreApplication, QEasingCurve, QEvent, QMimeData, QObject, QPoint, QPointF,
-    QRect, QRectF, QSize, Qt, QTimer, QVariantAnimation, Signal,
+    QRect, QRectF, QSize, Qt, QTimer, QVariantAnimation, Signal, QUrl,
 )
 from PySide6.QtGui import (
     QBrush,
     QColor,
+    QCursor,
     QFont,
+    QFontMetrics,
     QGuiApplication,
     QIcon,
     QKeySequence,
@@ -26,9 +29,15 @@ from PySide6.QtGui import (
     QTextCharFormat,
     QTextCursor,
     QTextFormat,
+    QTextFrameFormat,
     QTextImageFormat,
+    QTextLength,
+    QTextTableFormat,
+    QImage,
+    QTextDocument,
 )
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QApplication,
     QDialog,
     QFileDialog,
@@ -38,6 +47,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QMenu,
     QSizeGrip,
+    QSizePolicy,
+    QSlider,
     QToolButton,
     QToolTip,
     QVBoxLayout,
@@ -90,7 +101,9 @@ from .rich_text import (
     set_copied_format,
     strip_link_icons,
 )
-from .theme import RoundedScrollBar, color_name
+from .theme import COLOR_FOCUS, RoundedScrollBar, color_name
+from . import widget_object as wobj
+from .widget_block import WidgetBlock, wants_setup
 
 
 # 바탕 화면과 앱 창 사이 레이어는 WindowStaysOnTopHint 로 만들 수 없어
@@ -131,6 +144,46 @@ def _set_window_topmost(hwnd: int, on: bool) -> None:
         )
     except Exception:
         pass
+
+
+class _AttachGhost(QWidget):
+    """메모를 다른 창의 가장자리로 끄는 동안, 놓으면 붙을 그 창의 테두리를 보인다."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent, Qt.Tool | Qt.FramelessWindowHint
+                         | Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus
+                         | Qt.WindowTransparentForInput)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+
+    def outline(self, rect: QRect, *, leaving: bool = False) -> None:
+        """``leaving`` 이면 놓으면 떨어진다는 뜻의 회색 점선."""
+        self._leaving = leaving
+        if self.geometry() != rect:
+            self.setGeometry(rect)
+        if not self.isVisible():
+            self.show()
+        self.update()
+
+    _leaving = False
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        dwm.set_bare(int(self.winId()))
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        if self._leaving:
+            p.setPen(QPen(QColor("#8A8A8A"), 2, Qt.DashLine))
+            p.setBrush(Qt.NoBrush)
+        else:
+            p.setPen(QPen(QColor(COLOR_FOCUS), 3))
+            fill = QColor(COLOR_FOCUS)
+            fill.setAlphaF(0.06)
+            p.setBrush(fill)
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5), 8, 8)
+        p.end()
 
 
 class _DockGhost(QWidget):
@@ -185,6 +238,116 @@ def _make_format_button(icon: QIcon, tip: str, checkable: bool = False) -> QTool
     return b
 
 
+class _ScheduleChip(QAbstractButton):
+    """머리 줄의 다음 알림(체크 해제) 때. 그림 옆에 때를 적는다.
+
+    때는 긴 꼴부터 여러 가지('내일 오전 9:00', '내일 9:00', '내일')를 받아 두고,
+    머리 줄이 좁으면 짧은 꼴로, 더 좁으면 그림만 둔다(``set_level``). 단계는 0 이
+    가장 긴 꼴, ``levels() - 1`` 이 그림만, ``levels()`` 는 감춤이다."""
+
+    _PAD = 4
+    _GAP = 5
+    _ICON = 13
+    _HEIGHT = 22
+    _INK = "#3A3A3A"
+
+    def __init__(self, icon: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._icon_name = icon
+        self._ink = self._INK
+        self._dark = False
+        self._icon = svg_icon(icon, color=self._INK)
+        self._forms: list[str] = []
+        self._level = 0
+        font = QFont(self.font())
+        font.setPixelSize(11)
+        self.setFont(font)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setAttribute(Qt.WA_Hover)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+    def set_ink(self, color: str, dark: bool) -> None:
+        """글자와 그림의 색(어두운 메모에서는 밝게)."""
+        if (color, dark) == (self._ink, self._dark):
+            return
+        self._ink, self._dark = color, dark
+        self._icon = svg_icon(self._icon_name, color=color)
+        self.update()
+
+    def set_forms(self, forms) -> None:
+        self._forms = [f for f in forms if f]
+        self._level = 0
+        self.setText(self._forms[0] if self._forms else "")
+        self.updateGeometry()
+        self.update()
+
+    def full_text(self) -> str:
+        return self._forms[0] if self._forms else ""
+
+    def levels(self) -> int:
+        """보이는 꼴의 수(마지막은 그림만)."""
+        return len(self._forms) + 1
+
+    def level(self) -> int:
+        return self._level
+
+    def shown_text(self) -> str:
+        return self._forms[self._level] if self._level < len(self._forms) else ""
+
+    def width_at(self, level: int) -> int:
+        """그 단계의 폭. 감추는 단계는 0."""
+        if level >= self.levels():
+            return 0
+        text = self._forms[level] if level < len(self._forms) else ""
+        width = 2 * self._PAD + self._ICON
+        if text:
+            width += self._GAP + self.fontMetrics().horizontalAdvance(text)
+        return width
+
+    def set_level(self, level: int) -> None:
+        level = max(0, min(level, self.levels()))
+        if level != self._level:
+            self._level = level
+            self.updateGeometry()
+            self.update()
+        self.setVisible(bool(self._forms) and level < self.levels())
+
+    def sizeHint(self) -> QSize:
+        return QSize(self.width_at(self._level), self._HEIGHT)
+
+    def minimumSizeHint(self) -> QSize:
+        return self.sizeHint()
+
+    def enterEvent(self, event) -> None:
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        if self.isDown() or self.underMouse():
+            p.setPen(Qt.NoPen)
+            if self._dark:
+                p.setBrush(QColor(255, 255, 255, 52 if self.isDown() else 40))
+            else:
+                p.setBrush(QColor(0, 0, 0, 34 if self.isDown() else 20))
+            p.drawRoundedRect(QRectF(self.rect()), 5, 5)
+        top = (self.height() - self._ICON) // 2
+        self._icon.paint(p, QRect(self._PAD, top, self._ICON, self._ICON))
+        text = self.shown_text()
+        if text:
+            left = self._PAD + self._ICON + self._GAP
+            p.setPen(QColor(self._ink))
+            p.setFont(self.font())
+            p.drawText(QRect(left, 0, self.width() - left, self.height()),
+                       Qt.AlignLeft | Qt.AlignVCenter, text)
+
+
 HIGHLIGHT_COLORS = [
     "#FFF59D",
     "#C5E1A5",
@@ -214,6 +377,15 @@ class _NoteGrip(QSizeGrip):
     def set_tone(self, color: QColor) -> None:
         self._tone = QColor(color)
         self.update()
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+        # 두 번 누르면 메모 높이를 내용에 맞춘다.
+        note = self.parentWidget()
+        if event.button() == Qt.LeftButton and hasattr(note, "fit_to_content"):
+            note.fit_to_content()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def paintEvent(self, event) -> None:  # noqa: N802
         p = QPainter(self)
@@ -301,6 +473,91 @@ def _text_color_for_bg(bg_hex: str) -> str:
     return "#FFFFFF" if lum < 0.55 else "#1F1F1F"
 
 
+class _GalleryTile(QAbstractButton):
+    """고르는 판의 칸 하나: 가운데 그림과 그 아래 이름. 마우스를 올리면 옅은 판."""
+
+    def __init__(self, icon: QIcon, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._icon = icon
+        self.setText(text)
+        self.setAccessibleName(text)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setAttribute(Qt.WA_Hover)
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        if self.underMouse() or self.isDown():
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor("#E9E9E9" if self.isDown() else "#F2F2F2"))
+            p.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 8, 8)
+        side = 26
+        top = 12
+        self._icon.paint(p, QRect((self.width() - side) // 2, top, side, side))
+        f = QFont(self.font())
+        f.setPixelSize(12)
+        p.setFont(f)
+        p.setPen(QColor("#1F1F1F"))
+        p.drawText(QRect(4, top + side + 6, self.width() - 8, 18),
+                   Qt.AlignHCenter | Qt.AlignTop,
+                   p.fontMetrics().elidedText(self.text(), Qt.ElideRight, self.width() - 8))
+
+    def enterEvent(self, event) -> None:
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self.update()
+        super().leaveEvent(event)
+
+
+class WidgetGallery(QWidget):
+    """위젯을 고르는 판: 그림과 이름의 칸(네 칸씩). 누르면 ``picked(종류)``."""
+
+    picked = Signal(str)
+    COLS = 4
+    TILE = QSize(84, 70)
+
+    def __init__(self, kinds: list[str], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        from ..widgets import texts as wtexts
+        grid = QGridLayout(self)
+        grid.setContentsMargins(8, 8, 8, 8)
+        grid.setSpacing(4)
+        self.tiles: dict[str, QToolButton] = {}
+        for i, name in enumerate(kinds):
+            b = _GalleryTile(svg_icon("w_" + name, size=26, color="#2B2B2B"),
+                             wtexts.tr("kind." + name), self)
+            b.setFixedSize(self.TILE)
+            b.clicked.connect(lambda _c=False, k=name: self.picked.emit(k))
+            grid.addWidget(b, i // self.COLS, i % self.COLS)
+            self.tiles[name] = b
+
+
+class _FlashRing(QWidget):
+    """목록에서 꺼낸 메모를 잠깐 파란 테두리로 알린다(어느 메모가 나왔는지 바로
+    보이게). 누름은 그대로 메모로 간다."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_NoSystemBackground)
+        self.level = 0.0
+        self.hide()
+
+    def paintEvent(self, _event) -> None:
+        if self.level <= 0.0:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        color = QColor(COLOR_FOCUS)
+        color.setAlphaF(min(1.0, self.level))
+        p.setPen(QPen(color, 3))
+        p.setBrush(Qt.NoBrush)
+        r = config.CORNER_RADIUS
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5), r, r)
+
+
 class StickyNoteWidget(QWidget):
     requestLock = Signal(str)
     releaseLock = Signal(str)
@@ -313,6 +570,31 @@ class StickyNoteWidget(QWidget):
     sizeChanged = Signal(str, int, int)  # note_id, w, h
     # note_id, 접힘 상태(folded, dock, dock_y, fold_style, fold_x, fold_y, fold_at)
     foldChanged = Signal(str, object)
+    # note_id, 바탕의 불투명도(%). 이 PC 에만 적는다.
+    opacityChanged = Signal(str, int)
+    # 알림, 체크 해제 예약을 정하는 창을 열어 달라(머리 줄 표시나 더 보기 메뉴).
+    reminderRequested = Signal(str)
+    checkResetRequested = Signal(str)
+    # 1.2: 공지로 만들기/풀기(메모 id, 켤까), 이 메모를 봤다(펼침, 2초 머묾), 내 공지를
+    # 본 사람 명단을 보여 달라.
+    noticeRequested = Signal(str, bool)
+    # 본문의 날짜를 눌렀다(메모 id, 때, 시각까지 적혔는가). 그 때로 알림을 만든다.
+    dateReminderRequested = Signal(str, object, bool)
+    # '같은 줄 모아 세기' 를 켜거나 껐다(메모 id, 켬).
+    tallyToggled = Signal(str, bool)
+    wrapToggled = Signal(str, bool)
+    # 위젯: 새로 넣었다(메모 id, 위젯 id, 데이터), 눌렀다(메모 id, 위젯 id, 동작).
+    widgetCreated = Signal(str, str, dict)
+    widgetOp = Signal(str, str, dict)
+    # 프로그램 창에 붙이기(실험): 붙여 달라, 떼어 달라.
+    attachRequested = Signal(str)
+    # 창 끝으로 끌어다 놓았다: (메모 id, 붙을 창의 핸들).
+    attachDropped = Signal(str, int)
+    detachRequested = Signal(str)
+    # 인쇄(메모 id, "print" 또는 "pdf").
+    printRequested = Signal(str, str)
+    viewed = Signal(str)
+    readListRequested = Signal(str)
 
     _DEFAULT_FONT_SIZE = 11
     _AUTOSAVE_INTERVAL_MS = 30_000
@@ -357,6 +639,7 @@ class StickyNoteWidget(QWidget):
         self._my_nickname = my_nickname
         self._lock_holder: str | None = None
         self._edit_mode = False
+        self.update()
         self._pending_lock = False
         self._first_show_done = False
         # 이 PC 에서 크기를 정해 둔 메모인가(apply_local_state, 크기 조절).
@@ -372,6 +655,13 @@ class StickyNoteWidget(QWidget):
                                        or self._DEFAULT_FONT_SIZE)
         # 참조로 보관해 설정 토글이 기존 메모 위젯에 즉시 반영되게 한다.
         self._settings = settings
+        # 바탕(종이와 머리 줄)의 불투명도(%). 글자, 그림, 체크 상자는 늘 또렷하다.
+        self._opacity = 100
+        self._opacity_hover = False
+        # 더 보기 메뉴에서 투명도를 고르는 동안은 편집 중이어도 고른 대로 보인다.
+        self._opacity_preview = False
+        # 체크 해제 예약: 잠금을 받는 대로 체크한 상자를 모두 해제하고 바로 놓는다.
+        self._pending_uncheck = False
 
         root = QVBoxLayout(self)
         # paintEvent 의 둥근 사각형 안쪽(2 px 인셋)에 콘텐츠를 맞춰
@@ -397,8 +687,56 @@ class StickyNoteWidget(QWidget):
         self._private_icon.setVisible(bool(self.private_owner))
         handle_row.addWidget(self._private_icon, 0, Qt.AlignVCenter)
 
+        # 공지: 만든 사람만 고치고 지운다. 머리 줄 왼쪽에 '공지'.
+        self._notice_owner: str | None = None
+        self._notice_can_make = False
+        self._notice_can_lift = False
+        self._notice_label = QLabel(i18n.t("notice.label"), self._handle)
+        self._notice_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self._notice_label.setToolTip(i18n.t("notice.label"))
+        self._notice_label.hide()
+        self._notice_icon = False      # 아주 좁으면 글 대신 그림
+        handle_row.addWidget(self._notice_label, 0, Qt.AlignVCenter)
+
+        # 붙은 프로그램 창의 이름. 누르면 '창에서 떼기'.
+        self._attached = False
+        self._can_attach = False
+        # 창 끝으로 끌어 붙이기: 끌기를 시작할 때 읽은 창 목록, 지금 붙을 창, 테두리 그림.
+        self._attach_windows: list | None = None
+        self._attach_target = None              # (창, 면, 맞출 자리) 또는 None
+        self._detach_pending = False            # 놓으면 붙은 창에서 떨어진다
+        self._attach_ghost: _AttachGhost | None = None
+        # 메인 창이 정한다: 지금 붙은 창의 핸들(없으면 0).
+        self.attached_hwnd = lambda: 0
+        self._attach_chip = QToolButton(self._handle)
+        self._attach_chip.setIcon(svg_icon("window", color="#3A3A3A"))
+        self._attach_chip.setIconSize(QSize(13, 13))
+        self._attach_chip.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._attach_chip.setCursor(Qt.PointingHandCursor)
+        self._attach_chip.setFocusPolicy(Qt.NoFocus)
+        self._attach_chip.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self._attach_chip.clicked.connect(self._show_window_menu)
+        self._attach_chip.hide()
+        self._attach_full = ""         # 붙은 창의 이름(줄이기 전)
+        self._head_ink = "#3A3A3A"
+        handle_row.addWidget(self._attach_chip, 0, Qt.AlignVCenter)
+
+        # 다음 알림과 다음 체크 해제 때. 누르면 정하는 창을 연다.
+        self._remind_chip = self._make_chip(
+            "bell", lambda: self.reminderRequested.emit(self.note_id))
+        self._reset_chip = self._make_chip(
+            "check_reset", lambda: self.checkResetRequested.emit(self.note_id))
+        handle_row.addWidget(self._remind_chip, 0, Qt.AlignVCenter)
+        handle_row.addWidget(self._reset_chip, 0, Qt.AlignVCenter)
+        # 내 공지를 본 사람 수('읽음 3/5'). 누르면 명단.
+        self._read_chip = self._make_chip(
+            "eye_on", lambda: self.readListRequested.emit(self.note_id))
+        handle_row.addWidget(self._read_chip, 0, Qt.AlignVCenter)
+
         self._lock_label = QLabel("", self._handle)
         self._lock_label.setTextFormat(Qt.PlainText)   # 편집 중인 사람의 닉네임
+        # 남는 자리만 쓴다(비어 있을 때 자리를 잡아 머리 줄 표시를 밀어내지 않는다).
+        self._lock_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self._lock_label.setStyleSheet(
             "color: #3A3A3A; font-size: 11px; background: transparent;"
         )
@@ -425,14 +763,53 @@ class StickyNoteWidget(QWidget):
                   self._more_btn, self._close_btn):
             handle_row.addWidget(b, 0, Qt.AlignVCenter)
         root.addWidget(self._handle)
+        # 남의 공지를 고치려 할 때, 연락처를 복사했을 때 잠깐 알리는 글은 머리 줄의 상태
+        # 글 자리에 둔다(본문을 밀었다 당기지 않는다).
+        self._flash_text = ""
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setSingleShot(True)
+        self._flash_timer.timeout.connect(self._end_flash_status)
+        # 2초 머물면 '봤다'.
+        self._view_timer = QTimer(self)
+        self._view_timer.setSingleShot(True)
+        self._view_timer.setInterval(2000)
+        self._view_timer.timeout.connect(self._on_view_timer)
 
         self._text = RichTextEdit(self)
+        self._text.set_attach_modes(getattr(settings, "attach_modes", None))
+        self._text.attachedRange.connect(self._on_attached_range)
+        # 보기 상태의 본문에서 날짜와 연락처를 찾는다(글이 바뀐 뒤 잠깐 있다가).
+        self._smart_timer = QTimer(self)
+        self._smart_timer.setSingleShot(True)
+        self._smart_timer.setInterval(250)
+        self._smart_timer.timeout.connect(self._refresh_smart)
+        self._text.document().contentsChanged.connect(self._smart_timer.start)
+        self._text.document().contentsChanged.connect(
+            lambda: self._widget_timer.start() if hasattr(self, "_widget_timer") else None)
+        self._smart_press = None
+        # 고른 글의 숫자 합계(끌어 고르는 동안에는 세지 않고 멈춘 뒤에).
+        self._sum_timer = QTimer(self)
+        self._sum_timer.setSingleShot(True)
+        self._sum_timer.setInterval(120)
+        self._sum_timer.timeout.connect(self._on_selection_changed)
+        self._text.selectionChanged.connect(self._sum_timer.start)
+        # @이름 자동 완성(고를 수 있는 이름은 메인 창이 넣어 준다).
+        self._people: list[str] = []
+        self._mention_list = None
+        self._text.textChanged.connect(self._update_mention_list)
+        # 같은 줄 모아 세기.
+        self._tally_on = False
+        self._wrap_on = True
+        self._text.textChanged.connect(self._refresh_tally)
         self._text.setReadOnly(True)
         self._text.setFrameStyle(QFrame.NoFrame)
         self._text.setAttribute(Qt.WA_TranslucentBackground)
         self._text.viewport().setAutoFillBackground(False)
         self._scrollbar = RoundedScrollBar()
         self._text.setVerticalScrollBar(self._scrollbar)
+        # 넓은 표나 그림이 폭을 넘을 때의 가로 막대도 둥글게 그린다(Windows 기본 그림은 각지다).
+        self._hscrollbar = RoundedScrollBar(orientation=Qt.Horizontal)
+        self._text.setHorizontalScrollBar(self._hscrollbar)
         self._text.setStyleSheet("QTextEdit { background: transparent; }")
         self._text.setViewportMargins(*config.TEXT_MARGINS)
         default_font = self._text.font()
@@ -474,27 +851,9 @@ class StickyNoteWidget(QWidget):
 
         self._list_btn = _make_format_button(
             svg_icon("list"), i18n.t("sticky.tip_list"), True)
+        # 메뉴의 항목은 처음 열 때 만든다(메모 창마다 미리 만들면 켤 때 느리다).
         self._list_menu = QMenu(self._list_btn)
-        # 네모는 단계에 따라 기호가 바뀌는 기본 목록이다(■ ○ – ·).
-        for code, key in ((MARKER_SQUARE, "sticky.menu_square"),
-                          (MARKER_CIRCLE, "sticky.menu_circle"),
-                          (MARKER_ARROW, "sticky.menu_arrow"),
-                          (MARKER_INFO, "sticky.menu_info")):
-            add_centered_menu_action(
-                self._list_menu, list_menu_icon(code), i18n.t(key),
-                lambda _checked=False, c=code: self._apply_bullet_marker(c))
-        self._list_menu.addSeparator()
-        add_centered_menu_action(
-            self._list_menu, list_menu_icon(MARKER_NUMBER),
-            i18n.t("sticky.menu_number"), self._apply_number_marker)
-        add_centered_menu_action(
-            self._list_menu, list_menu_icon(MARKER_CHECK0),
-            i18n.t("sticky.menu_checkbox"),
-            self._apply_checkbox_marker)
-        self._list_menu.addSeparator()
-        add_centered_menu_action(
-            self._list_menu, None, i18n.t("sticky.menu_list_off"),
-            self._remove_list_markers)
+        self._list_menu.aboutToShow.connect(self._fill_list_menu)
         self._list_btn.setMenu(self._list_menu)
         self._list_btn.setPopupMode(QToolButton.InstantPopup)
 
@@ -503,12 +862,48 @@ class StickyNoteWidget(QWidget):
             svg_icon("attach"), i18n.t("sticky.tip_attach"))
         self._image_btn.setToolTip(i18n.t("sticky.tip_attach_full"))
         self._attach_menu = QMenu(self._image_btn)
-        add_centered_menu_action(
-            self._attach_menu, svg_icon("image"),
-            i18n.t("sticky.menu_attach_image"), self._attach_image)
-        add_centered_menu_action(
-            self._attach_menu, svg_icon("link"),
-            i18n.t("sticky.menu_attach_link"), self._insert_link)
+        self._attach_menu.aboutToShow.connect(self._fill_attach_menu)
+        # 위젯은 서식 막대의 따로 된 단추에서 고른다(공유 PC 가 위젯을 알 때만 누른다).
+        self._widget_btn = _make_format_button(
+            svg_icon("widgets"), i18n.t("widget.menu"))
+        # clicked 는 눌림 값(bool)을 넘긴다. 고르는 판의 자리로 받지 않게 감싼다.
+        self._widget_btn.clicked.connect(lambda _c=False: self._show_widget_gallery())
+        self._widgets_ok = False
+        self._widget_games = True
+        self._widget_data: dict[str, dict] = {}
+        self._widget_views: dict = {}
+        self._widget_fixing = False
+        self._widget_delete_pending: list[str] = []
+        # 본문의 위젯 칸 크기(위젯 id: (폭, 높이))와 저장용 그림(같은 모습이면 다시 그리지 않는다).
+        self._widget_sizes: dict[str, tuple[int, int]] = {}
+        self._widget_shots: dict[str, tuple] = {}
+        self._widget_room: set[str] = set()
+        # 부모는 문서(본문 칸에 자식을 붙이면 메모의 이벤트 거르개가 만들기 전에 불린다).
+        self._widget_handler = wobj.WidgetObjectHandler(
+            self._text.document(), self._widget_sizes.get,
+            lambda wid: wid in self._widget_views)
+        wobj.install(self._text.document(), self._widget_handler)
+        # 옮겨 붙인 위젯은 이 메모의 위젯이고 본문에 아직 없을 때만 다시 위젯이 된다.
+        self._text.widget_ok = lambda wid: (
+            wid in self._widget_data
+            and wid not in {w for w, _p, _f in wobj.find_objects(self._text.document())})
+        self._text.widget_picture = self._widget_copy_picture
+        self._text.widget_mine = lambda wid: wid in self._widget_data
+        self._widget_timer = QTimer(self)
+        self._widget_timer.setSingleShot(True)
+        self._widget_timer.setInterval(40)
+        self._widget_timer.timeout.connect(self._sync_widget_views)
+        # 메모 폭이 바뀌어 글이 다시 놓이면 위젯 폭('메모 폭에 맞춤')과 자리도 다시 맞춘다.
+        layout = self._text.document().documentLayout()
+        layout.documentSizeChanged.connect(
+            lambda _size: self._widget_timer.start() if self._widget_views else None)
+        # 자리는 글이 다시 놓이는 그때 바로 옮긴다(위젯이 글보다 늦게 따라오지 않게).
+        self._placing_widgets = False
+        layout.update.connect(lambda _rect: self._place_widget_views())
+        self._text.verticalScrollBar().valueChanged.connect(
+            lambda _v: self._place_widget_views())
+        self._text.horizontalScrollBar().valueChanged.connect(
+            lambda _v: self._place_widget_views())
 
         self._bold_btn.clicked.connect(self._toggle_bold)
         self._italic_btn.clicked.connect(self._toggle_italic)
@@ -518,10 +913,25 @@ class StickyNoteWidget(QWidget):
 
         for b in (self._bold_btn, self._italic_btn, self._underline_btn,
                   self._strike_btn, self._font_color_btn, self._highlight_btn,
-                  self._list_btn, self._image_btn):
+                  self._list_btn, self._image_btn, self._widget_btn):
             fb.addWidget(b)
         fb.addStretch(1)
         fb.addSpacing(_NoteGrip.SIZE)        # 손잡이가 올라앉는 자리
+        # 본문 아래 칸: 가는 선, 고른 글의 합계, 같은 줄 모아 세기.
+        self._extra_rule = QFrame(self)
+        self._extra_rule.setFixedHeight(1)
+        self._extra_rule.hide()
+        root.addWidget(self._extra_rule)
+        self._sum_line = QLabel("", self)
+        self._sum_line.setTextFormat(Qt.PlainText)
+        self._sum_line.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._sum_line.hide()
+        root.addWidget(self._sum_line)
+        self._tally_line = QLabel("", self)
+        self._tally_line.setTextFormat(Qt.RichText)
+        self._tally_line.hide()
+        root.addWidget(self._tally_line)
+        self._extra_ink = ("#3A3A3A", "#6B6B6B")
         root.addWidget(self._format_bar)
 
         self._grip = _NoteGrip(self)
@@ -651,6 +1061,8 @@ class StickyNoteWidget(QWidget):
         self._pending_drop_pos = -1
         # 편집을 시작하면 본문 끝에 링크로 넣을 파일·폴더 경로.
         self._pending_links: list[str] = []
+        # 클립보드로 만든 새 메모에 넣을 내용(편집을 얻으면 넣는다).
+        self._pending_mime: QMimeData | None = None
         # 접힌 아이콘에 넣는 첫 이미지의 작은 그림(내용이 바뀌면 다시 만든다).
         self._thumb_src: str | None = None
         self._thumb_pix: QPixmap | None = None
@@ -670,6 +1082,8 @@ class StickyNoteWidget(QWidget):
             # 서식 없이 저장된 글. 꺾쇠가 들어 있어도 글자 그대로 보여 준다.
             self._text.setPlainText(content)
         self._convert_loaded_markers()
+        # 저장 형식의 위젯 그림을 본문의 위젯 칸으로(그림으로 다루지 않는다).
+        wobj.images_to_objects(self._text.document())
         # 링크마다 종류 아이콘 자리를 끼우고 글자색을 지금 메모 색에 맞춘다.
         self._text.sync_link_icons()
         self._keep_text_readable()
@@ -680,6 +1094,9 @@ class StickyNoteWidget(QWidget):
         # load·fit 을 undo 스택에서 제거해 첫 Ctrl+Z 가 fit 이전
         # 이미지 크기로 되돌아가지 않게 한다.
         self._text.document().clearUndoRedoStacks()
+        # 접힌 모양의 할 일 진행률이 바뀌었을 수 있다.
+        if getattr(self, "_folded", False):
+            self.update()
 
     def _leading_marker(self, block) -> tuple[int, int]:
         """블록 맨 앞에 인라인 마커 이미지가 있으면 ``(code, 제거할 글자수)``
@@ -716,14 +1133,18 @@ class StickyNoteWidget(QWidget):
             return 0
         return found.end() + (1 if text[found.end():found.end() + 1] == " " else 0)
 
-    def _convert_loaded_markers(self) -> None:
+    def _convert_loaded_markers(self, start: int | None = None,
+                                end: int | None = None) -> None:
         """저장본을 화면용으로 바꾼다: 줄 앞의 마커 그림(+뒤 공백)과 번호 글자를
         블록 마커 속성으로, 블록의 들여쓰기 값을 단계로. 구버전 인라인 이미지
-        저장본도 이렇게 현재 모델로 흡수한다."""
+        저장본도 이렇게 현재 모델로 흡수한다. ``start``/``end`` 를 주면 그 범위의
+        줄만(첨부한 글. 원래 있던 줄의 '1.' 글자를 번호로 바꾸지 않는다)."""
         doc = self._text.document()
         positions = []
-        block = doc.begin()
+        block = doc.findBlock(start) if start is not None else doc.begin()
         while block.isValid():
+            if end is not None and block.position() > end:
+                break
             positions.append(block.position())
             block = block.next()
         for pos in reversed(positions):
@@ -756,6 +1177,9 @@ class StickyNoteWidget(QWidget):
         clone = self._text.document().clone()
         # 링크 아이콘 자리는 화면용이라 저장하지 않는다(위치 계산 전에 뺀다).
         strip_link_icons(clone)
+        # 위젯 칸은 지금 모습의 그림으로 적는다(옛 버전은 그림을 본다). 글자 하나가
+        # 글자 하나로 바뀌어 아래의 위치 계산은 그대로다.
+        wobj.objects_to_images(clone, self._widget_picture)
         numbers = self._text.list_numbers(clone)
         positions = []
         block = clone.begin()
@@ -809,7 +1233,8 @@ class StickyNoteWidget(QWidget):
         doc = self._text.document()
         plain = doc.toPlainText()
         default_size = doc.defaultFont().pointSizeF()
-        has_rich = False
+        # 표(글상자)가 있으면 서식이다. 글자만 든 표를 평문으로 저장하면 표가 사라진다.
+        has_rich = bool(doc.rootFrame().childFrames())
         block = doc.begin()
         while block.isValid() and not has_rich:
             if self._marker_code(block) in MARKER_CODES:
@@ -827,6 +1252,7 @@ class StickyNoteWidget(QWidget):
                             or fmt.fontUnderline()
                             or fmt.fontStrikeOut()
                             or fmt.isImageFormat()
+                            or wobj.is_widget_format(fmt)
                             or (size > 0
                                 and abs(size - default_size) > 0.1)
                             or fmt.hasProperty(QTextFormat.ForegroundBrush)
@@ -914,6 +1340,14 @@ class StickyNoteWidget(QWidget):
     def enter_edit_mode(self) -> None:
         self._pending_lock = False
         pending_check, self._pending_check = self._pending_check, None
+        uncheck, self._pending_uncheck = self._pending_uncheck, False
+        if (uncheck and pending_check is None and self._pending_drop is None
+                and not self._pending_links and self._pending_mime is None):
+            # 체크 해제 예약: 편집 화면으로 바꾸지 않고 고친 뒤 바로 놓는다.
+            # 접힌 메모도 그대로 접힌 채로 둔다.
+            self._abandon_grant = False
+            self._uncheck_and_release()
+            return
         if self._abandon_grant or self._folded or self._fold_busy():
             # 이미지 뷰어를 열거나 메모를 접는 사이에 허용이 도착했다. 변경 없이
             # 잠금만 돌려주므로 서버는 이력 행을 남기지 않는다(변경 없는 편집
@@ -921,15 +1355,18 @@ class StickyNoteWidget(QWidget):
             self._abandon_grant = False
             self._pending_drop = None
             self._pending_links = []
+            self._pending_mime = None
             self.releaseLock.emit(self.note_id)
             return
         self._edit_mode = True
+        self.update()
         self._earlier_commit = None
         self._text.setReadOnly(False)
         self._text.setFocus(Qt.OtherFocusReason)
         self._overlay.hide()
-        self._lock_label.setText(i18n.t("sticky.lock_editing_self"))
+        self._set_lock_text(i18n.t("sticky.lock_editing_self"))
         self._set_format_bar_enabled(True)
+        self._fit_chips()
         self._refresh_format_buttons()
         self._autosave_timer.start()
         # 변화 없는 focus→blur 가 updated_at 을 건드리거나 no-op 이력
@@ -937,6 +1374,9 @@ class StickyNoteWidget(QWidget):
         self._edit_baseline = self._edit_snapshot()
         self._apply_pending_drop()
         self._apply_pending_links()
+        self._apply_pending_widget_deletes()
+        if uncheck:
+            self._uncheck_blocks()
         if pending_check is not None:
             # 체크박스 한 번 누르기: 그 상자만 바꾸고 곧바로 저장하고 잠금을 푼다.
             block = self._text.document().findBlockByNumber(pending_check)
@@ -1012,7 +1452,237 @@ class StickyNoteWidget(QWidget):
             # 편집을 청하지 못했다(다른 사람이 편집 중이다).
             self._pending_links = []
 
+    # ── 본문 자동 인식 ──
+
+    def _refresh_smart(self) -> None:
+        if self._edit_mode:
+            return
+        if not self.isVisible():
+            self._smart_stale = True        # 보일 때 한다(숨긴 메모가 많으면 켤 때 느리다)
+            return
+        self._smart_stale = False
+        from datetime import datetime
+        self._text.refresh_smart(datetime.now())
+
+    def _on_selection_changed(self) -> None:
+        from .. import text_detect as td
+        text = self._text.textCursor().selectedText().replace("\u2029", "\n")
+        # 아주 긴 고르기(메모 전체 등)는 세지 않는다. 합계를 보려는 고르기가 아니다.
+        summary = td.summarize_numbers(text) if text and len(text) <= 20000 else None
+        if summary is None:
+            self._sum_line.hide()
+            self._refresh_extra_rule()
+            return
+        from decimal import ROUND_HALF_UP, Decimal
+        # 평균은 소수 둘째 자리까지(1.333333 처럼 길게 늘어놓지 않는다).
+        avg = summary.format(summary.average.quantize(Decimal("0.01"), ROUND_HALF_UP))
+        self._sum_line.setText(i18n.t("smart.sum", total=summary.total_text,
+                                      avg=avg, count=summary.count))
+        self._sum_line.show()
+        self._refresh_extra_rule()
+
+    def _smart_event(self, event) -> bool:
+        """보기 상태에서 날짜를 누르면 알림, 연락처를 누르면 복사."""
+        et = event.type()
+        if self._edit_mode:
+            return False
+        if et == QEvent.MouseMove and event.buttons() == Qt.NoButton:
+            if self._text.smart_at(event.position().toPoint()) is not None:
+                self._text.viewport().setCursor(Qt.PointingHandCursor)
+                return True
+            return False
+        if et == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+            hit = self._text.smart_at(event.position().toPoint())
+            self._smart_press = hit
+            if hit is not None:
+                event.accept()
+                return True
+            return False
+        if et == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+            pressed, self._smart_press = self._smart_press, None
+            if pressed is None:
+                return False
+            hit = self._text.smart_at(event.position().toPoint())
+            if hit is not None and hit.start == pressed.start:
+                if hit.kind == "date":
+                    self.dateReminderRequested.emit(self.note_id, hit.value, hit.has_time)
+                else:
+                    QGuiApplication.clipboard().setText(str(hit.value))
+                    self._flash_status(i18n.t("smart.copied", text=str(hit.value)), 1500)
+            event.accept()
+            return True
+        return False
+
+    # ── @이름 자동 완성 ──
+
+    def set_people(self, names: list[str]) -> None:
+        """'@' 뒤에 고를 수 있는 이름(참가자). 비어 있으면 자동 완성을 하지 않는다."""
+        self._people = [n for n in names if n]
+
+    def _mention_prefix(self) -> str | None:
+        """커서 바로 앞이 '@이름의 앞부분' 이면 그 앞부분(빈 글일 수 있다)."""
+        cursor = self._text.textCursor()
+        if cursor.hasSelection():
+            return None
+        block = cursor.block()
+        before = block.text()[:cursor.position() - block.position()]
+        found = re.search(r"(?:^|[^\w.@])@([^\s@]{0,12})$", before)
+        return found.group(1) if found else None
+
+    def _update_mention_list(self) -> None:
+        if not getattr(self, "_edit_mode", False) or not self._people:
+            self._hide_mention_list()
+            return
+        prefix = self._mention_prefix()
+        names = ([n for n in self._people if n.lower().startswith(prefix.lower())]
+                 if prefix is not None else [])
+        if not names or (len(names) == 1 and names[0] == prefix):
+            self._hide_mention_list()
+            return
+        from PySide6.QtWidgets import QListWidget
+        box = self._mention_list
+        if box is None:
+            box = self._mention_list = QListWidget(self)
+            box.setFocusPolicy(Qt.NoFocus)
+            box.setStyleSheet(
+                "QListWidget { background: #FFFFFF; border: 1px solid #D4D4D4;"
+                " border-radius: 6px; padding: 2px; font-size: 12px; outline: none; }"
+                "QListWidget::item { padding: 3px 8px; border-radius: 4px; color: #1F1F1F; }"
+                "QListWidget::item:selected { background: #F0F0F0; }")
+            box.itemClicked.connect(lambda item: self._accept_mention(item.text()))
+        box.clear()
+        box.addItems(names[:6])
+        box.setCurrentRow(0)
+        at = self._text.textCursor()
+        at.setPosition(max(0, at.position() - len(prefix) - 1))
+        rect = self._text.cursorRect(at)
+        top_left = self._text.viewport().mapTo(self, rect.bottomLeft())
+        row_h = box.sizeHintForRow(0) if box.count() else 22
+        box.resize(140, min(6, box.count()) * row_h + 6)
+        box.move(max(4, min(top_left.x(), self.width() - box.width() - 4)), top_left.y() + 2)
+        box.show()
+        box.raise_()
+
+    def _hide_mention_list(self) -> None:
+        if self._mention_list is not None:
+            self._mention_list.hide()
+
+    def mention_choices(self) -> list[str]:
+        """지금 떠 있는 이름 목록(시험용)."""
+        box = self._mention_list
+        if box is None or box.isHidden():
+            return []
+        return [box.item(i).text() for i in range(box.count())]
+
+    def _accept_mention(self, name: str) -> None:
+        prefix = self._mention_prefix()
+        if prefix is None:
+            return
+        cursor = self._text.textCursor()
+        cursor.movePosition(QTextCursor.Left, QTextCursor.KeepAnchor, len(prefix))
+        cursor.insertText(name + " ")
+        self._text.setTextCursor(cursor)
+        self._hide_mention_list()
+
+    def _mention_key(self, event) -> bool:
+        """이름 목록이 떠 있을 때의 키(위아래, Enter, Tab, Esc). 처리했으면 True."""
+        box = self._mention_list
+        if box is None or box.isHidden():
+            return False
+        key = event.key()
+        if key in (Qt.Key_Down, Qt.Key_Up):
+            row = box.currentRow() + (1 if key == Qt.Key_Down else -1)
+            box.setCurrentRow(max(0, min(box.count() - 1, row)))
+            return True
+        if key in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Tab):
+            item = box.currentItem()
+            if item is not None:
+                self._accept_mention(item.text())
+            return True
+        if key == Qt.Key_Escape:
+            self._hide_mention_list()
+            return True
+        return False
+
+    # ── 같은 줄 모아 세기 ──
+
+    def set_word_wrap(self, on: bool) -> None:
+        """자동 줄바꿈. 끄면 줄이 메모 폭에서 꺾이지 않고 가로로 굴러간다."""
+        self._wrap_on = bool(on)
+        mode = self._text.LineWrapMode
+        self._text.setLineWrapMode(mode.WidgetWidth if on else mode.NoWrap)
+        self._text.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff if on else Qt.ScrollBarAsNeeded)
+        if hasattr(self, "_widget_timer"):
+            self._widget_timer.start()
+
+    def word_wrap(self) -> bool:
+        return self._wrap_on
+
+    def set_tally(self, on: bool) -> None:
+        self._tally_on = bool(on)
+        self._refresh_tally()
+
+    def _refresh_tally(self) -> None:
+        if getattr(self, "_tally_line", None) is None:
+            return          # 아직 만드는 중이다
+        if not self._tally_on:
+            self._tally_line.hide()
+            self._refresh_extra_rule()
+            return
+        import html as _html
+        from .. import text_detect as td
+        rows = td.tally_lines(self._text.toPlainText().splitlines())
+        if not rows:
+            self._tally_line.hide()
+            self._refresh_extra_rule()
+            return
+        ink, soft = self._extra_ink
+        lines = [f'<span style="color:{soft}">{_html.escape(i18n.t("smart.tally"))}</span>']
+        for row in rows:
+            text = _html.escape(f"{row.item} {row.quantity}{row.unit}")
+            if row.names:
+                names = _html.escape(", ".join(row.names))
+                text += f'&nbsp;&nbsp;<span style="color:{soft}">{names}</span>'
+            lines.append(text)
+        self._tally_line.setText("<br>".join(lines))
+        self._tally_line.show()
+        self._refresh_extra_rule()
+
+    def _on_attached_range(self, start: int, end: int) -> None:
+        """파일을 글이나 표로 첨부했다. 그 범위의 저장용 목록 표시를 화면용으로."""
+        self._convert_loaded_markers(start, end)
+        self._text.sync_link_icons()
+
+    def set_attach_modes(self, overrides: dict | None) -> None:
+        self._text.set_attach_modes(overrides)
+
+    def add_clipboard(self, mime: QMimeData) -> None:
+        """클립보드에서 가져온 내용(글, 서식 있는 글, 그림, 파일)을 넣는다. 편집 중이
+        아니면 편집을 먼저 시작하고 잠금을 받은 뒤에 넣는다."""
+        self._pending_mime = mime
+        if self._edit_mode:
+            self._apply_pending_links()
+            return
+        if self.is_locked_by_other() or self._folded or self._fold_busy():
+            self._pending_mime = None
+            return
+        if not self._pending_lock:
+            self._request_edit()
+        if not self._pending_lock and not self._edit_mode:
+            self._pending_mime = None
+
     def _apply_pending_links(self) -> None:
+        mime, self._pending_mime = self._pending_mime, None
+        if mime is not None:
+            cursor = self._text.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            self._text.setTextCursor(cursor)
+            self._text.insertFromMimeData(mime)
+            if not self._pending_links:
+                if self._pending_commit is None:
+                    self._autosave_while_editing()
+                return
         paths, self._pending_links = self._pending_links, []
         if not paths:
             return
@@ -1044,12 +1714,14 @@ class StickyNoteWidget(QWidget):
 
     def show_lock_denied(self, holder: str) -> None:
         self._pending_lock = False
+        self._widget_delete_pending = []
+        self._pending_uncheck = False
         self._pending_check = None
         self._pending_drop = None
         self._pending_links = []
         self._abandon_grant = False
         self._text.setReadOnly(True)
-        self._lock_label.setText(i18n.t("sticky.lock_editing_by", holder=holder))
+        self._set_lock_text(i18n.t("sticky.lock_editing_by", holder=holder))
         # 손잡이 줄의 글자는 그대로 두고, 왜 편집이 안 되는지만 잠깐 알린다.
         self._show_overlay(i18n.t("sticky.lock_overlay", holder=holder))
 
@@ -1065,9 +1737,84 @@ class StickyNoteWidget(QWidget):
                   self._strike_btn, self._font_color_btn, self._highlight_btn,
                   self._list_btn, self._image_btn):
             b.setEnabled(enabled)
+        self._widget_btn.setEnabled(enabled and self._widgets_ok)
         self._format_bar.setVisible(
             enabled and not getattr(self, "_folded", False))
+        self._fit_edit_size(enabled)
         self._place_grip()
+
+    def _fit_edit_size(self, editing: bool) -> None:
+        """편집하는 동안은 서식 줄과 글 두어 줄이 들어가게 작은 메모를 잠시 넓힌다.
+        편집을 마치면, 그동안 크기를 손대지 않았을 때 원래 크기로 돌린다."""
+        if getattr(self, "_folded", False) or not hasattr(self, "_grip"):
+            return
+        if editing:
+            # 최소 크기를 올리면 Qt 가 창을 먼저 키우므로 원래 크기를 그 전에 잡는다.
+            before = QSize(self.size())
+            want = QSize(max(before.width(), config.EDIT_MIN_WIDTH),
+                         max(before.height(), config.EDIT_MIN_HEIGHT))
+            self.setMinimumSize(config.EDIT_MIN_WIDTH, config.EDIT_MIN_HEIGHT)
+            if want != before:
+                self._edit_restore = (before, QSize(want))
+                self.resize(want)
+            return
+        self.setMinimumSize(config.MIN_NOTE_WIDTH, config.MIN_NOTE_HEIGHT)
+        restore = getattr(self, "_edit_restore", None)
+        self._edit_restore = None
+        if restore is not None and self.size() == restore[1]:
+            self.resize(restore[0])
+
+    def _shared_size(self) -> tuple[int, int]:
+        """공유 PC 에 적어 둘 크기. 편집하느라 잠시 넓힌 크기는 보내지 않는다."""
+        restore = getattr(self, "_edit_restore", None)
+        if restore is not None and self.size() == restore[1]:
+            return restore[0].width(), restore[0].height()
+        return self.width(), self.height()
+
+    def fit_to_content(self) -> None:
+        """본문 높이에 맞춰 메모 높이를 줄이거나 늘린다(크기 조절 손잡이를 두 번 누르면).
+        한 줄짜리 메모는 그 한 줄만큼으로 줄고, 긴 메모는 화면 높이까지만 늘어난다."""
+        if self._folded or self._fold_busy():
+            return
+        doc = self._text.document()
+        margins = self._text.viewportMargins()
+        bar = self._format_bar.height() if self._format_bar.isVisible() else 0
+        want = math.ceil(4 + config.HANDLE_BAR_HEIGHT + margins.top() + margins.bottom()
+                         + doc.size().height() + bar)
+        avail = self._avail()
+        want = max(self.minimumHeight(), min(int(want), avail.height()))
+        self.resize(self.width(), want)
+        pos = self._pull_on_screen(self.pos(), self.size())
+        if pos != self.pos():
+            self.move(pos)
+            self._open_pos = QPoint(pos)
+            self.positionChanged.emit(self.note_id, pos.x(), pos.y())
+        self._edit_restore = None
+        self._local_size_set = True
+        self.sizeChanged.emit(self.note_id, self.width(), self.height())
+
+    def _widen_for_table(self) -> None:
+        """방금 넣은 표가 본문 폭을 넘으면 메모를 그만큼 넓힌다(화면 폭까지)."""
+        doc = self._text.document()
+        over = math.ceil(doc.size().width() - self._text.viewport().width())
+        if over <= 0:
+            return
+        avail = self._avail()
+        width = min(self.width() + over + 2, avail.width())
+        if width <= self.width():
+            return
+        self.resize(width, self.height())
+        pos = self._pull_on_screen(self.pos(), self.size())
+        if pos != self.pos():
+            self.move(pos)
+            self._open_pos = QPoint(pos)
+            self.positionChanged.emit(self.note_id, pos.x(), pos.y())
+        restore = getattr(self, "_edit_restore", None)
+        if restore is not None:
+            # 표 때문에 넓힌 폭은 편집을 마쳐도 그대로 둔다.
+            self._edit_restore = None
+        self._local_size_set = True
+        self.sizeChanged.emit(self.note_id, self.width(), self.height())
 
     def _place_grip(self) -> None:
         g = self._grip
@@ -1078,18 +1825,19 @@ class StickyNoteWidget(QWidget):
         if self._edit_mode:
             return
         if self._lock_holder is None:
-            self._lock_label.setText(
+            self._set_lock_text(
                 i18n.t("sticky.offline") if self._offline else "")
             self._overlay.hide()
             self._text.setReadOnly(True)
             self._set_format_bar_enabled(False)
         elif self._lock_holder == self._my_nickname:
-            self._lock_label.setText(i18n.t("sticky.lock_editing_self"))
+            self._set_lock_text(i18n.t("sticky.lock_editing_self"))
         else:
             # 누가 편집 중인지는 손잡이 줄에 적는다. 본문은 가리지 않는다.
-            self._lock_label.setText(
+            self._set_lock_text(
                 i18n.t("sticky.lock_editing_by", holder=self._lock_holder))
             self._set_format_bar_enabled(False)
+        self._fit_chips()
 
     def _show_overlay(self, text: str) -> None:
         """본문 가운데에 알림을 잠깐 띄운다."""
@@ -1156,6 +1904,7 @@ class StickyNoteWidget(QWidget):
         self._autosave_timer.stop()
         self._idle_save_timer.stop()
         self._edit_mode = False
+        self.update()
         self._text.setReadOnly(True)
         snapshot = self._edit_snapshot()
         unsent = snapshot[0] if snapshot != self._edit_baseline else None
@@ -1164,13 +1913,15 @@ class StickyNoteWidget(QWidget):
             self._pending_commit = unsent
             self._pending_commit_version = self.version
             self._content = unsent
-        self._lock_label.setText(i18n.t("sticky.offline") if self._offline else "")
+        self._set_lock_text(i18n.t("sticky.offline") if self._offline else "")
         self._set_format_bar_enabled(False)
         return unsent
 
     def cancel_pending_lock(self) -> None:
         """편집 요청을 들어줄 수 없다. 기다리는 상태를 푼다."""
         self._pending_lock = False
+        self._widget_delete_pending = []
+        self._pending_uncheck = False
         self._pending_check = None
         self._pending_drop = None
         self._pending_links = []
@@ -1184,7 +1935,475 @@ class StickyNoteWidget(QWidget):
             return None
         return self._pending_commit
 
+    # ── 메모 안 위젯 ──
+
+    def set_widget_env(self, ok: bool, games: bool, *, offline: bool = False) -> None:
+        """공유 PC 가 위젯을 아는가(모르면 그림으로만 보인다), 미니게임을 넣을 수 있는가.
+        끊긴 동안(``offline``)에도 그림으로만 보인다."""
+        self._widgets_ok = bool(ok)
+        self._widget_games = bool(games)
+        self._widget_btn.setEnabled(self._edit_mode and self._widgets_ok)
+        self._widget_btn.setToolTip(i18n.t("widget.menu") if self._widgets_ok
+                                    else i18n.t("sticky.offline") if offline
+                                    else i18n.t("widget.host_old"))
+        for block in self._widget_views.values():
+            block.set_readonly(not self._widgets_ok)
+        self._widget_timer.start()
+
+    def set_widget_data(self, widget_id: str, data: dict) -> None:
+        self._widget_data[widget_id] = data
+        block = self._widget_views.get(widget_id)
+        if block is not None:
+            block.set_data(data)
+            if not self._widgets_ok:
+                block.set_readonly(True)
+        self._widget_timer.start()
+
+    def widget_views(self) -> dict:
+        """본문 위에 놓인 위젯(시험용)."""
+        return dict(self._widget_views)
+
+    def widget_kinds(self) -> list[str]:
+        """넣을 수 있는 위젯 종류(미니게임은 설정에서 켰을 때만)."""
+        from .. import widgets
+        out = []
+        for name in widgets.kinds():
+            kind = widgets.get(name)
+            if kind is not None and (not kind.is_game or self._widget_games):
+                out.append(name)
+        return out
+
+    def _show_widget_gallery(self, at: QPoint | None = None) -> str | None:
+        """위젯을 고르는 판(그림과 이름의 칸). 고르면 넣고 그 종류를 돌려준다."""
+        if not self._edit_mode:
+            self._request_edit()
+            return None
+        if not self._widgets_ok:
+            return None
+        menu = edit_menu.new_menu(self)
+        gallery = WidgetGallery(self.widget_kinds(), menu)
+        chosen: dict = {}
+        gallery.picked.connect(lambda k: (chosen.update(kind=k), menu.close()))
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(gallery)
+        menu.addAction(action)
+        self._widget_gallery = gallery          # 시험이 쓴다
+        if at is None:
+            at = self._widget_btn.mapToGlobal(QPoint(0, -gallery.sizeHint().height() - 12))
+        edit_menu.run_menu(menu, at)
+        menu.deleteLater()
+        kind = chosen.get("kind")
+        if kind and self._edit_mode:
+            self.insert_widget(kind)
+        return kind
+
+    def insert_widget(self, name: str) -> str | None:
+        """커서가 있는 줄 아래(빈 줄이면 그 줄)에 위젯 칸을 넣는다. 정할 것이 있는 종류는
+        바로 설정 칸이 열린다."""
+        from .. import widgets
+        kind = widgets.get(name)
+        if kind is None or not self._edit_mode or not self._widgets_ok:
+            return None
+        data = kind.new_data(self._my_nickname)
+        wid = widgets.new_id()
+        cursor = self._text.textCursor()
+        cursor.clearSelection()
+        plain = RichTextEdit._plain_format(cursor.charFormat())
+        own = QTextBlockFormat(cursor.blockFormat())
+        for prop in (MARKER_PROP, LEVEL_PROP, SPACING_PROP):
+            own.clearProperty(prop)
+        own.setIndent(0)
+        own.setLeftMargin(0.0)
+        cursor.beginEditBlock()
+        try:
+            if cursor.block().length() > 1:
+                # 글을 가르지 않고 그 줄 끝에서 새 줄을 연다.
+                cursor.movePosition(QTextCursor.EndOfBlock)
+                cursor.insertBlock(own, plain)
+            else:
+                cursor.setBlockFormat(own)
+            cursor.insertText(wobj.CHAR, wobj.object_format(wid))
+            cursor.insertBlock(own, plain)
+        finally:
+            cursor.endEditBlock()
+        self._text.setTextCursor(cursor)
+        self._text.setCurrentCharFormat(plain)
+        self._widget_data[wid] = data
+        self.widgetCreated.emit(self.note_id, wid, data)
+        self._sync_widget_views()
+        block = self._widget_views.get(wid)
+        if block is not None and wants_setup(name):
+            block.open_setup(first=True)
+            self._sync_widget_views()
+        # 기본 크기 메모에서도 위젯이 잘리지 않게 메모를 키운다.
+        self._make_room_for_widget(wid)
+        return wid
+
+    def delete_widget(self, wid: str) -> None:
+        """본문에서 위젯을 뺀다(본문을 고치므로 편집을 받은 뒤에)."""
+        if not self._edit_mode:
+            if self.is_locked_by_other() or self._notice_blocks_me():
+                return              # 편집을 받을 수 없다. 나중에 몰래 지우지 않는다.
+            if wid not in self._widget_delete_pending:
+                self._widget_delete_pending.append(wid)
+            self._request_edit()
+            return
+        for found, pos, _fmt in wobj.find_objects(self._text.document()):
+            if found != wid:
+                continue
+            cursor = QTextCursor(self._text.document())
+            cursor.beginEditBlock()
+            cursor.setPosition(pos)
+            cursor.setPosition(pos + 1, QTextCursor.KeepAnchor)
+            cursor.removeSelectedText()
+            # 위젯만 있던 빈 줄도 함께 뺀다.
+            if cursor.block().length() <= 1 and cursor.block().next().isValid():
+                cursor.deleteChar()
+            cursor.endEditBlock()
+            break
+        block = self._widget_views.pop(wid, None)
+        if block is not None:
+            block.hide()
+            block.deleteLater()
+        self._widget_sizes.pop(wid, None)
+        if self._pending_commit is None:
+            self._autosave_while_editing()
+
+    def _widget_copy_picture(self, wid: str) -> str:
+        """복사하는 위젯의 그림(data URL). 다른 메모에 붙이면 이 그림이 들어간다."""
+        for found, _pos, fmt in wobj.find_objects(self._text.document()):
+            if found == wid:
+                try:
+                    return self._widget_picture(wid, fmt)[0] or ""
+                except Exception:       # 그림을 못 만들면 그림 없이 복사한다
+                    return ""
+        return ""
+
+    def _apply_pending_widget_deletes(self) -> None:
+        pending, self._widget_delete_pending = self._widget_delete_pending, []
+        for wid in pending:
+            self.delete_widget(wid)
+
+    def _widget_column(self) -> int:
+        """본문 글 칸의 폭. 굴리는 막대가 보이든 말든 같은 값이다(막대가 나타났다
+        사라지며 위젯 폭이 흔들리지 않게 막대 자리를 늘 뺀다)."""
+        doc = self._text.document()
+        width = self._text.viewport().width() - 2 * int(doc.documentMargin())
+        bar = self._text.verticalScrollBar()
+        if bar.isVisible():
+            width += bar.width()
+        return width - max(8, bar.sizeHint().width())
+
+    # 위젯이 그려지는 가장 좁은 폭. 메모가 더 좁으면 위젯을 넣을 때 메모를 넓힌다.
+    _WIDGET_MIN = 160
+    # 위젯을 넣을 때 메모 글 칸이 이만큼은 되게 넓힌다.
+    _WIDGET_ROOM = 220
+
+    def _widget_fit_width(self) -> int:
+        """'메모 폭에 맞춤' 의 폭(글 칸 폭, 560 까지)."""
+        return max(self._WIDGET_MIN, min(560, self._widget_column()))
+
+    def _widget_max_width(self) -> int:
+        """위젯은 글 칸보다 넓어지지 않는다(넓게 정해 두어도 메모 폭까지)."""
+        return max(self._WIDGET_MIN, self._widget_column())
+
+    def _make_room_for_widget(self, wid: str) -> None:
+        """위젯이 다 보이도록 메모를 키우고(화면 안에서) 그 자리로 굴린다. 줄이지는 않는다."""
+        size = self._widget_sizes.get(wid)
+        if size is None or self.is_folded():
+            return
+        geo = self.geometry()
+        screen = self.screen()
+        area = screen.availableGeometry() if screen is not None else geo
+        grow_w = max(0, self._WIDGET_ROOM - self._widget_column())
+        grow_h = max(0, size[1] + 16 - self._text.viewport().height())
+        new_w = max(geo.width(), min(geo.width() + grow_w, area.right() - geo.left() + 1))
+        new_h = max(geo.height(), min(geo.height() + grow_h, area.bottom() - geo.top() + 1))
+        if (new_w, new_h) != (geo.width(), geo.height()):
+            self.resize(new_w, new_h)
+            self._sync_widget_views()
+        self._scroll_to_widget(wid)
+
+    def _scroll_to_widget(self, wid: str) -> None:
+        block = self._widget_views.get(wid)
+        if block is None:
+            return
+        bar = self._text.verticalScrollBar()
+        rect = block.geometry()
+        view_h = self._text.viewport().height()
+        if rect.bottom() > view_h:
+            bar.setValue(bar.value() + min(rect.bottom() - view_h + 8, rect.top()))
+        elif rect.top() < 0:
+            bar.setValue(bar.value() + rect.top() - 8)
+
+    def _widget_png(self, kind, data: dict, wid: str, width: int) -> bytes:
+        """저장용 위젯 그림(위젯 id 와 이름을 품은 PNG). 보는 사람과 상관없는 모습이다."""
+        from datetime import date
+        from .. import widgets
+        img = kind.render(data, width, viewer="", today=date.today(), background=self.color)
+        return widgets.to_png(img, wid, label=widgets.label_of(data))
+
+    def _widget_picture(self, wid: str, fmt) -> tuple[str, int, int]:
+        """저장할 때 위젯 칸 대신 적을 그림: (data URL, 폭, 높이). 같은 모습이면 앞서
+        그린 것을 쓴다(저장 내용이 괜히 바뀌지 않게)."""
+        import json
+        from datetime import date
+        from .. import widgets
+        data = self._widget_data.get(wid)
+        kind = widgets.usable_kind(data) if data is not None else None
+        size = self._widget_sizes.get(wid)
+        if kind is not None:
+            width = size[0] if size else self._widget_fit_width()
+            try:
+                key = (json.dumps(data, sort_keys=True, ensure_ascii=False), width,
+                       self.color, date.today().isoformat())
+            except (TypeError, ValueError):
+                key = None
+            cached = self._widget_shots.get(wid)
+            if key is not None and cached is not None and cached[0] == key:
+                return cached[1]
+            png = self._widget_png(kind, data, wid, width)
+            image = QImage.fromData(png)
+            if not image.isNull():
+                out = (widgets.to_data_url(png), image.width(), image.height())
+                if key is not None:
+                    self._widget_shots[wid] = (key, out)
+                return out
+        # 그릴 수 있는 데이터가 없다(받기 전, 새 판의 데이터). 마지막으로 그린 그림이나
+        # 저장돼 있던 그림을 그대로 둔다.
+        cached = self._widget_shots.get(wid)
+        if cached is not None:
+            return cached[1]
+        url = fmt.property(wobj.P_URL) if fmt is not None else None
+        if isinstance(url, str) and url:
+            w, h = wobj.stored_size(fmt)
+            return url, w, h
+        # 데이터도 그림도 없다(받기 전). 빈 틀이라도 id 를 품은 그림으로 남긴다.
+        from ..widgets.base import Ctx
+        from ..widgets.draw import blank
+        img = blank(240, i18n.t("widget.menu"), Ctx())
+        png = widgets.to_png(img, wid)
+        return widgets.to_data_url(png), img.width(), img.height()
+
+    def _widget_object_rect(self, pos: int, width: int, height: int) -> QRect:
+        """본문 위치 ``pos`` 의 위젯 칸이 뷰포트에서 차지하는 자리."""
+        doc = self._text.document()
+        tb = doc.findBlock(pos)
+        layout_rect = doc.documentLayout().blockBoundingRect(tb)    # 배치를 마치게 한다
+        layout = tb.layout()
+        rel = pos - tb.position()
+        line = layout.lineForTextPosition(rel) if layout is not None else None
+        if line is None or not line.isValid():
+            cursor = QTextCursor(doc)
+            cursor.setPosition(pos)
+            rect = self._text.cursorRect(cursor)
+            return QRect(rect.left(), rect.bottom() - height + 1, width, height)
+        x = line.cursorToX(rel)
+        if isinstance(x, tuple):
+            x = x[0]
+        # 위젯 칸은 줄의 기준선 위에 선다(칸의 바닥이 기준선).
+        top = layout_rect.y() + line.y() + line.ascent() - height
+        left = layout_rect.x() + x
+        dx = self._text.horizontalScrollBar().value()
+        dy = self._text.verticalScrollBar().value()
+        return QRect(int(round(left - dx)), int(round(top - dy)), width, height)
+
+    def _place_widget_views(self) -> None:
+        """위젯 칸이 있는 자리에 위젯을 옮긴다(크기는 그대로). 가벼워서 본문이 다시 놓일
+        때마다 부른다."""
+        if not self._widget_views or self._widget_fixing or self._placing_widgets:
+            return
+        self._placing_widgets = True
+        try:
+            seen: set[str] = set()
+            for wid, pos, _fmt in wobj.find_objects(self._text.document()):
+                if wid in seen:
+                    continue
+                seen.add(wid)
+                block = self._widget_views.get(wid)
+                size = self._widget_sizes.get(wid)
+                if block is None or size is None:
+                    continue
+                rect = self._widget_object_rect(pos, *size)
+                if block.geometry() != rect:
+                    block.setGeometry(rect)
+        finally:
+            self._placing_widgets = False
+
+    def _sync_widget_views(self) -> None:
+        """본문의 위젯 칸마다 그 자리에 위젯을 놓는다. 위젯의 폭이나 높이가 바뀌면 칸의
+        크기만 고친다(본문은 그대로다). 데이터를 모르는 위젯은 저장된 그림이 보인다.
+        같은 위젯이 두 번 들어 있으면(복사) 앞의 것만 위젯이다."""
+        from datetime import date
+        from .. import widgets
+        if self._widget_fixing:
+            return
+        doc = self._text.document()
+        viewport = self._text.viewport()
+        fit = self._widget_fit_width()
+        most = self._widget_max_width()
+        placed: list[tuple[str, int]] = []
+        dirty: list[int] = []
+        seen: set[str] = set()
+        for wid, pos, _fmt in wobj.find_objects(doc):
+            if wid in seen:
+                continue
+            data = self._widget_data.get(wid)
+            kind = widgets.usable_kind(data) if data is not None else None
+            if kind is None:
+                continue
+            seen.add(wid)
+            block = self._widget_views.get(wid)
+            if block is None:
+                block = WidgetBlock(kind, data, self._my_nickname, date.today(),
+                                    background=self.color,
+                                    can_delete=not self._notice_blocks_me(), parent=viewport)
+                block.opRequested.connect(
+                    lambda op, w=wid: self.widgetOp.emit(self.note_id, w, op))
+                block.sizeChanged.connect(self._widget_timer.start)
+                block.roomWanted.connect(lambda w=wid: self._widget_room.add(w))
+                block.deleteRequested.connect(lambda w=wid: self.delete_widget(w))
+                self._widget_views[wid] = block
+                block.set_readonly(not self._widgets_ok)
+                dirty.append(pos)        # 저장된 그림 대신 위젯이 보이게 다시 그린다
+            width = block.wanted_width() or fit
+            width = max(self._WIDGET_MIN, min(width, most))
+            need = block.content_height(width)
+            if self._widget_sizes.get(wid) != (width, need):
+                self._widget_sizes[wid] = (width, need)
+                dirty.append(pos)
+            placed.append((wid, pos))
+        for wid in list(self._widget_sizes):
+            if wid not in seen:
+                self._widget_sizes.pop(wid, None)
+        if dirty:
+            self._widget_fixing = True
+            try:
+                for pos in sorted(set(dirty), reverse=True):
+                    doc.markContentsDirty(pos, 1)
+            finally:
+                self._widget_fixing = False
+        for wid, pos in placed:
+            block = self._widget_views[wid]
+            width, need = self._widget_sizes[wid]
+            block.setGeometry(self._widget_object_rect(pos, width, need))
+            block.show()
+        # 설정 칸이 열리거나 커진 위젯은 다 보이게 메모를 키운다.
+        room, self._widget_room = self._widget_room, set()
+        for wid in room:
+            if wid in self._widget_views:
+                self._make_room_for_widget(wid)
+        for wid in list(self._widget_views):
+            if wid not in seen:
+                view = self._widget_views.pop(wid)
+                view.hide()
+                view.deleteLater()
+
+    # ── 프로그램 창에 붙이기(실험) ──
+
+    def set_attached(self, label: str | None, *, can_attach: bool = False) -> None:
+        """붙은 창의 이름(없으면 붙지 않음). ``can_attach`` 는 설정에서 켰는가."""
+        self._attached = bool(label)
+        self._can_attach = bool(can_attach)
+        self._attach_full = label or ""
+        self._attach_chip.setText(self._attach_full)
+        self._attach_chip.setToolTip(i18n.t("attach_win.tip", name=label or ""))
+        self._attach_chip.setVisible(self._attached)
+        self._fit_chips()
+        if not self._attached:
+            self._apply_z_order(initial=True)
+
+    def is_attached(self) -> bool:
+        return self._attached
+
+    def _show_window_menu(self) -> None:
+        """붙은 창 이름표의 메뉴: 창에서 떼기."""
+        menu = edit_menu.new_menu(self)
+        add_centered_menu_action(menu, svg_icon("close", color="#3A3A3A"),
+                                 i18n.t("attach_win.detach"),
+                                 lambda: self.detachRequested.emit(self.note_id))
+        edit_menu.run_menu(menu, self._attach_chip.mapToGlobal(
+            QPoint(0, self._attach_chip.height())))
+        menu.deleteLater()
+
+    def _apply_head_ink(self, ink: str, dark: bool) -> None:
+        """머리 줄과 본문 아래 칸의 새 요소 색(어두운 메모에서는 밝게)."""
+        self._head_ink = ink
+        soft = "#B8B8B8" if dark else "#6B6B6B"
+        hover = "rgba(255, 255, 255, 0.16)" if dark else "rgba(0, 0, 0, 0.06)"
+        for chip in (self._remind_chip, self._reset_chip, self._read_chip):
+            chip.set_ink(ink, dark)
+        self._notice_label.setStyleSheet(
+            f"color: {ink}; font-size: 11px; font-weight: 700; background: transparent;"
+            " padding: 0px;")
+        self._attach_chip.setIcon(svg_icon("window", color=ink))
+        self._attach_chip.setStyleSheet(
+            f"QToolButton {{ border: none; background: transparent; color: {ink};"
+            " font-size: 11px; padding: 0px 3px; }"
+            f"QToolButton:hover {{ background: {hover}; border-radius: 4px; }}")
+        line = "rgba(255, 255, 255, 0.16)" if dark else "rgba(0, 0, 0, 0.08)"
+        self._extra_rule.setStyleSheet(f"background: {line}; border: none;")
+        self._extra_ink = (ink, soft)
+        style = (f"color: {ink}; font-size: 11px; background: transparent;"
+                 " padding: 3px 12px 3px 23px;")
+        self._sum_line.setStyleSheet(style)
+        self._tally_line.setStyleSheet(style)
+        if self._notice_icon:
+            self._notice_label.setPixmap(svg_icon("info", color=ink).pixmap(13, 13))
+        if self._tally_on:
+            self._refresh_tally()
+
+    def _refresh_extra_rule(self) -> None:
+        self._extra_rule.setVisible(not self._sum_line.isHidden()
+                                    or not self._tally_line.isHidden())
+
+    def _flash_status(self, text: str, ms: int) -> None:
+        """머리 줄의 상태 글 자리에 잠깐 알린다(편집 중 같은 원래 글은 뒤에 되돌린다)."""
+        if not self._flash_text:
+            self._flash_saved = self._lock_label.text()
+        self._flash_text = text
+        self._set_lock_text(text)
+        self._flash_timer.start(ms)
+
+    def _end_flash_status(self) -> None:
+        if self._flash_text and self._lock_label.text() == self._flash_text:
+            self._set_lock_text(getattr(self, "_flash_saved", ""))
+        self._flash_text = ""
+
+    # ── 공지 ──
+
+    def set_notice(self, owner: str | None, *, can_make: bool = False,
+                   can_lift: bool = False, read_text: str = "", read_short: str = "") -> None:
+        """공지인가(만든 사람의 이름), 공지로 만들 수 있는가, 풀 수 있는가, 내 공지면
+        본 사람 수 글(긴 꼴과 짧은 꼴)."""
+        self._notice_owner = owner or None
+        self._notice_can_make = bool(can_make)
+        self._notice_can_lift = bool(can_lift)
+        self._notice_label.setVisible(bool(owner))
+        self._read_chip.set_forms([read_text, read_short] if read_text else [])
+        self._read_chip.setVisible(bool(read_text))
+        self._read_chip.setToolTip(read_text)
+        self._fit_chips()
+
+    def notice_owner(self) -> str | None:
+        return self._notice_owner
+
+    def _notice_blocks_me(self) -> bool:
+        return bool(self._notice_owner) and self._notice_owner != self._my_nickname
+
+    def _show_notice_line(self) -> None:
+        self._flash_status(i18n.t("notice.only_owner", name=self._notice_owner or ""), 3000)
+
+    def _on_view_timer(self) -> None:
+        if (self.isVisible() and not self._folded
+                and self.rect().contains(self.mapFromGlobal(QCursor.pos()))):
+            self.viewed.emit(self.note_id)
+
     def _request_edit(self) -> None:
+        if self._notice_blocks_me():
+            # 남의 공지다. 고치지 않고 까닭을 한 줄로.
+            self._show_notice_line()
+            return
         if self._edit_mode or self._pending_lock:
             # 뷰어를 연 뒤 응답이 오기 전에 다시 눌렀다면 편집하려는 뜻이다.
             self._abandon_grant = False
@@ -1201,6 +2420,7 @@ class StickyNoteWidget(QWidget):
         self._autosave_timer.stop()
         self._idle_save_timer.stop()
         self._edit_mode = False
+        self.update()
         self._text.setReadOnly(True)
         snapshot = self._edit_snapshot()
         # baseline 과 같으면 updated_at·이력 행을 건드리지 않도록 전송을 건너뛴다.
@@ -1211,11 +2431,11 @@ class StickyNoteWidget(QWidget):
             self._content = new_content
             self.commitEdit.emit(
                 self.note_id, new_content, self.color,
-                self.width(), self.height(), version,
+                *self._shared_size(), version,
             )
         self._edit_baseline = None
         self.releaseLock.emit(self.note_id)
-        self._lock_label.setText(i18n.t("sticky.offline") if self._offline else "")
+        self._set_lock_text(i18n.t("sticky.offline") if self._offline else "")
         self._set_format_bar_enabled(False)
 
     def _on_body_changed(self) -> None:
@@ -1248,7 +2468,7 @@ class StickyNoteWidget(QWidget):
         self._content = new_content
         self.commitEdit.emit(
             self.note_id, new_content, self.color,
-            self.width(), self.height(), version,
+            *self._shared_size(), version,
         )
         # baseline 을 굴려 이후 idle 자동 저장 tick 도 no-op 이 되게 한다.
         self._edit_baseline = snapshot
@@ -1445,11 +2665,19 @@ class StickyNoteWidget(QWidget):
             add_centered_menu_action(
                 menu, svg_icon(icon, color=ink) if icon else None, text, handler)
 
+        # 보이는 모양: 투명도와 자동 줄바꿈.
+        self._add_opacity_row(menu)
+        add_centered_menu_action(
+            menu, svg_icon("wrap", color=ink), i18n.t("sticky.more_wrap"),
+            lambda: self.wrapToggled.emit(self.note_id, not self._wrap_on),
+            checked=self._wrap_on)
+        menu.addSeparator()
         add("eye_off", i18n.t("sticky.more_hide"),
             lambda: self.hideRequested.emit(self.note_id))
         add("clock", i18n.t("sticky.tip_history"),
             lambda: self.historyRequested.emit(self.note_id))
         menu.addSeparator()
+        # 놓는 자리: 접기와 프로그램 창에 붙이기.
         if self._dock:
             # 벽에 붙여 둔 메모는 접으면 늘 그 자리의 탭으로 돌아간다.
             add("fold", i18n.t("sticky.tip_fold"), self.fold)
@@ -1458,15 +2686,437 @@ class StickyNoteWidget(QWidget):
                 lambda: self.fold(style=nf.FOLD_SLIP))
             add("note", i18n.t("sticky.more_fold_icon"),
                 lambda: self.fold(style=nf.FOLD_ICON))
+        if self._attached:
+            add("window", i18n.t("attach_win.detach"),
+                lambda: self.detachRequested.emit(self.note_id))
+        elif self._can_attach:
+            add("window", i18n.t("attach_win.menu"),
+                lambda: self.attachRequested.emit(self.note_id))
         menu.addSeparator()
+        add("bell", i18n.t("sticky.more_reminder"),
+            lambda: self.reminderRequested.emit(self.note_id))
+        if self.todo_progress() or not self._reset_chip.isHidden():
+            # 할 일(체크 상자)이 있는 메모에만 둔다. 예약을 지울 수 있게 걸어 둔 것은 남긴다.
+            add("check_reset", i18n.t("sticky.more_check_reset"),
+                lambda: self.checkResetRequested.emit(self.note_id))
+        add_centered_menu_action(
+            menu, svg_icon("tally", color=ink), i18n.t("smart.tally_toggle"),
+            lambda: self.tallyToggled.emit(self.note_id, not self._tally_on),
+            checked=self._tally_on)
+        menu.addSeparator()
+        # 누가 보는가: 나만 보기와 공지.
         add("lock", i18n.t("sticky.more_private_off") if is_private
             else i18n.t("sticky.more_private_on"),
             lambda: self.privateToggleRequested.emit(self.note_id, not is_private))
+        if self._notice_owner and (self._notice_can_lift
+                                   or self._notice_owner == self._my_nickname):
+            add("info", i18n.t("notice.lift"),
+                lambda: self.noticeRequested.emit(self.note_id, False))
+        elif not self._notice_owner and self._notice_can_make:
+            add("info", i18n.t("notice.make"),
+                lambda: self.noticeRequested.emit(self.note_id, True))
         menu.addSeparator()
-        add("trash", i18n.t("sticky.more_delete"),
-            lambda: self.deleteRequested.emit(self.note_id))
-        edit_menu.run_menu(menu, self._more_btn.mapToGlobal(
-            QPoint(0, self._more_btn.height())))
+        add("printer", i18n.t("print.menu_print"),
+            lambda: self.printRequested.emit(self.note_id, "print"))
+        add("download", i18n.t("print.menu_pdf"),
+            lambda: self.printRequested.emit(self.note_id, "pdf"))
+        if not self._notice_blocks_me():
+            menu.addSeparator()
+            add("trash", i18n.t("sticky.more_delete"),
+                lambda: self.deleteRequested.emit(self.note_id))
+        start = self._opacity
+        self._opacity_preview = True
+        try:
+            edit_menu.run_menu(menu, self._more_btn.mapToGlobal(
+                QPoint(0, self._more_btn.height())))
+        finally:
+            self._opacity_preview = False
+            self.update()
+        if self._opacity != start:
+            self.opacityChanged.emit(self.note_id, self._opacity)
+
+    def _add_opacity_row(self, menu: QMenu) -> None:
+        """투명도(0 ~ 80%, 5 단위)를 고르는 한 줄. 고르는 대로 메모에 보인다."""
+        box = QWidget(menu)
+        box.setStyleSheet("background: transparent;")
+        row = QHBoxLayout(box)
+        # 그림 칸(40)과 글의 세로줄을 다른 메뉴 항목과 맞춘다.
+        row.setContentsMargins(4, 5, 12, 5)
+        row.setSpacing(0)
+        mark = QLabel(box)
+        mark.setFixedWidth(40)
+        mark.setAlignment(Qt.AlignCenter)
+        mark.setPixmap(svg_icon("opacity", color="#3A3A3A").pixmap(16, 16))
+        row.addWidget(mark)
+        label = QLabel(i18n.t("sticky.more_transparency"), box)
+        slider = QSlider(Qt.Horizontal, box)
+        slider.setRange(0, (100 - config.MIN_NOTE_OPACITY) // 5)
+        slider.setPageStep(2)
+        slider.setFixedWidth(120)
+        slider.setAccessibleName(i18n.t("sticky.more_transparency"))
+        slider.setValue((100 - self._opacity) // 5)
+        value = QLabel(box)
+        value.setMinimumWidth(34)
+        value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        def show(step: int) -> None:
+            value.setText(f"{step * 5}%")
+            self.set_opacity(100 - step * 5)
+
+        slider.valueChanged.connect(show)
+        show(slider.value())
+        row.addWidget(label)
+        row.addSpacing(10)
+        row.addWidget(slider)
+        row.addSpacing(10)
+        row.addWidget(value)
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(box)
+        menu.addAction(action)
+
+    # ── 알림과 체크 해제 예약 ──
+
+    def _set_lock_text(self, text: str) -> None:
+        """머리 줄의 상태 글(편집 중, 연결 끊김). 자리가 바뀌니 표시를 다시 맞춘다."""
+        self._lock_label.setText(text)
+        self._fit_chips()
+
+    def _make_chip(self, icon: str, handler) -> _ScheduleChip:
+        chip = _ScheduleChip(icon, self._handle)
+        chip.clicked.connect(handler)
+        chip.hide()
+        return chip
+
+    def set_schedule(self, reminder="", reminder_tip: str = "",
+                     reset="", reset_tip: str = "") -> None:
+        """머리 줄에 다음 알림과 다음 체크 해제 때를 적는다. 때는 글 하나나 긴
+        것부터 짧은 것까지의 꼴 목록이다. 비어 있으면 감춘다."""
+        for chip, forms, tip in ((self._remind_chip, reminder, reminder_tip),
+                                 (self._reset_chip, reset, reset_tip)):
+            chip.set_forms([forms] if isinstance(forms, str) else list(forms or ()))
+            text = chip.full_text()
+            chip.setToolTip(tip or text)
+            chip.setAccessibleName(tip or text)
+            chip.setVisible(bool(text))
+        self._fit_chips()
+        if self._folded:
+            self.update()              # 접힌 모양의 종
+
+    def has_reminder(self) -> bool:
+        """다음 알림이 걸려 있는가(접힌 모양에 종을 그린다)."""
+        return bool(self._remind_chip.full_text())
+
+    _SHAKE_MS = 460
+
+    def shake(self) -> None:
+        """알림이 왔을 때 접힌 메모를 좌우로 살짝 흔든다(어느 메모인지 보이게).
+        움직임을 끈 PC에서는 흔들지 않는다."""
+        if (not self.isVisible() or not self._folded or self._fold_busy()
+                or getattr(self, "_shake_anim", None) is not None
+                or not nf.system_animations_enabled()):
+            return
+        home = QPoint(self.pos())
+        anim = QVariantAnimation(self)
+        anim.setDuration(self._SHAKE_MS)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+
+        def step(t) -> None:
+            # 세 번 오가며 줄어드는 흔들림(5px 에서 0).
+            dx = round(5 * (1.0 - float(t)) * math.sin(float(t) * math.pi * 6))
+            self.move(home.x() + dx, home.y())
+
+        def done() -> None:
+            self.move(home)
+            self._shake_anim = None
+        anim.valueChanged.connect(step)
+        anim.finished.connect(done)
+        self._shake_anim = anim
+        anim.start()
+
+    def schedule_texts(self) -> tuple[str, str]:
+        """머리 줄의 (다음 알림, 다음 체크 해제) 때(긴 꼴). 시험용."""
+        return (self._remind_chip.full_text() if not self._remind_chip.isHidden() else "",
+                self._reset_chip.full_text() if not self._reset_chip.isHidden() else "")
+
+    def schedule_levels(self) -> tuple[int, int]:
+        """머리 줄 표시가 얼마나 줄었는가(0 이 가장 긴 꼴). 시험용."""
+        return self._remind_chip.level(), self._reset_chip.level()
+
+    # 붙은 창 이름을 줄여 둘 폭(처음 96, 그림으로 바꾸기 전 40 까지).
+    _ATTACH_MAX = 96
+    _ATTACH_MIN = 40
+
+    def _attach_text_pad(self) -> int:
+        """붙은 창 칩에서 글을 뺀 폭(그림, 사이, 여백). 단추에서 한 번 잰다."""
+        pad = getattr(self, "_attach_pad", None)
+        if pad is None:
+            chip = self._attach_chip
+            text, style = chip.text(), chip.toolButtonStyle()
+            chip.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+            chip.setText("M")
+            pad = chip.sizeHint().width() - chip.fontMetrics().horizontalAdvance("M")
+            chip.setText(text)
+            chip.setToolButtonStyle(style)
+            self._attach_pad = pad
+        return pad
+
+    def _fit_chips(self) -> None:
+        """머리 줄이 좁으면 차례로 줄인다. 단추를 밀어내거나 눌러 찌그러뜨리지 않는다.
+
+        1. 붙은 창 이름을 줄임표로(96px 까지)
+        2. 체크 해제, 알림 때를 차례로 짧은 꼴로
+        3. 읽음을 짧은 꼴로('3/5')
+        4. 붙은 창 이름을 남은 자리만큼(40px 까지), 그다음 그림만으로
+        5. 더 보기 메뉴에도 있는 기록 단추, 그다음 접기 단추를 감춘다
+        6. 체크 해제, 알림을 그림만으로
+        7. 체크 해제, 알림, 읽음, 붙은 창을 차례로 감춘다
+        8. '공지' 를 그림으로(말풍선에 글)
+        좁힐수록 줄기만 한다(뒤 단계에서 자리가 남아도 앞 단계를 되돌리지 않는다).
+        '공지', 색, 더 보기, 닫기는 줄이거나 감추지 않는다."""
+        if getattr(self, "_close_btn", None) is None:
+            return      # 아직 만드는 중이다
+        row = self._handle.layout()
+        m = row.contentsMargins()
+        gap = row.spacing()
+        fixed = m.left() + m.right()
+        for w in (self._private_icon, self._color_btn, self._more_btn, self._close_btn):
+            if not w.isHidden():
+                fixed += w.sizeHint().width() + gap
+        if self._lock_label.text():
+            fixed += self._lock_label.sizeHint().width()
+        room = self._handle.width() - fixed
+        chips = [c for c in (self._remind_chip, self._reset_chip) if c.full_text()]
+        read = self._read_chip if self._read_chip.full_text() else None
+        spare = (self._fold_btn, self._history_btn)     # 기록부터 감춘다
+        fm = QFontMetrics(self._attach_chip.font())
+        attach_text = self._attach_full if self._attached else ""
+        notice = bool(self._notice_owner)
+        nfm = QFontMetrics(self._notice_label.font())
+        notice_text = i18n.t("notice.label")
+
+        st = {"attach": "full" if attach_text else "none", "levels": [0] * len(chips),
+              "read": 0, "keep": len(spare), "notice": "text"}
+
+        pad = self._attach_text_pad() if attach_text else 0
+
+        def attach_w() -> int:
+            mode = st["attach"]
+            if mode in ("none", "hidden"):
+                return 0
+            if mode == "icon":
+                return 13 + 6 + 4             # 그림, 여백
+            text_w = fm.horizontalAdvance(attach_text)
+            if mode == "elided":
+                text_w = min(text_w, st.get("attach_max", self._ATTACH_MAX))
+            elif mode == "flex":
+                text_w = min(text_w, self._ATTACH_MIN)
+            return pad + text_w
+
+        def need() -> int:
+            n = 0
+            if notice:
+                n += (13 if st["notice"] == "icon" else nfm.horizontalAdvance(notice_text)) + gap
+            w = attach_w()
+            if w:
+                n += w + gap
+            for c, lv in zip(chips, st["levels"]):
+                cw = c.width_at(lv)
+                if cw:
+                    n += cw + gap
+            if read is not None:
+                rw = read.width_at(st["read"])
+                if rw:
+                    n += rw + gap
+            n += sum(b.sizeHint().width() + gap for b in spare[:st["keep"]])
+            return n
+
+        def steps():
+            if st["attach"] == "full":
+                st["attach"] = "elided"
+                yield
+            # 짧은 꼴로(그림만 앞까지). 체크 해제 쪽부터.
+            for i in reversed(range(len(chips))):
+                c = chips[i]
+                while st["levels"][i] < c.levels() - 2:
+                    st["levels"][i] += 1
+                    yield
+            if read is not None and read.levels() > 2:
+                st["read"] = 1
+                yield
+            if st["attach"] == "elided":
+                st["attach"] = "flex"                  # 남은 자리만큼(아래에서 정한다)
+                yield
+                st["attach"] = "icon"
+                yield
+            while st["keep"] > 0:
+                st["keep"] -= 1
+                yield
+            for i in reversed(range(len(chips))):     # 그림만(체크 해제 쪽부터)
+                st["levels"][i] = chips[i].levels() - 1
+                yield
+            for i in reversed(range(len(chips))):     # 체크 해제, 알림 차례로 감춤
+                st["levels"][i] = chips[i].levels()
+                yield
+            if read is not None:
+                st["read"] = read.levels()
+                yield
+            if st["attach"] == "icon":
+                st["attach"] = "hidden"
+                yield
+            if notice:
+                st["notice"] = "icon"
+                yield
+
+        if need() > room:
+            for _ in steps():
+                if need() <= room:
+                    break
+            if st["attach"] == "flex":
+                # 붙은 창 이름은 남은 자리만큼(40 에서 96 사이) 줄임표로.
+                st["attach_max"] = min(self._ATTACH_MAX,
+                                       self._ATTACH_MIN + max(0, room - need()))
+                st["attach"] = "elided"
+        for c, lv in zip(chips, st["levels"]):
+            c.set_level(lv)
+        if read is not None:
+            read.set_level(st["read"])
+        for i, b in enumerate(spare):
+            b.setVisible(i < st["keep"])
+        mode = st["attach"]
+        if mode in ("full", "elided"):
+            shown = (attach_text if mode == "full"
+                     else fm.elidedText(attach_text, Qt.ElideRight,
+                                        st.get("attach_max", self._ATTACH_MAX)))
+            self._attach_chip.setText(shown)
+            self._attach_chip.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        else:
+            self._attach_chip.setText("")
+            self._attach_chip.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self._attach_chip.setVisible(self._attached and mode not in ("none", "hidden"))
+        if self._attach_chip.isVisible():
+            self._attach_chip.setFixedWidth(attach_w())
+        icon_mode = notice and st["notice"] == "icon"
+        if icon_mode != self._notice_icon:
+            self._notice_icon = icon_mode
+            if icon_mode:
+                self._notice_label.setPixmap(
+                    svg_icon("info", color=self._head_ink).pixmap(13, 13))
+            else:
+                self._notice_label.setText(notice_text)
+        self._notice_label.setFixedWidth(
+            13 if icon_mode else nfm.horizontalAdvance(notice_text) + 1)
+
+    def has_checked(self) -> bool:
+        block = self._text.document().begin()
+        while block.isValid():
+            if self._marker_code(block) == MARKER_CHECK1:
+                return True
+            block = block.next()
+        return False
+
+    def uncheck_all(self) -> bool:
+        """체크한 상자를 모두 해제한다(체크 해제 예약). 글과 차례는 그대로다.
+
+        잠금을 받아 고치고 바로 놓는다(보통 편집과 같은 길이라 공유 PC 는 옛
+        버전이어도 된다). 고칠 것이 없거나 지금 고칠 수 없으면 False."""
+        if not self.has_checked():
+            return False
+        if self._edit_mode or self._pending_lock or self.is_locked_by_other():
+            return False
+        self._pending_uncheck = True
+        self._request_edit()
+        if not self._pending_lock and not self._edit_mode:
+            self._pending_uncheck = False
+            return False
+        return True
+
+    def _uncheck_blocks(self) -> bool:
+        doc = self._text.document()
+        blocks = []
+        block = doc.begin()
+        while block.isValid():
+            if self._marker_code(block) == MARKER_CHECK1:
+                blocks.append(block.blockNumber())
+            block = block.next()
+        if not blocks:
+            return False
+        cursor = QTextCursor(doc)
+        cursor.beginEditBlock()
+        try:
+            for number in blocks:
+                self._set_block_marker(doc.findBlockByNumber(number), MARKER_CHECK0)
+        finally:
+            cursor.endEditBlock()
+        return True
+
+    def _uncheck_and_release(self) -> None:
+        if self._uncheck_blocks():
+            content = self._current_content()
+            version = self._version_to_send()
+            self._pending_commit = content
+            self._content = content
+            size = self._current_open_size()
+            self.commitEdit.emit(self.note_id, content, self.color,
+                                 size.width(), size.height(), version)
+            if self._folded:
+                self._refresh_face_tip()
+            self.update()
+        self.releaseLock.emit(self.note_id)
+
+    # ── 할 일 진행률 ──
+
+    def todo_progress(self) -> str:
+        """접힌 모양에 적는 할 일 진행률('끝낸 것/모두'). 할 일이 없으면 빈 글.
+        본문이 바뀔 때만 다시 센다(문서의 판 번호로 안다)."""
+        doc = self._text.document()
+        revision = doc.revision()
+        cached = getattr(self, "_progress_cache", None)
+        if cached is not None and cached[0] == revision and cached[1] is doc:
+            return cached[2]
+        total = done = 0
+        block = doc.begin()
+        while block.isValid():
+            code = block.blockFormat().intProperty(MARKER_PROP)
+            if code in (MARKER_CHECK0, MARKER_CHECK1):
+                total += 1
+                done += code == MARKER_CHECK1
+            block = block.next()
+        text = f"{done}/{total}" if total else ""
+        self._progress_cache = (revision, doc, text)
+        return text
+
+    # ── 투명도 ──
+
+    def set_opacity(self, percent: int) -> None:
+        """바탕의 불투명도(%)를 정한다. 접힌 모양은 늘 진하다."""
+        percent = max(config.MIN_NOTE_OPACITY, min(100, int(percent)))
+        if percent != self._opacity:
+            self._opacity = percent
+            self.update()
+
+    def opacity(self) -> int:
+        return self._opacity
+
+    def _paper_alpha(self) -> float:
+        """지금 바탕을 칠할 알파. 편집 중이거나 마우스를 올리면 진하게."""
+        if self._opacity >= 100 or self._folded:
+            return 1.0
+        if self._opacity_preview:
+            return self._opacity / 100.0
+        if self._edit_mode:
+            return 1.0
+        solid = (self._settings is None
+                 or getattr(self._settings, "opacity_hover_solid", True))
+        if solid and self._opacity_hover:
+            return 1.0
+        return self._opacity / 100.0
+
+    def _set_opacity_hover(self, on: bool) -> None:
+        if on != self._opacity_hover:
+            self._opacity_hover = on
+            if self._opacity < 100:
+                self.update()
 
     def _show_text_menu(self, pos: QPoint, global_pos: QPoint) -> None:
         """본문을 우클릭했을 때의 메뉴.
@@ -1490,6 +3140,7 @@ class StickyNoteWidget(QWidget):
             menu.addSeparator()
         if self._edit_mode:
             edit_menu.add_edit_actions(menu, self._text)
+            self._add_table_actions(menu, pos)
         else:
             can_edit = not self.is_locked_by_other()
             add_centered_menu_action(
@@ -1513,6 +3164,18 @@ class StickyNoteWidget(QWidget):
                 menu, svg_icon("brush", color=ink if ready else "#B0B0B0"),
                 i18n.t("sticky.menu_format_paste"),
                 lambda: self._paste_format(pos), enabled=ready)
+        # 접기: 벽에 붙인 메모는 그 자리의 탭으로, 아니면 쪽지와 아이콘.
+        menu.addSeparator()
+        if self._dock:
+            add_centered_menu_action(menu, svg_icon("fold", color=ink),
+                                     i18n.t("sticky.tip_fold"), self.fold)
+        else:
+            add_centered_menu_action(menu, svg_icon("fold", color=ink),
+                                     i18n.t("sticky.more_fold"),
+                                     lambda: self.fold(style=nf.FOLD_SLIP))
+            add_centered_menu_action(menu, svg_icon("note", color=ink),
+                                     i18n.t("sticky.more_fold_icon"),
+                                     lambda: self.fold(style=nf.FOLD_ICON))
         edit_menu.run_menu(menu, global_pos)
         menu.deleteLater()
 
@@ -1584,9 +3247,13 @@ class StickyNoteWidget(QWidget):
         if fg == "#FFFFFF":
             self._scrollbar.set_colors(QColor(255, 255, 255, 90),
                                        QColor(255, 255, 255, 140))
+            self._hscrollbar.set_colors(QColor(255, 255, 255, 90),
+                                        QColor(255, 255, 255, 140))
         else:
             self._scrollbar.set_colors(QColor(0, 0, 0, 60),
                                        QColor(0, 0, 0, 105))
+            self._hscrollbar.set_colors(QColor(0, 0, 0, 60),
+                                        QColor(0, 0, 0, 105))
         # 글머리·체크박스와 형광펜 글자도 바탕에 맞춘다.
         self._text.set_marker_tone(fg == "#FFFFFF")
         self._keep_text_readable()
@@ -1595,6 +3262,7 @@ class StickyNoteWidget(QWidget):
         lock_color = "#E5E5E5" if fg == "#FFFFFF" else "#3A3A3A"
         self._lock_label.setStyleSheet(
             f"color: {lock_color}; font-size: 11px; background: transparent;")
+        self._apply_head_ink(lock_color, fg == "#FFFFFF")
         self._private_icon.setPixmap(
             svg_icon("lock", color=lock_color).pixmap(14, 14))
         self._history_btn.setIcon(svg_icon("clock", color=fg))
@@ -1969,12 +3637,173 @@ class StickyNoteWidget(QWidget):
             self._font_icon_state = (fg, bar)
             self._font_color_btn.setIcon(text_color_icon(fg, bar))
 
+    def _fill_list_menu(self) -> None:
+        if self._list_menu.actions():
+            return
+        # 네모는 단계에 따라 기호가 바뀌는 기본 목록이다(■ ○ – ·).
+        for code, key in ((MARKER_SQUARE, "sticky.menu_square"),
+                          (MARKER_CIRCLE, "sticky.menu_circle"),
+                          (MARKER_ARROW, "sticky.menu_arrow"),
+                          (MARKER_INFO, "sticky.menu_info")):
+            add_centered_menu_action(
+                self._list_menu, list_menu_icon(code), i18n.t(key),
+                lambda _checked=False, c=code: self._apply_bullet_marker(c))
+        self._list_menu.addSeparator()
+        add_centered_menu_action(
+            self._list_menu, list_menu_icon(MARKER_NUMBER),
+            i18n.t("sticky.menu_number"), self._apply_number_marker)
+        add_centered_menu_action(
+            self._list_menu, list_menu_icon(MARKER_CHECK0),
+            i18n.t("sticky.menu_checkbox"),
+            self._apply_checkbox_marker)
+        self._list_menu.addSeparator()
+        add_centered_menu_action(
+            self._list_menu, None, i18n.t("sticky.menu_list_off"),
+            self._remove_list_markers)
+
+    def _fill_attach_menu(self) -> None:
+        if self._attach_menu.actions():
+            return
+        add_centered_menu_action(
+            self._attach_menu, svg_icon("image"),
+            i18n.t("sticky.menu_attach_image"), self._attach_image)
+        add_centered_menu_action(
+            self._attach_menu, svg_icon("link"),
+            i18n.t("sticky.menu_attach_link"), self._insert_link)
+        add_centered_menu_action(
+            self._attach_menu, svg_icon("table"),
+            i18n.t("sticky.menu_attach_table"), self._show_table_picker)
+
     def _show_attach_menu(self) -> None:
         if not self._edit_mode:
             self._request_edit()
             return
+        self._fill_attach_menu()
         self._attach_menu.exec(self._image_btn.mapToGlobal(
             QPoint(0, self._image_btn.height())))
+
+    # ── 표 ──
+
+    def _show_table_picker(self) -> None:
+        """표의 크기를 고르는 칸. 마우스를 올린 만큼 칠해지고, 누르면 넣는다."""
+        if not self._edit_mode:
+            self._request_edit()
+            return
+        menu = edit_menu.new_menu(self)
+        picker = TableSizePicker(menu)
+        chosen: dict = {}
+        picker.picked.connect(lambda r, c: (chosen.update(size=(r, c)), menu.close()))
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(picker)
+        menu.addAction(action)
+        self._table_picker = picker      # 시험이 쓴다
+        edit_menu.run_menu(menu, self._image_btn.mapToGlobal(
+            QPoint(0, self._image_btn.height())))
+        menu.deleteLater()
+        if "size" in chosen and self._edit_mode:
+            self.insert_table(*chosen["size"])
+
+    def insert_table(self, rows: int, cols: int) -> None:
+        """커서 자리에 표를 넣는다. 글이 있는 줄이면 다음 줄에 넣는다."""
+        rows = max(1, min(TABLE_MAX_ROWS, int(rows)))
+        cols = max(1, min(TABLE_MAX_COLS, int(cols)))
+        fmt = QTextTableFormat()
+        fmt.setBorder(1)
+        fmt.setBorderStyle(QTextFrameFormat.BorderStyle_Solid)
+        fmt.setBorderBrush(QBrush(QColor(TABLE_BORDER)))
+        fmt.setBorderCollapse(True)
+        fmt.setCellPadding(4)
+        fmt.setCellSpacing(0)
+        fmt.setWidth(QTextLength(QTextLength.PercentageLength, 100))
+        cursor = self._text.textCursor()
+        cursor.beginEditBlock()
+        try:
+            inside = cursor.currentTable()
+            if inside is not None:
+                # 표 안의 표는 만들지 않는다. 그 표의 바로 다음 줄에 넣는다.
+                while inside.parentFrame() is not None and isinstance(
+                        inside.parentFrame(), type(inside)):
+                    inside = inside.parentFrame()
+                cursor.setPosition(inside.lastPosition() + 1)
+            if cursor.block().length() > 1:
+                cursor.movePosition(QTextCursor.EndOfBlock)
+                cursor.insertBlock()
+            # 목록 줄의 기호가 칸으로 따라 들어가지 않게 한다.
+            plain = QTextBlockFormat()
+            cursor.setBlockFormat(plain)
+            table = cursor.insertTable(rows, cols, fmt)
+        finally:
+            cursor.endEditBlock()
+        self._text.setTextCursor(table.cellAt(0, 0).firstCursorPosition())
+        self._widen_for_table()
+
+    def _move_table_cell(self, step: int) -> bool:
+        """Tab 으로 다음 칸, Shift+Tab 으로 앞 칸. 마지막 칸에서 Tab 은 줄을 더한다."""
+        cursor = self._text.textCursor()
+        table = cursor.currentTable()
+        if table is None:
+            return False
+        cell = table.cellAt(cursor)
+        index = cell.row() * table.columns() + cell.column() + step
+        if index < 0:
+            return True
+        if index >= table.rows() * table.columns():
+            if table.rows() >= TABLE_MAX_ROWS:
+                return True
+            table.appendRows(1)
+        row, col = divmod(index, table.columns())
+        self._text.setTextCursor(table.cellAt(row, col).firstCursorPosition())
+        return True
+
+    def _add_table_actions(self, menu: QMenu, pos: QPoint) -> None:
+        """본문을 우클릭한 자리가 표 안이면 줄과 칸을 더하고 지우는 항목."""
+        cursor = self._text.cursorForPosition(pos)
+        table = cursor.currentTable()
+        if table is None:
+            return
+        cell = table.cellAt(cursor)
+        row, col = cell.row(), cell.column()
+        ink = "#3A3A3A"
+        menu.addSeparator()
+        sub = edit_menu.new_menu(menu)
+        sub.setTitle(i18n.t("sticky.menu_table"))
+        sub.setIcon(svg_icon("table", color=ink))
+        more_rows = table.rows() < TABLE_MAX_ROWS
+        more_cols = table.columns() < TABLE_MAX_COLS
+        for key, run, ok in (
+                ("sticky.table_row_above", lambda: table.insertRows(row, 1), more_rows),
+                ("sticky.table_row_below", lambda: table.insertRows(row + 1, 1), more_rows),
+                ("sticky.table_col_left", lambda: table.insertColumns(col, 1), more_cols),
+                ("sticky.table_col_right", lambda: table.insertColumns(col + 1, 1), more_cols)):
+            add_centered_menu_action(sub, None, i18n.t(key), run, enabled=ok)
+        sub.addSeparator()
+        add_centered_menu_action(
+            sub, None, i18n.t("sticky.table_row_delete"),
+            lambda: self._remove_table_part(table, row=row))
+        add_centered_menu_action(
+            sub, None, i18n.t("sticky.table_col_delete"),
+            lambda: self._remove_table_part(table, col=col))
+        add_centered_menu_action(
+            sub, None, i18n.t("sticky.table_delete"),
+            lambda: self._remove_table_part(table))
+        menu.addMenu(sub)
+        self._table_menu = sub           # 시험이 쓴다
+
+    def _remove_table_part(self, table, *, row: int | None = None,
+                           col: int | None = None) -> None:
+        """줄이나 칸 하나를 지운다. 마지막 하나를 지우거나 둘 다 없으면 표째 지운다."""
+        if row is not None and table.rows() > 1:
+            table.removeRows(row, 1)
+            return
+        if col is not None and table.columns() > 1:
+            table.removeColumns(col, 1)
+            return
+        cursor = QTextCursor(self._text.document())
+        cursor.beginEditBlock()
+        cursor.setPosition(table.firstPosition() - 1)
+        cursor.setPosition(table.lastPosition() + 1, QTextCursor.KeepAnchor)
+        cursor.removeSelectedText()
+        cursor.endEditBlock()
 
     def _insert_link(self) -> None:
         """파일·폴더·웹 링크를 넣는다. 커서가 링크 위에 있으면 그 링크를 고친다."""
@@ -2114,6 +3943,8 @@ class StickyNoteWidget(QWidget):
                     event.accept()
                     return True
         if obj is self._text and event.type() == QEvent.KeyPress:
+            if self._edit_mode and self._mention_key(event):
+                return True
             if event.key() == Qt.Key_Escape and self._edit_mode:
                 self._commit_and_release()
                 return True
@@ -2132,12 +3963,16 @@ class StickyNoteWidget(QWidget):
         return super().eventFilter(obj, event)
 
     def _link_event(self, event) -> bool:
-        """본문 위의 마우스 이벤트 가운데 링크에 해당하는 것을 처리한다.
+        """본문 위의 마우스 이벤트 가운데 링크(와 날짜, 연락처)에 해당하는 것을 처리한다.
 
         보기 상태에서는 링크를 누르면 열고(편집으로 들어가지 않는다), 편집
         중에는 Ctrl 을 누른 채 눌러야 연다. 그냥 누르면 글자를 고친다."""
         et = event.type()
         viewport = self._text.viewport()
+        if (et in (QEvent.MouseMove, QEvent.MouseButtonPress, QEvent.MouseButtonRelease)
+                and not self._text.anchorAt(event.position().toPoint())
+                and self._smart_event(event)):
+            return True
         if et == QEvent.MouseMove:
             if event.buttons() == Qt.NoButton:
                 href = self._text.anchorAt(event.position().toPoint())
@@ -2225,6 +4060,11 @@ class StickyNoteWidget(QWidget):
                                     | Qt.AltModifier | Qt.MetaModifier)
         undo, self._auto_list_undo = self._auto_list_undo, None
         cursor = self._text.textCursor()
+        if key == Qt.Key_Tab and not mods and self._text.accept_calc():
+            return True
+        if key in (Qt.Key_Tab, Qt.Key_Backtab) and cursor.currentTable() is not None:
+            back = key == Qt.Key_Backtab or bool(mods & Qt.ShiftModifier)
+            return self._move_table_cell(-1 if back else +1)
         if key == Qt.Key_Tab and not mods:
             return self._change_level(+1)
         if key == Qt.Key_Backtab and mods in (Qt.ShiftModifier, Qt.NoModifier):
@@ -2362,6 +4202,7 @@ class StickyNoteWidget(QWidget):
             gp = event.globalPosition().toPoint()
             self.move(gp - self._drag_offset)
             self._preview_wall(gp)
+            self._preview_window_edge(gp)
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -2392,7 +4233,28 @@ class StickyNoteWidget(QWidget):
             self._drag_offset = None
             side = self._drag_dock
             avail, cursor = QRect(self._drag_avail), QPoint(self._drag_cursor)
+            target = self._attach_target
+            leaving = self._detach_pending
             self._clear_wall_preview()
+            self._clear_window_edge()
+            if target is not None and not side:
+                # 창의 끝면에 놓았다. 그 면에 딱 맞추고 그 창에 붙인다.
+                from .. import window_attach as wa
+                win, _face, (x, y) = target
+                wa.move_window(int(self.winId()), x, y)
+                self._open_pos = self.pos()
+                self.positionChanged.emit(self.note_id, self.x(), self.y())
+                if int(win.hwnd) != int(self.attached_hwnd() or 0):
+                    self.attachDropped.emit(self.note_id, int(win.hwnd))
+                event.accept()
+                return
+            if leaving and not side:
+                # 붙은 창에서 멀리 떼어 놓았다. 떨어진다(자리는 놓은 그대로).
+                self._open_pos = self.pos()
+                self.positionChanged.emit(self.note_id, self.x(), self.y())
+                self.detachRequested.emit(self.note_id)
+                event.accept()
+                return
             if side and not self._fold_busy():
                 # 벽까지 끌어다 놓았다. 그 벽의 탭으로 접는다. 펼친 자리는 끌기
                 # 전 그대로 둬서, 다시 펴면 원래 있던 곳으로 돌아온다.
@@ -2460,6 +4322,10 @@ class StickyNoteWidget(QWidget):
         super().keyPressEvent(event)
 
     def enterEvent(self, event) -> None:
+        if not self._folded:
+            self._set_opacity_hover(True)
+            if self._notice_owner:
+                self._view_timer.start()
         if self._folded and not self._fold_busy():
             self._slip_hover = True
             if self._dock and not self._slip_dragging:
@@ -2468,6 +4334,10 @@ class StickyNoteWidget(QWidget):
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
+        # 안쪽 위젯으로 옮겨 간 것은 나간 것이 아니다.
+        if not self.rect().contains(self.mapFromGlobal(QCursor.pos())):
+            self._set_opacity_hover(False)
+            self._view_timer.stop()
         if self._slip_hover:
             self._slip_hover = False
             if (self._folded and self._dock and not self._slip_dragging
@@ -2580,6 +4450,97 @@ class StickyNoteWidget(QWidget):
         self.raise_()
         self.activateWindow()
 
+    # 꺼낸 메모 알리기: 두 번 깜빡이는 테두리(움직임을 끈 PC는 잠깐 켰다 끔).
+    _FLASH_MS = 760
+    _FLASH_STEPS = ((0.0, 0.0), (0.14, 1.0), (0.36, 0.25), (0.55, 1.0), (1.0, 0.0))
+
+    def flash(self) -> None:
+        """목록에서 꺼낸 메모임을 잠깐 테두리로 알린다. 펴는 중이면 다 편 뒤에."""
+        if not self.isVisible():
+            return
+        if self._folded or self._fold_busy():
+            tries = getattr(self, "_flash_wait", 0)
+            if tries < 30:
+                self._flash_wait = tries + 1
+                QTimer.singleShot(60, self.flash)
+            return
+        self._flash_wait = 0
+        ring = getattr(self, "_flash_ring", None)
+        if ring is None:
+            ring = self._flash_ring = _FlashRing(self)
+        ring.setGeometry(self.rect())
+        ring.show()
+        ring.raise_()
+        anim = getattr(self, "_flash_anim", None)
+        if anim is not None:
+            anim.stop()
+        if not nf.system_animations_enabled():
+            ring.level = 0.9
+            ring.update()
+            QTimer.singleShot(600, self._end_flash)
+            return
+        anim = QVariantAnimation(self)
+        anim.setDuration(self._FLASH_MS)
+        for at, level in self._FLASH_STEPS:
+            anim.setKeyValueAt(at, float(level))
+
+        def step(value) -> None:
+            ring.level = float(value)
+            ring.update()
+        anim.valueChanged.connect(step)
+        anim.finished.connect(self._end_flash)
+        self._flash_anim = anim
+        anim.start()
+
+    def _end_flash(self) -> None:
+        ring = getattr(self, "_flash_ring", None)
+        if ring is not None:
+            ring.level = 0.0
+            ring.hide()
+
+    def fold_busy(self) -> bool:
+        """접거나 펴는 중인가."""
+        return self._fold_busy()
+
+    def in_view(self, share: float = 0.6) -> bool:
+        """펼쳐진 채 눈앞에 보이는가: 다른 창에 가려지거나 화면 밖에 나간 부분이
+        적은가. 메모 안의 고른 점들에서 맨 위에 있는 창이 이 메모인지 본다."""
+        if (not self.isVisible() or self._folded or self._fold_busy()
+                or self.windowOpacity() < 0.5):
+            return False
+        if platform.system() != "Windows" or QGuiApplication.platformName() != "windows":
+            return True
+        handle = self.windowHandle()
+        hwnd = int(handle.winId()) if handle is not None else int(self.winId())
+        try:
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            user32.WindowFromPoint.restype = wintypes.HWND
+            user32.WindowFromPoint.argtypes = [wintypes.POINT]
+            user32.GetAncestor.restype = wintypes.HWND
+            user32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+            user32.MonitorFromPoint.restype = wintypes.HANDLE
+            user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+            rect = wintypes.RECT()
+            if not user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
+                return True
+            w, h = rect.right - rect.left, rect.bottom - rect.top
+            seen = total = 0
+            for i in range(5):
+                for j in range(5):
+                    pt = wintypes.POINT(rect.left + int(w * (0.1 + 0.2 * i)),
+                                        rect.top + int(h * (0.1 + 0.2 * j)))
+                    total += 1
+                    if not user32.MonitorFromPoint(pt, 0):     # 화면 밖
+                        continue
+                    top = user32.WindowFromPoint(pt)
+                    root = user32.GetAncestor(top, 2) if top else None   # GA_ROOT
+                    if root and int(root) == hwnd:
+                        seen += 1
+            return seen >= share * total
+        except Exception:
+            return True
+
     def bring_to_front(self, *, start_editing: bool = False) -> None:
         """방금 만든 메모처럼 지금 바로 봐야 하는 메모를 다른 창들 위로 올린다.
 
@@ -2647,6 +4608,36 @@ class StickyNoteWidget(QWidget):
 
     def set_icon_controller(self, controller) -> None:
         self._icon_ctl = controller
+
+    # ── 모니터 구성별 자리 ──
+
+    def layout_spot(self) -> list[int] | None:
+        """모니터 구성마다 기억할 자리 [x, y, 접힌 x, 접힌 y, 접힌 자리를 둠].
+        벽에 붙인 탭과 바탕화면 아이콘 모양은 각자의 틀(벽, 아이콘 칸)을 따르므로 None."""
+        if self._dock or self._fold_busy() or (self._folded and self._icon_mode()):
+            return None
+        open_pos = self._open_pos if self._folded else self.pos()
+        fold = self.pos() if self._folded else self._fold_pos
+        fold_at = self._folded or self._fold_at
+        return [open_pos.x(), open_pos.y(), fold.x(), fold.y(), int(bool(fold_at))]
+
+    def apply_layout_spot(self, spot) -> bool:
+        """다른 때 이 모니터 구성에서 쓰던 자리로 옮긴다. 옮겼으면 True."""
+        if (self._dock or self._fold_busy() or (self._folded and self._icon_mode())
+                or not isinstance(spot, (list, tuple)) or len(spot) != 5):
+            return False
+        x, y, fx, fy, at = (int(v) for v in spot)
+        self._open_pos = self._pull_on_screen(QPoint(x, y), self._current_open_size())
+        if at:
+            self._fold_at = True
+            self._fold_pos = QPoint(fx, fy)
+        if self._folded:
+            self.setGeometry(self._folded_rect())
+            self._emit_fold_state()
+        else:
+            self.move(self._open_pos)
+        self.positionChanged.emit(self.note_id, self._open_pos.x(), self._open_pos.y())
+        return True
 
     def icon_key(self) -> str:
         return "note:" + self.note_id
@@ -3014,6 +5005,8 @@ class StickyNoteWidget(QWidget):
         self._apply_z_order()
         self.update()
         self._emit_fold_state()
+        if self._notice_owner:
+            self.viewed.emit(self.note_id)
 
     def _open_rect(self) -> QRect:
         """다시 펼 자리. 직전에 펼쳐 있던 자리 그대로다."""
@@ -3110,6 +5103,55 @@ class StickyNoteWidget(QWidget):
         self._ghost.preview(nf.tab_rect(side, along, avail), self.color,
                             self._title(), side, bool(self.private_owner),
                             self.font())
+
+    def _preview_window_edge(self, gp: QPoint) -> None:
+        """창에 붙이기를 켜 두었으면 끄는 동안 메모의 가장자리가 다른 창의 끝면에 닿는지
+        본다. 닿으면 그 창의 테두리를 파랗게, 붙은 메모를 그 창에서 멀리 떼면 회색 점선으로
+        보인다. 화면 벽에 닿아 있으면(벽에 붙는다) 보지 않는다."""
+        from .. import window_attach as wa
+        if not self._can_attach or self._drag_dock:
+            self._clear_window_edge()
+            return
+        note = wa.window_rect(int(self.winId()))
+        if note is None:
+            return
+        if self._attach_windows is None:
+            import os
+            self._attach_windows = wa.list_windows(skip_pid=os.getpid())
+        screen = QGuiApplication.screenAt(gp) or self.screen()
+        ratio = screen.devicePixelRatio() if screen is not None else 1.0
+        snap = wa.edge_snap(self._attach_windows, note, int(round(wa.EDGE_MARGIN * ratio)))
+        own_hwnd = int(self.attached_hwnd() or 0) if self._attached else 0
+        own = None
+        if own_hwnd:
+            own = next((w for w in self._attach_windows if int(w.hwnd) == own_hwnd), None) \
+                or wa.window_info(own_hwnd)
+        self._attach_target = snap
+        self._detach_pending = False
+        show, leaving = None, False
+        if snap is not None:
+            show = snap[0].rect
+        elif own is not None:
+            far = wa.rect_gap(note, own.rect) > int(round(wa.DETACH_GAP * ratio))
+            self._detach_pending = far
+            show, leaving = own.rect, far
+        if show is None:
+            if self._attach_ghost is not None:
+                self._attach_ghost.hide()
+            return
+        if self._attach_ghost is None:
+            self._attach_ghost = _AttachGhost(self)
+        left, top, right, bottom = show
+        self._attach_ghost.outline(QRect(int(left / ratio), int(top / ratio),
+                                         int((right - left) / ratio),
+                                         int((bottom - top) / ratio)), leaving=leaving)
+
+    def _clear_window_edge(self) -> None:
+        self._attach_target = None
+        self._detach_pending = False
+        self._attach_windows = None
+        if self._attach_ghost is not None:
+            self._attach_ghost.hide()
 
     def _clear_wall_preview(self) -> None:
         self._drag_dock = nf.DOCK_NONE
@@ -3468,7 +5510,8 @@ class StickyNoteWidget(QWidget):
         if self._topmost:
             _set_window_topmost(hwnd, False)
             self._topmost = False
-        if initial:
+        if initial and not getattr(self, "_attached", False):
+            # 프로그램 창에 붙은 메모는 그 창 바로 위에 선다(따라가는 쪽이 정한다).
             _pin_window_to_bottom(hwnd)
 
     def fold_state(self) -> dict[str, Any]:
@@ -3496,9 +5539,12 @@ class StickyNoteWidget(QWidget):
         super().resizeEvent(event)
         self._reposition_overlay()
         self._place_grip()
+        self._fit_chips()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        if getattr(self, "_smart_stale", False):
+            self._smart_timer.start()
         hwnd = int(self.winId())
         if not self._first_show_done:
             self._first_show_done = True
@@ -3562,25 +5608,120 @@ class StickyNoteWidget(QWidget):
                               thumb=self._fold_thumb(),
                               icon=self._icon_grid().icon,
                               selected=self._icon_selected,
-                              tint=self._marquee_tint)
+                              tint=self._marquee_tint,
+                              progress=self.todo_progress(),
+                              bell=self.has_reminder())
             else:
                 nf.paint_slip(painter, QRectF(self.rect()), self.color,
                               self._title(), dock=dock,
                               private=bool(self.private_owner),
-                              hover=self._slip_hover, font=self.font())
+                              hover=self._slip_hover, font=self.font(),
+                              progress=self.todo_progress(),
+                              bell=self.has_reminder())
             painter.end()
             return
         rect = self.rect()
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(self.color))
-        painter.drawRoundedRect(rect, config.CORNER_RADIUS, config.CORNER_RADIUS)
         bar = QColor(self.color)
         h, s, v, a = bar.getHsv()
         v = min(255, v + 18)
         s = max(0, s - 20)
         bar.setHsv(h, s, v, a)
         hb = QRect(rect.x(), rect.y(), rect.width(), config.HANDLE_BAR_HEIGHT)
+        alpha = self._paper_alpha()
+        if alpha < 0.999:
+            # 옅게: 머리 줄과 종이가 겹쳐 칠해지면 머리 줄만 진해지므로 나눠 칠한다.
+            paper = QColor(self.color)
+            paper.setAlphaF(alpha)
+            bar.setAlphaF(alpha)
+            whole = QPainterPath()
+            whole.addRoundedRect(QRectF(rect), config.CORNER_RADIUS, config.CORNER_RADIUS)
+            top = QPainterPath()
+            top.addRect(QRectF(hb))
+            painter.fillPath(whole.subtracted(top), paper)
+            painter.fillPath(whole.intersected(top), bar)
+            painter.end()
+            return
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(self.color))
+        painter.drawRoundedRect(rect, config.CORNER_RADIUS, config.CORNER_RADIUS)
         path = QPainterPath()
         path.addRoundedRect(hb, config.CORNER_RADIUS, config.CORNER_RADIUS)
         painter.fillPath(path, bar)
         painter.end()
+
+
+# 표 한 개의 줄과 칸 한도(남이 보낸 본문도 이보다 크면 잘라 그리지 않는다. 고를 때의 한도).
+TABLE_MAX_ROWS = 50
+TABLE_MAX_COLS = 12
+TABLE_BORDER = "#9A9A9A"
+
+
+class TableSizePicker(QWidget):
+    """표의 줄과 칸 수를 고르는 격자. 마우스를 올린 칸까지 칠하고 아래에 크기를 적는다.
+    화살표로 옮기고 Enter 로 고를 수도 있다."""
+
+    picked = Signal(int, int)
+    ROWS, COLS, CELL, GAP = 8, 8, 18, 3
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setAccessibleName(i18n.t("sticky.menu_attach_table"))
+        self._at = (1, 1)
+        side = self.COLS * (self.CELL + self.GAP) - self.GAP
+        self.setFixedSize(side + 16, self.ROWS * (self.CELL + self.GAP) - self.GAP + 40)
+
+    def size_text(self) -> str:
+        return i18n.t("sticky.table_size", rows=self._at[0], cols=self._at[1])
+
+    def _cell_at(self, pos) -> tuple[int, int] | None:
+        x, y = pos.x() - 8, pos.y() - 8
+        if x < 0 or y < 0:
+            return None
+        col, row = x // (self.CELL + self.GAP) + 1, y // (self.CELL + self.GAP) + 1
+        if row > self.ROWS or col > self.COLS:
+            return None
+        return int(row), int(col)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        hit = self._cell_at(event.position().toPoint())
+        if hit is not None and hit != self._at:
+            self._at = hit
+            self.update()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        hit = self._cell_at(event.position().toPoint())
+        if hit is not None and event.button() == Qt.LeftButton:
+            self._at = hit
+            self.picked.emit(*hit)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        row, col = self._at
+        moves = {Qt.Key_Left: (0, -1), Qt.Key_Right: (0, 1),
+                 Qt.Key_Up: (-1, 0), Qt.Key_Down: (1, 0)}
+        if event.key() in moves:
+            dr, dc = moves[event.key()]
+            self._at = (max(1, min(self.ROWS, row + dr)), max(1, min(self.COLS, col + dc)))
+            self.update()
+            return
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+            self.picked.emit(row, col)
+            return
+        super().keyPressEvent(event)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        for r in range(self.ROWS):
+            for c in range(self.COLS):
+                on = r < self._at[0] and c < self._at[1]
+                rect = QRectF(8 + c * (self.CELL + self.GAP), 8 + r * (self.CELL + self.GAP),
+                              self.CELL, self.CELL)
+                p.setPen(QPen(QColor("#1F2937") if on else QColor("#C9CDD3"), 1.0))
+                p.setBrush(QColor("#E8EEF6") if on else QColor("#FFFFFF"))
+                p.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), 3, 3)
+        p.setPen(QColor("#374151"))
+        p.drawText(QRectF(0, self.height() - 28, self.width(), 22), Qt.AlignCenter,
+                   self.size_text())
+        p.end()

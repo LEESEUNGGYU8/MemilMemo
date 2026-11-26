@@ -206,6 +206,38 @@ def test_a_copy_taken_over_remembers_which_sharing_it_continues(tmp_path):
         repo.close()
 
 
+def test_a_takeover_keeps_shared_reminders_notices_and_widgets(tmp_path):
+    """사본에는 메모와 폴더만 있다. 이어받는 PC 가 알던 공유 알림, 공지, 위젯 데이터를
+    함께 넣는다(사본에 없는 메모의 것과 잘못된 것은 뺀다)."""
+    from app import widgets
+    copy = ReplicaStore(tmp_path / "replica.sqlite3")
+    copy.apply_snapshot([{"id": "a", "content": "회의록", "version": 1,
+                          "updated_at": 1, "color": "#FFE066"}], [],
+                        host_id="H1", host=OTHER, address="10.0.0.5:5555", nickname=ME)
+    copy.close()
+    vote = widgets.get("vote").new_data(OTHER, question="점심", options=["밥", "면"])
+    wid = "a" * 32
+    rule = {"kind": "once", "date": "2027-01-04", "time": "09:00"}
+    extras = {
+        "reminders": {"a": {"rule": rule, "targets": [], "set_by": OTHER, "set_at": 5,
+                            "fired": 0, "snooze": 0},
+                      "gone": {"rule": rule, "targets": [], "set_by": OTHER, "set_at": 5}},
+        "notices": {"a": OTHER, "gone": OTHER},
+        "widgets": {wid: ("a", vote), "b" * 32: ("a", {"kind": "vote", "v": 99}),
+                    "c" * 32: ("gone", vote)},
+    }
+    build_host_database(tmp_path / "replica.sqlite3", tmp_path / "notes.sqlite3", ME,
+                        extras=extras)
+    repo = SqliteRepository(tmp_path / "notes.sqlite3")
+    try:
+        assert set(repo.list_reminders()) == {"a"}
+        assert repo.list_reminders()["a"]["set_by"] == OTHER
+        assert repo.list_notices() == {"a": OTHER}
+        assert set(repo.list_widgets()) == {wid}
+    finally:
+        repo.close()
+
+
 # ── 접속 창 ─────────────────────────────────────────────────────────────
 
 FOUND = [

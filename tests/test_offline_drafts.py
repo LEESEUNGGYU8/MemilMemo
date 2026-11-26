@@ -571,7 +571,7 @@ def test_notes_made_by_others_while_away_arrive_hidden(guest):
     assert state["b"].hidden and not guest.win._stickies["b"].isVisible()
     assert not state["a"].hidden                         # 보이게 둔 것은 그대로
     assert not state["mine"].hidden                      # 내 메모는 숨기지 않는다
-    assert guest.win._count_btn.text() == "전체 3개"
+    assert guest.win._place_count.text() == "3개"
 
 
 def test_notes_already_on_the_desktop_stay_after_updating(qapp, tmp_path,

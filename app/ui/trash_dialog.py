@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 from .. import i18n
 from ..datetime_fmt import fmt_relative
 from ..settings import AppSettings
+from . import window_frame
 from . import confirm, edit_menu
 from .folder_window import FolderWindow
 from .icons import svg_icon
@@ -111,6 +112,7 @@ class _Preview(QDialog):
         self._restore_btn.clicked.connect(self._restore)
         bottom.addWidget(self._restore_btn, 0, Qt.AlignBottom)
         root.addLayout(bottom)
+        window_frame.install(self, window_frame.DIALOG)
 
     def note_id(self) -> str:
         return self._note_id

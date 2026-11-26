@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import i18n
+from . import window_frame
 from .theme import RoundedScrollBar, refresh_style
 
 
@@ -102,3 +103,4 @@ class UpdateAvailableDialog(QDialog):
         button_row.addWidget(self._update_btn)
 
         root.addLayout(button_row)
+        window_frame.install(self, window_frame.DIALOG)

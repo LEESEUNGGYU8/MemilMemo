@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from .. import i18n
 from ..offline_drafts import KIND_EDIT, KIND_NEW
+from . import window_frame
 from . import confirm
 from .icons import svg_icon
 from .rich_text import has_non_checkbox_image, html_to_plain
@@ -182,6 +183,8 @@ class DraftsDialog(QDialog):
         self._keep.setDefault(True)
         self._keep.setFocus()
 
+        # 상단바를 먼저 입힌다. 높이를 내용에 맞출 때 상단바도 들어가야 한다.
+        window_frame.install(self, window_frame.DIALOG)
         self.setFixedWidth(_WIDTH)
         self._set_expanded(True)
 

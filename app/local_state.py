@@ -135,6 +135,27 @@ class LocalState:
     # 휴지통으로 간 메모가 이 PC 에서 있던 자리와 접힘(메모 id → (버린 때, 상태)).
     # 되살아나면 그대로 돌아온다. 휴지통의 보관 기간이 지나면 버린다.
     trashed: dict[str, tuple[int, NoteLocalState]] = field(default_factory=dict)
+    # 메모마다 이 PC 에서 정한 바탕의 불투명도(%, 20 ~ 99). 없으면 설정의 기본값.
+    # 메모 항목(notes)에 넣지 않는다: 1.0.6 이하는 모르는 키를 보면 파일을 버린다.
+    note_opacity: dict[str, int] = field(default_factory=dict)
+    # 모니터 구성마다 메모를 둔 자리(구성 열쇠 → 메모 id → [x, y, 접힌 x, 접힌 y,
+    # 접힌 자리를 둠]). 노트북만 쓸 때와 모니터를 꽂았을 때를 따로 기억한다.
+    screen_layouts: dict[str, dict[str, list]] = field(default_factory=dict)
+    # 이 PC 에서만 거는 메모 알림과 체크 해제 예약(메모 id → {"rule": 규칙,
+    # "set_at": 건 때, "fired": 마지막으로 처리한 회차, ...}, 때는 ms). 지운 메모의
+    # 예약은 휴지통에 있는 동안 남겨 두고 되살리면 다시 쓴다.
+    reminders: dict[str, dict] = field(default_factory=dict)
+    check_resets: dict[str, dict] = field(default_factory=dict)
+    # 공유 PC 가 나누는 알림(모두, 고른 사람)의 사본과 이 PC 의 처리 상태(메모 id →
+    # {"rule", "targets", "set_by", "set_at", "fired", "snooze", "lead"}). 공유 PC 와
+    # 끊겨 있어도 사본으로 알린다.
+    shared_reminders: dict[str, dict] = field(default_factory=dict)
+    # '항목별 합계 보기' 를 켠 메모(이 PC 설정).
+    tally_notes: list = field(default_factory=list)
+    # 메모마다 고른 자동 줄바꿈(메모 id: 켬/끔). 없으면 설정의 기본값.
+    wrap_notes: dict = field(default_factory=dict)
+    # 프로그램 창에 붙인 메모(메모 id → {"exe", "title", "corner", "dx", "dy", "label"}).
+    attachments: dict = field(default_factory=dict)
 
     def keep_trashed(self, note_id: str) -> None:
         """사라진 메모의 자리를 따로 적어 두고 메모 목록에서는 뺀다."""
@@ -188,6 +209,24 @@ class LocalState:
 
     def remove_note(self, note_id: str) -> None:
         self.notes.pop(note_id, None)
+        self.note_opacity.pop(note_id, None)
+
+    def move_note_extras(self, old_id: str, new_id: str) -> bool:
+        """메모마다 이 PC 에서 정한 것(알림, 체크 해제 예약, 투명도, 자동 줄바꿈, 항목별
+        합계, 창에 붙이기)을 다른 id 로 옮긴다. 끊긴 동안 만든 메모가 올라가 새 id 를 받을
+        때 쓴다. 옮긴 것이 있으면 True."""
+        if not old_id or not new_id or old_id == new_id:
+            return False
+        moved = False
+        for table in (self.note_opacity, self.reminders, self.check_resets,
+                      self.wrap_notes, self.attachments):
+            if old_id in table:
+                table[new_id] = table.pop(old_id)
+                moved = True
+        if old_id in self.tally_notes:
+            self.tally_notes = [new_id if n == old_id else n for n in self.tally_notes]
+            moved = True
+        return moved
 
     def touch_user(self, nickname: str, joined: bool = False, *,
                    disconnected: bool = False) -> UserRecord:
@@ -255,6 +294,81 @@ def _icon_grids_from_raw(raw: Any) -> dict[str, list]:
     return out
 
 
+def _opacity_from_raw(raw: Any) -> dict[str, int]:
+    out: dict[str, int] = {}
+    if not isinstance(raw, dict):
+        return out
+    for nid, value in raw.items():
+        if (isinstance(nid, str) and isinstance(value, int) and not isinstance(value, bool)
+                and config.MIN_NOTE_OPACITY <= value < 100):
+            out[nid] = value
+    return out
+
+
+# 예약 항목에 적는 때(ms)들. 규칙은 reminders.Rule 이 확인한다.
+_SCHEDULE_TIMES = ("set_at", "fired", "snooze", "lead", "wait")
+
+
+def _schedules_from_raw(raw: Any, known: set) -> dict[str, dict]:
+    """예약을 읽는다. 이 PC 가 모르는 메모(휴지통에서도 사라진 것)의 예약은 버린다."""
+    from .reminders import Rule
+
+    out: dict[str, dict] = {}
+    if not isinstance(raw, dict):
+        return out
+    for nid, entry in raw.items():
+        if not isinstance(nid, str) or not isinstance(entry, dict) or nid not in known:
+            continue
+        rule = Rule.from_dict(entry.get("rule"))
+        if rule is None:
+            continue
+        kept = {"rule": rule.to_dict()}
+        for key in _SCHEDULE_TIMES:
+            value = entry.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                kept[key] = value
+        out[nid] = kept
+    return out
+
+
+def _shared_from_raw(raw: Any, known: set) -> dict[str, dict]:
+    """공유 알림의 사본을 읽는다. 이 PC 가 모르는 메모의 것은 버린다."""
+    from .reminders import shared_from_dict
+
+    out: dict[str, dict] = {}
+    if not isinstance(raw, dict):
+        return out
+    for nid, entry in raw.items():
+        if not isinstance(nid, str) or not isinstance(entry, dict) or nid not in known:
+            continue
+        kept = shared_from_dict(entry)
+        if kept is None:
+            continue
+        for key in ("fired", "snooze", "lead"):
+            value = entry.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                kept[key] = value
+        out[nid] = kept
+    return out
+
+
+def _layouts_from_raw(raw: Any) -> dict[str, dict[str, list]]:
+    out: dict[str, dict[str, list]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, notes in raw.items():
+        if not isinstance(key, str) or not isinstance(notes, dict):
+            continue
+        spots = {}
+        for nid, spot in notes.items():
+            if (isinstance(nid, str) and isinstance(spot, list) and len(spot) == 5
+                    and all(isinstance(v, int) and not isinstance(v, bool) for v in spot)):
+                spots[nid] = list(spot)
+        if spots:
+            out[key] = spots
+    return out
+
+
 class LocalStateStore:
     def __init__(self, path: Path | None = None):
         self.path = path or config.default_local_state_path()
@@ -273,6 +387,8 @@ class LocalStateStore:
                 nid: _note_from_raw(v, folds.get(nid))
                 for nid, v in raw.get("notes", {}).items()
             }
+            trashed_raw = raw.get("trashed_notes")
+            known = set(notes) | (set(trashed_raw) if isinstance(trashed_raw, dict) else set())
             users: dict[str, UserRecord] = {}
             for nick, payload in raw.get("users", {}).items():
                 if not isinstance(payload, dict):
@@ -298,6 +414,24 @@ class LocalStateStore:
                             if isinstance(raw.get("share_auth"), dict) else None),
                 icon_grids=_icon_grids_from_raw(raw.get("icon_grids")),
                 trashed=_trashed_from_raw(raw.get("trashed_notes")),
+                note_opacity={k: v for k, v in _opacity_from_raw(raw.get("note_opacity")).items()
+                              if k in known},
+                screen_layouts={key: {nid: v for nid, v in layout.items() if nid in known}
+                                for key, layout in
+                                _layouts_from_raw(raw.get("screen_layouts")).items()},
+                reminders=_schedules_from_raw(raw.get("reminders"), known),
+                check_resets=_schedules_from_raw(raw.get("check_resets"), known),
+                shared_reminders=_shared_from_raw(raw.get("shared_reminders"), known),
+                # 이 PC 가 모르는 메모(지워진 지 오래된 것)의 것은 버린다. 많으면 나중 것을 둔다.
+                tally_notes=[n for n in raw.get("tally_notes")
+                             if isinstance(n, str) and n in known][-500:]
+                if isinstance(raw.get("tally_notes"), list) else [],
+                wrap_notes={k: v for k, v in (raw.get("wrap_notes") or {}).items()
+                            if isinstance(k, str) and isinstance(v, bool) and k in known}
+                if isinstance(raw.get("wrap_notes"), dict) else {},
+                attachments={k: v for k, v in (raw.get("attachments") or {}).items()
+                             if isinstance(k, str) and isinstance(v, dict) and k in known}
+                if isinstance(raw.get("attachments"), dict) else {},
             )
         except (json.JSONDecodeError, TypeError, ValueError):
             return LocalState()
@@ -328,6 +462,22 @@ class LocalStateStore:
             data["share_auth"] = self.state.share_auth
         if self.state.icon_grids:
             data["icon_grids"] = self.state.icon_grids
+        if self.state.screen_layouts:
+            data["screen_layouts"] = self.state.screen_layouts
+        if self.state.note_opacity:
+            data["note_opacity"] = dict(self.state.note_opacity)
+        if self.state.reminders:
+            data["reminders"] = self.state.reminders
+        if self.state.check_resets:
+            data["check_resets"] = self.state.check_resets
+        if self.state.shared_reminders:
+            data["shared_reminders"] = self.state.shared_reminders
+        if self.state.tally_notes:
+            data["tally_notes"] = list(self.state.tally_notes)
+        if self.state.wrap_notes:
+            data["wrap_notes"] = dict(self.state.wrap_notes)
+        if self.state.attachments:
+            data["attachments"] = dict(self.state.attachments)
         if self.state.trashed:
             data["trashed_notes"] = {
                 nid: {"at": at, **{k: getattr(v, k)

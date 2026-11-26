@@ -2,26 +2,32 @@
 
 ``capture_screenshots.py`` 가 데모 데이터로 앱을 띄운 뒤 이 모듈의 ``shoot`` 를
 부른다. 창은 전부 ``QWidget.grab()`` 으로 찍어 한 장에 배치한다. 실제 화면은
-찍지 않는다(배경과 창 테두리도 여기서 그린다).
+찍지 않는다(배경도 여기서 그린다). 창의 상단바는 앱이 직접 그리므로 찍은 그림에
+들어 있다. Windows 11 이 두르는 둥근 모서리와 테두리만 여기서 더한다.
 
 만드는 파일
     hero.png        바탕 화면 위의 메모들과 메인 창, 접힌 쪽지·아이콘, 가장자리 탭
     links.png       파일·폴더 링크가 든 메모와 링크 창
     icons.png       접힌 메모와 폴더의 모양 네 가지
-    views.png       '최근 메모' 보기 방식 여섯 가지
+    views.png       메모 목록의 보기 방식 여섯 가지
     fold.gif        접기 → 가장자리에 붙이기 → 펼치기
     fold-steps.png  같은 과정의 정지 그림(GIF 를 못 보는 곳용)
     editing.png     서식·목록·색·이미지 뷰어
     together.png    편집 중 표시, 참가자, 수정 이력
+    reminders.png   알림 창, 머리 줄의 알림과 체크 해제 표시, 알림이 울린 모습
+    widgets.png     메모 안의 위젯(투표, D-day, 그래프)과 위젯 고르기
+    notice.png      목록 맨 위의 공지, 읽은 사람, @이름 알림
 
 배율 200% 화면으로 따로 찍는 파일(``QT_SCALE_FACTOR=2`` 를 주고 돌린다)
     desktop-icons.png  아이콘으로 접은 메모와 폴더가 Windows 의 아이콘 옆에 놓인 모습
+
+``--only hero,notice`` 처럼 주면 그 장면만 찍는다.
 """
 from __future__ import annotations
 
 import io
 
-from PySide6.QtCore import QBuffer, QPointF, QRect, QRectF, QSize, QSizeF, Qt, QTimer
+from PySide6.QtCore import QBuffer, QPoint, QPointF, QRect, QRectF, QSize, QSizeF, Qt, QTimer
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -34,9 +40,9 @@ from PySide6.QtGui import (
     QPen,
     QPixmap,
 )
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget
 
-from app import config, i18n
+from app import i18n
 from app.ui import note_fold as nf
 
 INK = "#1F2937"
@@ -46,40 +52,30 @@ BACKDROP_BOTTOM = "#DCE2EA"
 # 바탕 화면 장면에 쓰는 배경(실제 화면을 찍지 않고 그린다).
 DESKTOP_A = "#243B55"
 DESKTOP_B = "#3F5F7F"
+# Windows 11 이 창에 두르는 모서리.
+WINDOW_RADIUS = 8
 
 LABELS = {
     "ko": {
-        "list": "리스트", "grid": "그리드",
-        "compact": "간략히", "standard": "표준", "detailed": "자세히",
         "step_open": "펼친 메모", "step_fold": "쪽지로 접기",
         "step_slip": "접힌 쪽지", "step_tab": "가장자리 탭",
         "step_peek": "마우스를 올리면 제목",
-        "viewer": "이미지 보기", "history": "수정 이력", "sessions": "참가자",
-        "settings": "설정", "link_dialog": "링크 고치기",
         "face_slip": "쪽지", "face_icon": "아이콘",
         "face_folder_closed": "접어 둔 폴더", "face_folder_open": "열어 둔 폴더",
         "face_tab": "가장자리 탭",
     },
     "en": {
-        "list": "List", "grid": "Grid",
-        "compact": "Compact", "standard": "Standard", "detailed": "Detailed",
         "step_open": "Open note", "step_fold": "Folding",
         "step_slip": "Folded slip", "step_tab": "Edge tab",
         "step_peek": "Hover for the title",
-        "viewer": "Image viewer", "history": "History", "sessions": "People",
-        "settings": "Settings", "link_dialog": "Edit link",
         "face_slip": "Slip", "face_icon": "Icon",
         "face_folder_closed": "Folded folder", "face_folder_open": "Open folder",
         "face_tab": "Edge tab",
     },
     "ja": {
-        "list": "リスト", "grid": "グリッド",
-        "compact": "簡略", "standard": "標準", "detailed": "詳細",
         "step_open": "開いたメモ", "step_fold": "折りたたみ",
         "step_slip": "折りたたんだ付箋", "step_tab": "端のタブ",
         "step_peek": "マウスを乗せるとタイトル",
-        "viewer": "画像ビューアー", "history": "編集履歴", "sessions": "参加者",
-        "settings": "設定", "link_dialog": "リンクを編集",
         "face_slip": "付箋", "face_icon": "アイコン",
         "face_folder_closed": "折りたたんだフォルダー",
         "face_folder_open": "開いたフォルダー", "face_tab": "端のタブ",
@@ -158,56 +154,24 @@ class Canvas:
         return self.img
 
 
-def framed(pix: QPixmap, title: str) -> QPixmap:
-    """찍은 창에 제목 줄을 붙여 창처럼 보이게 한다(grab 에는 OS 창틀이 없다)."""
-    bar = 34
-    w, h = pix.width(), pix.height()
-    out = QPixmap(w, h + bar)
-    out.fill(Qt.transparent)
-    p = QPainter(out)
-    p.setRenderHint(QPainter.Antialiasing)
-    shape = QPainterPath()
-    shape.addRoundedRect(QRectF(0, 0, w, h + bar), 9, 9)
-    p.setClipPath(shape)
-    p.fillRect(0, 0, w, bar, QColor("#F3F4F6"))
-    icon = QPixmap(str(config.ICON_PATH))
-    if not icon.isNull():
-        p.drawPixmap(QRectF(11, 9, 16, 16), icon, QRectF(icon.rect()))
-    p.setFont(_font(12))
-    p.setPen(QColor(INK))
-    p.drawText(QRectF(35, 0, w - 150, bar), Qt.AlignVCenter | Qt.AlignLeft,
-               title)
-    p.setPen(QPen(QColor("#374151"), 1.2))
-    cx = w - 116
-    p.drawLine(QPointF(cx, 17.5), QPointF(cx + 10, 17.5))
-    p.drawRect(QRectF(cx + 41, 12.5, 9.5, 9.5))
-    p.drawLine(QPointF(cx + 83, 12.5), QPointF(cx + 93, 22.5))
-    p.drawLine(QPointF(cx + 93, 12.5), QPointF(cx + 83, 22.5))
-    p.drawPixmap(0, bar, pix)
-    p.setClipping(False)
-    p.setPen(QPen(QColor(17, 24, 39, 46), 1))
-    p.setBrush(Qt.NoBrush)
-    p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h + bar - 1), 9, 9)
-    p.end()
-    return out
-
-
 def rounded(pix: QPixmap, radius: float = 10) -> QPixmap:
-    """메뉴처럼 네모나게 찍히는 그림의 모서리를 다듬는다."""
+    """네모나게 찍히는 그림(창, 메뉴)의 모서리를 다듬고 가는 테두리를 두른다.
+    창은 Windows 11 이 그리는 모양(둥근 모서리와 테두리)을 흉내 낸다."""
     out = QPixmap(pix.size())
+    out.setDevicePixelRatio(pix.devicePixelRatio())
     out.fill(Qt.transparent)
+    w = pix.width() / pix.devicePixelRatio()
+    h = pix.height() / pix.devicePixelRatio()
     p = QPainter(out)
     p.setRenderHint(QPainter.Antialiasing)
     shape = QPainterPath()
-    shape.addRoundedRect(QRectF(0, 0, pix.width(), pix.height()),
-                         radius, radius)
+    shape.addRoundedRect(QRectF(0, 0, w, h), radius, radius)
     p.setClipPath(shape)
     p.drawPixmap(0, 0, pix)
     p.setClipping(False)
     p.setPen(QPen(QColor(17, 24, 39, 40), 1))
     p.setBrush(Qt.NoBrush)
-    p.drawRoundedRect(QRectF(0.5, 0.5, pix.width() - 1, pix.height() - 1),
-                      radius, radius)
+    p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), radius, radius)
     p.end()
     return out
 
@@ -215,6 +179,11 @@ def rounded(pix: QPixmap, radius: float = 10) -> QPixmap:
 def grab(widget, harness) -> QPixmap:
     harness.settle()
     return widget.grab()
+
+
+def window_shot(widget, harness) -> QPixmap:
+    """창 하나(상단바는 앱이 그린다)에 Windows 11 의 모서리를 입힌다."""
+    return rounded(grab(widget, harness), WINDOW_RADIUS)
 
 
 def screen_scale() -> float:
@@ -239,15 +208,76 @@ def grab_popup(trigger, harness) -> QPixmap | None:
     return got[0] if got else None
 
 
+def fit_note(note, harness, width: int, height: int, limit: int = 720) -> None:
+    """메모를 ``width`` 폭으로 두고, 본문이 굴리지 않고 다 보일 때까지 키운다(언어마다
+    줄 바꿈이 달라 높이가 다르다)."""
+    note.resize(width, height)
+    harness.settle(150)
+    bar = note._text.verticalScrollBar()
+    while bar.maximum() > 0 and note.height() < limit:
+        note.resize(width, note.height() + 8)
+        harness.settle(60)
+
+
+def last_toast(window):
+    toasts = window._toasts.toasts()
+    return toasts[-1] if toasts else None
+
+
+def dialog_shot(dlg, harness) -> QPixmap:
+    """대화 상자를 띄워 찍고 닫는다. 처음 칸에 간 초점 테두리는 지운다."""
+    dlg.show()
+    harness.settle(200)
+    focus = dlg.focusWidget()
+    if focus is not None:
+        focus.clearFocus()
+    pix = window_shot(dlg, harness)
+    dlg.close()
+    dlg.deleteLater()
+    return pix
+
+
+def stack(c: "Canvas", items: list, x: float, top: float, bottom: float,
+          gap: float = 36) -> None:
+    """그림 여럿을 세로로 쌓아 ``top``~``bottom`` 의 가운데에 둔다.
+    ``items`` 는 (그림, 왼쪽 들여쓰기, place 의 선택) 목록."""
+    total = sum(p.height() / p.devicePixelRatio() for p, _dx, _kw in items)
+    total += gap * (len(items) - 1)
+    y = top + max(0.0, (bottom - top - total) / 2)
+    for pix, dx, kw in items:
+        c.place(pix, x + dx, y, **kw)
+        y += pix.height() / pix.devicePixelRatio() + gap
+
+
+def _quiet_toasts(window):
+    """알림이 소리 없이, 전체 화면 여부와 상관없이 뜨게 한다. 되돌리는 함수를 준다."""
+    from app.ui import toast as toast_mod
+    busy = toast_mod.user_is_busy
+    sound = getattr(window._settings, "reminder_sound", True)
+    toast_mod.user_is_busy = lambda: False
+    window._settings.reminder_sound = False
+
+    def restore():
+        toast_mod.user_is_busy = busy
+        window._settings.reminder_sound = sound
+        window._toasts.close_all()
+    return restore
+
+
 # ── 장면 ────────────────────────────────────────────────────────────────
 
 def _hero(window, harness) -> None:
     st = window._stickies
-    window._set_view_mode(density="standard", layout="list")
-    window.resize(380, 640)
+    window._set_view_mode(density="standard", layout="grid")
+    window.resize(780, 680)
+    window._choose_place("all")
+    window._refresh_schedule_chips()
 
     reply, lunch, deploy = st["n_reply"], st["n_lunch"], st["n_deploy"]
-    homes = {w: w.geometry() for w in (reply, lunch, deploy)}
+    info = st["n_info"]
+    homes = {w: w.geometry() for w in (reply, lunch, deploy, info)}
+    # 사무실 정보의 마지막 줄까지 보이게 한다(반쯤 잘린 줄이 남지 않게).
+    info.resize(300, 300)
     reply.fold(style=nf.FOLD_SLIP)
     lunch.fold(style=nf.FOLD_ICON)
     deploy.dock(nf.DOCK_LEFT)
@@ -260,23 +290,22 @@ def _hero(window, harness) -> None:
     # 방금 한 일의 임시 안내가 상태줄에 남지 않게 한다.
     window._status.clearMessage()
     window._refresh_status_text()
+    window._scroll.verticalScrollBar().setValue(0)
 
     c = Canvas(1600, 790, desktop=True)
-    c.place(grab(st["n_meeting"], harness), 110, 64)
-    c.place(grab(st["n_todo"], harness), 440, 64)
-    c.place(grab(st["n_plan"], harness), 804, 64)
-    c.place(grab(st["n_info"], harness), 110, 380)
-    c.place(grab(reply, harness), 440, 372, radius=10)
+    c.place(grab(st["n_meeting"], harness), 64, 56)
+    c.place(grab(st["n_todo"], harness), 396, 56)
+    c.place(grab(info, harness), 64, 352)
+    c.place(grab(reply, harness), 396, 368, radius=10)
     # 아이콘은 그림자 없이 올린다(창이 아니라 바탕 화면에 놓인 것처럼).
-    c.place(grab(lunch, harness), 446, 440, shadow=False)
-    c.place(grab(window._folder_icons["f_store"], harness), 546, 440,
+    c.place(grab(lunch, harness), 402, 436, shadow=False)
+    c.place(grab(window._folder_icons["f_store"], harness), 502, 436,
             shadow=False)
-    c.place(grab(window._folder_icons["f_me"], harness), 646, 440,
+    c.place(grab(window._folder_icons["f_me"], harness), 602, 436,
             shadow=False)
     # 가장자리 탭: 마우스를 올려 제목이 보이는 상태.
-    c.place(grab(deploy, harness), 0, 664, radius=10)
-    main = framed(grab(window, harness), i18n.t("app.name"))
-    c.place(main, 1186, 58, radius=9)
+    c.place(grab(deploy, harness), 0, 690, radius=10)
+    c.place(window_shot(window, harness), 760, 56, radius=WINDOW_RADIUS)
     harness.save(c.finish(), "hero")
 
     window._remove_folder_icon("f_store")
@@ -285,8 +314,10 @@ def _hero(window, harness) -> None:
     for w in (reply, lunch, deploy):
         w.unfold()
         w.set_fold_style(nf.FOLD_SLIP)
-        w.setGeometry(homes[w])
-        w.positionChanged.emit(w.note_id, homes[w].x(), homes[w].y())
+    for w, geo in homes.items():
+        w.setGeometry(geo)
+        w.positionChanged.emit(w.note_id, geo.x(), geo.y())
+    window._set_view_mode(density="standard", layout="list")
     harness.settle(100)
 
 
@@ -535,14 +566,14 @@ def _links(window, harness) -> None:
     dlg = LinkDialog(text=sample_text, href=href, editing=True)
     dlg.show()
     harness.settle(150)
-    dialog = framed(grab(dlg, harness), _t("link_dialog"))
+    dialog = window_shot(dlg, harness)
     dlg.close()
 
     c = Canvas(1120, 470)
     c.place(note_pix, 60, 56)
     if menu is not None:
         c.place(rounded(menu, 8), 250, 350, radius=8)
-    c.place(dialog, 560, 44, radius=9)
+    c.place(dialog, 560, 44, radius=WINDOW_RADIUS)
     harness.save(c.finish(), "links")
 
 
@@ -588,25 +619,49 @@ def _icons(window, harness) -> None:
     harness.save(c.finish(), "icons")
 
 
+def _main_area_rect(window) -> QRect:
+    """메인 창에서 옆줄과 상단바를 뺀 목록 자리(창 안의 좌표)."""
+    area = window.findChild(QWidget, "MainArea")
+    if area is None:
+        return window.rect()
+    return QRect(area.mapTo(window, QPoint(0, 0)), area.size())
+
+
 def _views(window, harness) -> None:
-    window.resize(380, 560)
-    pad, gap, head = 34, 30, 34
-    cols = ("compact", "standard", "detailed")
-    rows = ("list", "grid")
-    width = pad * 2 + 380 * 3 + gap * 2
-    height = pad + (head + 560) * 2 + gap + pad
-    c = Canvas(width, height)
-    for r, layout in enumerate(rows):
-        for i, density in enumerate(cols):
+    """목록의 보기 방식 여섯 가지(리스트와 그리드, 작게·보통·크게). 메인 창에서 목록
+    자리만 잘라 3x2 로 놓는다. 위에 크기, 왼쪽에 보기 이름을 적는다."""
+    window.resize(720, 580)
+    window._choose_place("all")
+    densities = ("compact", "standard", "detailed")
+    layouts = ("list", "grid")
+    shots: dict[tuple[str, str], QPixmap] = {}
+    for layout in layouts:
+        for density in densities:
             window._set_view_mode(density=density, layout=layout)
-            x = pad + i * (380 + gap)
-            y = pad + r * (head + 560 + gap)
-            c.text(f"{_t(layout)} · {_t(density)}",
-                   QRectF(x + 2, y, 380, head - 8), px=16)
-            c.place(rounded(grab(window, harness), 10), x, y + head, radius=10)
+            window._scroll.verticalScrollBar().setValue(0)
+            harness.settle(150)
+            whole = grab(window, harness)
+            shots[(layout, density)] = rounded(whole.copy(_main_area_rect(window)), 10)
+    cw = shots[("list", "compact")].width()
+    ch = shots[("list", "compact")].height()
+    pad, gap, head, side = 34, 30, 40, 96
+    width = pad * 2 + side + cw * 3 + gap * 2
+    height = pad + head + ch * 2 + gap + pad
+    c = Canvas(width, height)
+    for i, density in enumerate(densities):
+        x = pad + side + i * (cw + gap)
+        c.text(i18n.t(f"main.size_{density}"), QRectF(x, pad, cw, head - 10),
+               px=17, align=Qt.AlignHCenter | Qt.AlignVCenter)
+    for r, layout in enumerate(layouts):
+        y = pad + head + r * (ch + gap)
+        c.text(i18n.t(f"main.view_{layout}"), QRectF(pad, y + 8, side - 14, 28),
+               px=17)
+        for i, density in enumerate(densities):
+            x = pad + side + i * (cw + gap)
+            c.place(shots[(layout, density)], x, y, radius=10)
     harness.save(c.finish(), "views")
     window._set_view_mode(density="standard", layout="list")
-    window.resize(380, 640)
+    window.resize(780, 600)
 
 
 def _fold_frames(window, harness) -> tuple[list[QImage], list[int]]:
@@ -751,13 +806,17 @@ def _fold(window, harness) -> None:
 
 def _editing(window, harness) -> None:
     note = window._stickies["n_meeting"]
+    home = note.geometry()
     note._request_edit()
     harness.settle()
+    # 서식 줄이 나오면 본문 칸이 줄어든다. 마지막 줄(다음 회의)까지 보이게 키운다.
+    fit_note(note, harness, home.width(), home.height())
     editing = grab(note, harness)
     list_menu = grab_popup(note._list_menu.exec, harness)
     color_menu = grab_popup(note._show_color_menu, harness)
     highlight = grab_popup(note._show_highlight_menu, harness)
     note._commit_and_release()
+    note.setGeometry(home)
 
     plan = window._stickies["n_plan"]
     plan_pix = grab(plan, harness)
@@ -768,20 +827,24 @@ def _editing(window, harness) -> None:
         harness.settle(250)
         if plan._image_viewer is not None:
             plan._image_viewer.resize(560, 470)
-            viewer_pix = framed(grab(plan._image_viewer, harness), _t("viewer"))
+            viewer_pix = window_shot(plan._image_viewer, harness)
             plan._image_viewer.close()
 
-    c = Canvas(1400, 600)
-    c.place(editing, 60, 60)
-    if list_menu is not None:
-        c.place(rounded(list_menu, 8), 250, 318, radius=8)
+    # 메모 아래에 색 고르기와 형광펜, 오른쪽에 목록 메뉴.
+    color_y = 56 + editing.height() + 28
+    high_y = color_y + (color_menu.height() + 22 if color_menu is not None else 0)
+    bottom = high_y + (highlight.height() if highlight is not None else 0)
+    c = Canvas(1480, max(680, bottom + 30))
+    c.place(editing, 60, 56)
     if color_menu is not None:
-        c.place(rounded(color_menu, 8), 60, 344, radius=8)
+        c.place(rounded(color_menu, 8), 60, color_y, radius=8)
     if highlight is not None:
-        c.place(rounded(highlight, 8), 100, 450, radius=8)
-    c.place(plan_pix, 440, 60)
+        c.place(rounded(highlight, 8), 80, high_y, radius=8)
+    if list_menu is not None:
+        c.place(rounded(list_menu, 8), 386, 56 + editing.height() - 110, radius=8)
+    c.place(plan_pix, 540, 56)
     if viewer_pix is not None:
-        c.place(viewer_pix, 800, 48, radius=9)
+        c.place(viewer_pix, 900, 56, radius=WINDOW_RADIUS)
     harness.save(c.finish(), "editing")
 
 
@@ -793,22 +856,185 @@ def _together(window, harness) -> None:
 
     window._open_sessions()
     harness.settle(200)
-    sessions = framed(grab(window._sessions_dialog, harness), _t("sessions"))
-    window._sessions_dialog.close()
+    dlg = window._sessions_dialog
+    # 지난 접속자까지 굴리지 않고 보이게 한다.
+    dlg.resize(dlg.width(), max(dlg.height(), 576))
+    harness.settle(150)
+    sessions = window_shot(dlg, harness)
+    dlg.close()
 
     window._open_history()
     harness.settle(300)
     hv = window._history_viewer
-    hv.resize(760, 480)
+    hv.resize(760, 520)
     hv._list.setCurrentRow(0)
-    history = framed(grab(hv, harness), _t("history"))
+    history = window_shot(hv, harness)
     hv.close()
 
     c = Canvas(1700, 700)
-    c.place(sessions, 56, 52, radius=9)
-    c.place(history, 584, 52, radius=9)
-    c.place(locked_pix, 1356, 52)
+    c.place(sessions, 56, 52, radius=WINDOW_RADIUS)
+    c.place(history, 584, 52, radius=WINDOW_RADIUS)
+    c.place(locked_pix, 1376, 52)
     harness.save(c.finish(), "together")
+
+
+# ── 1.1 의 새 기능 ───────────────────────────────────────────────────────
+
+def _reminders(window, harness) -> None:
+    """할 일 메모의 머리 줄(알림, 체크 해제 예약), 알림 창, 체크 해제 창, 울린 알림."""
+    from app import reminders as rm
+    from app.ui import reminder_dialog as rd
+
+    nid = "n_todo"
+    note = window._stickies[nid]
+    home = note.geometry()
+    # 머리 줄의 때가 짧은 꼴로 줄지 않을 만큼 넓힌다.
+    note.resize(380, 300)
+    window._refresh_schedule_chips()
+    harness.settle(150)
+    note_pix = grab(note, harness)
+
+    st = window._local.state
+    shared = st.shared_reminders[nid]
+    rule = rm.Rule.from_dict(shared["rule"])
+    targets = list(shared["targets"])
+    remind_pix = dialog_shot(rd.ReminderDialog(
+        None, rule, mode=rd.REMIND, targets=targets,
+        people=window._reminder_people(targets),
+        me=window._client.nickname(), share=rd.SHARE_OK), harness)
+    reset_rule = rm.Rule.from_dict(st.check_resets[nid]["rule"])
+    reset_pix = dialog_shot(rd.ReminderDialog(None, reset_rule, mode=rd.RESET), harness)
+
+    # 알림이 울린 모습(소리는 끈다).
+    restore = _quiet_toasts(window)
+    try:
+        now = window._now()
+        window._ring(rm.to_ms(now), window._SHARED, nid, rule.to_dict(), now=now)
+        harness.settle(300)
+        toast = last_toast(window)
+        toast_pix = grab(toast, harness) if toast is not None else None
+    finally:
+        restore()
+    note.setGeometry(home)
+    harness.settle(100)
+
+    # 왼쪽: 메모(세로 가운데), 가운데: 알림 창, 오른쪽: 체크 해제 창과 그 아래 화면
+    # 구석에 뜨는 알림.
+    # 언어마다 창 폭이 조금 달라도 그림 크기는 같게(소개 페이지가 크기를 적어 둔다)
+    # 정해 둔 폭에 가운데로 놓는다.
+    pad, gap = 52, 44
+    rw, rh = remind_pix.width(), remind_pix.height()
+    left_w = note_pix.width()
+    content_w = left_w + gap + rw + gap + reset_pix.width()
+    width = max(1440, content_w + 2 * pad)
+    x0 = (width - content_w) // 2
+    right_x = x0 + left_w + gap + rw + gap
+    c = Canvas(width, rh + 2 * pad)
+    stack(c, [(note_pix, 0, {})], x0, pad, pad + rh)
+    c.place(remind_pix, x0 + left_w + gap, pad, radius=WINDOW_RADIUS)
+    c.place(reset_pix, right_x, pad, radius=WINDOW_RADIUS)
+    if toast_pix is not None:
+        # 알림 카드는 제 그림자(여백 10)를 품고 있다. 오른쪽 끝을 창과 맞춘다.
+        c.place(toast_pix, right_x + reset_pix.width() - toast_pix.width() + 10,
+                pad + rh - toast_pix.height() + 10, shadow=False)
+    harness.save(c.finish(), "reminders")
+
+
+def _widgets(window, harness) -> None:
+    """투표와 D-day 가 든 메모, 그래프가 든 메모, 서식 줄에서 여는 위젯 고르기."""
+    st = window._stickies
+    party, sales = st["n_party"], st["n_sales"]
+    homes = {w: w.geometry() for w in (party, sales)}
+    fit_note(party, harness, 310, 470)
+    party.resize(310, party.height() + 16)
+    harness.settle(150)
+    party_pix = grab(party, harness)
+
+    # 위젯 고르기에는 소개 글에 적은 여섯 가지만(미니게임은 설정에서 켜는 것).
+    games = window._settings.widget_games
+    window._settings.widget_games = False
+    window._apply_widget_env(sales)
+    sales.resize(360, 476)
+    harness.settle(150)
+    sales._request_edit()
+    harness.settle(200)
+    sales_pix = grab(sales, harness)
+    gallery = grab_popup(sales._show_widget_gallery, harness)
+    sales._commit_and_release()
+    window._settings.widget_games = games
+    window._apply_widget_env(sales)
+    harness.settle(100)
+    for w, geo in homes.items():
+        w.setGeometry(geo)
+
+    pad, gap = 56, 44
+    top = pad
+    height = max(party_pix.height(), sales_pix.height())
+    sales_x = pad + party_pix.width() + gap
+    gallery_x = sales_x + sales_pix.width() + gap
+    width = gallery_x + (gallery.width() if gallery is not None else 0) + pad
+    # 메모 높이는 언어마다 조금 다르다. 그림 크기는 같게 둔다.
+    c = Canvas(width, max(630, height + 2 * pad))
+    c.place(party_pix, pad, top)
+    c.place(sales_pix, sales_x, top)
+    if gallery is not None:
+        # 서식 줄의 위젯 단추로 여는 고르기 판. 두 메모 곁의 세로 가운데에 둔다.
+        stack(c, [(rounded(gallery, 8), 0, {"radius": 8})], gallery_x, top, top + height)
+    harness.save(c.finish(), "widgets")
+
+
+def _notice(window, harness) -> None:
+    """목록 맨 위에 고정된 공지, 내 공지를 읽은 사람, 나를 부른 @이름 알림."""
+    nid = "n_notice"
+    note = window._stickies[nid]
+    window._choose_place("all")
+    window._set_view_mode(density="standard", layout="list")
+    window.resize(760, 600)
+    window._refresh_notices()
+    window._scroll.verticalScrollBar().setValue(0)
+    harness.settle(200)
+    main_pix = window_shot(window, harness)
+    home = note.geometry()
+    fit_note(note, harness, home.width(), 170)
+    note.resize(home.width(), note.height() + 20)
+    harness.settle(100)
+    note_pix = grab(note, harness)
+    read_menu = grab_popup(lambda: window._show_read_list(nid), harness)
+
+    restore = _quiet_toasts(window)
+    try:
+        window._on_mentioned("n_party", harness.USER_B, 0)
+        harness.settle(300)
+        toast = last_toast(window)
+        toast_pix = grab(toast, harness) if toast is not None else None
+    finally:
+        restore()
+
+    pad, gap = 52, 48
+    mw, mh = main_pix.width(), main_pix.height()
+    right_x = pad + mw + gap
+    right_w = max(note_pix.width(), toast_pix.width() - 20 if toast_pix else 0)
+    c = Canvas(right_x + right_w + pad, mh + 2 * pad)
+    note.setGeometry(home)
+    c.place(main_pix, pad, pad, radius=WINDOW_RADIUS)
+    c.place(note_pix, right_x, pad)
+    if read_menu is not None:
+        # 머리 줄의 '읽음' 을 누르면 그 아래에 뜬다. 메모 글을 가리지 않게 메모 아래에 둔다.
+        chip = note._read_chip.mapTo(note, QPoint(0, 0))
+        c.place(rounded(read_menu, 8), right_x + chip.x() - 6,
+                pad + note_pix.height() + 14, radius=8)
+    if toast_pix is not None:
+        # 화면 구석에 뜨는 알림(제 그림자의 여백 10 을 품고 있다).
+        c.place(toast_pix, right_x + right_w - toast_pix.width() + 10,
+                pad + mh - toast_pix.height() + 10, shadow=False)
+    harness.save(c.finish(), "notice")
+
+
+SCENES = {
+    "hero": _hero, "links": _links, "icons": _icons, "views": _views,
+    "fold": _fold, "editing": _editing, "together": _together,
+    "reminders": _reminders, "widgets": _widgets, "notice": _notice,
+}
 
 
 def shoot(window, harness) -> None:
@@ -819,9 +1045,13 @@ def shoot(window, harness) -> None:
     # 아이콘 이름처럼 작은 글자가 주인공인 그림은 배율 200% 화면으로 찍어야
     # 소개 페이지에서 또렷하다. 나머지 장면은 100% 화면의 크기로 짜여 있다.
     if screen_scale() > 1.0:
-        scenes = (_desktop,)
+        scenes = [_desktop]
     else:
-        scenes = (_hero, _links, _icons, _views, _fold, _editing, _together)
+        only = [s.strip() for s in getattr(harness.ARGS, "only", "").split(",") if s.strip()]
+        unknown = [s for s in only if s not in SCENES]
+        if unknown:
+            raise SystemExit(f"모르는 장면: {', '.join(unknown)} (있는 것: {', '.join(SCENES)})")
+        scenes = [SCENES[s] for s in only] if only else list(SCENES.values())
     try:
         for scene in scenes:
             scene(window, harness)

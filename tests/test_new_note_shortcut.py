@@ -251,8 +251,8 @@ def test_stale_cursor_spot_is_not_reused(window, monkeypatch):
     monkeypatch.setattr(QCursor, "pos",
                         staticmethod(lambda: avail.topLeft() + QPoint(400, 300)))
     window.handle_ipc_command("new-note-here")       # 만들어지지 못한 요청
-    asked_at, spot = window._new_note_spots[0]
-    window._new_note_spots[0] = (asked_at - mw.NEW_NOTE_SPOT_TTL - 1, spot)
+    asked_at, spot, hint = window._new_note_spots[0]
+    window._new_note_spots[0] = (asked_at - mw.NEW_NOTE_SPOT_TTL - 1, spot, hint)
 
     window._client.deliver = True
     window._create_note(config.DEFAULT_COLOR)
@@ -322,9 +322,12 @@ def test_key(monkeypatch):
     links = (root + r"\LinkFile", root + r"\LinkFolder")
     monkeypatch.setattr(shell_menu, "LINK_KEY_PATHS", links)
     monkeypatch.setattr(shell_menu, "FOLDER_KEY_PATH", root + r"\NewNoteFolder")
+    clips = (root + r"\ClipDesktop", root + r"\ClipFile")
+    monkeypatch.setattr(shell_menu, "CLIP_KEY_PATHS", clips)
     yield root + r"\NewNote"
     for path in (root + r"\NewNote\command", root + r"\NewNote",
                  root + r"\NewNoteFolder\command", root + r"\NewNoteFolder",
+                 clips[0] + r"\command", clips[0], clips[1] + r"\command", clips[1],
                  links[0] + r"\command", links[0],
                  links[1] + r"\command", links[1], root,
                  r"Software\SyncNotesTests"):
@@ -396,8 +399,8 @@ def test_settings_dialog_toggles_the_menu(qapp, test_key, monkeypatch):
     real = shell_menu.set_registered
     monkeypatch.setattr(
         shell_menu, "set_registered",
-        lambda on, label, link="", folder="": calls.append((on, label, link, folder))
-        or real(on, label, link, folder))
+        lambda on, label, link="", folder="", clip="": calls.append(
+            (on, label, link, folder, clip)) or real(on, label, link, folder, clip))
 
     dlg = SettingsDialog(AppSettings(), role="host")
     assert not dlg._desktop_menu.isChecked()
@@ -408,13 +411,17 @@ def test_settings_dialog_toggles_the_menu(qapp, test_key, monkeypatch):
     dlg._desktop_menu.setChecked(True)
     dlg._on_accept()
     assert calls == [(True, "새 메모 추가", "새 메모에 링크로 넣기",
-                      "새 메모 폴더 추가")]
+                      "새 메모 폴더 추가", "클립보드로 새 메모")]
     assert shell_menu.is_registered()
     assert shell_menu._read()[0] == "새 메모 추가"
     # 켜면 '새 메모 폴더 추가'와 파일, 폴더의 항목도 함께 들어간다.
     assert shell_menu._read_entry(shell_menu.FOLDER_KEY_PATH)[0] == "새 메모 폴더 추가"
     for path in shell_menu.LINK_KEY_PATHS:
         assert shell_menu._read_entry(path)[0] == "새 메모에 링크로 넣기"
+    # '클립보드로 새 메모' 는 바탕 화면과 파일에 들어간다.
+    for path in shell_menu.CLIP_KEY_PATHS:
+        label, _icon, command = shell_menu._read_entry(path)
+        assert label == "클립보드로 새 메모" and "--clip-note" in command
 
     dlg = SettingsDialog(AppSettings(), role="host")
     assert dlg._desktop_menu.isChecked()        # 상태는 레지스트리에서 읽는다
@@ -624,3 +631,22 @@ def test_file_link_request_while_disconnected_shows_main_window(window, qapp):
     qapp.processEvents()
     assert window._client.created == [] and window.isVisible()
     assert window._link_note_queue == []
+
+
+def test_the_clipboard_menu_item_reaches_a_running_app():
+    """바탕 화면과 파일 우클릭 메뉴의 '클립보드로 새 메모': 실행 표시를 명령으로 바꾸고,
+    떠 있는 앱은 그 명령으로 마우스 자리에 클립보드 메모를 만든다."""
+    from app import ipc
+    assert ipc.clip_note_command(["memil.exe", "--clip-note", "--at-cursor"]) == "clip-note-here"
+    assert ipc.clip_note_command(["memil.exe", "--new-note"]) is None
+    assert "--clip-note" in shell_menu.clip_command_line()
+    assert "--at-cursor" in shell_menu.clip_command_line()
+
+    from app.ui.main_window import MainWindow
+    calls = []
+
+    class Fake:
+        handle_clip_note_request = lambda self, spot=None: calls.append(spot)  # noqa: E731
+
+    MainWindow.handle_ipc_command(Fake(), "clip-note-here")
+    assert len(calls) == 1 and calls[0] is not None

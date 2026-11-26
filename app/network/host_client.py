@@ -18,6 +18,11 @@ from ..protocol import (
     MSG_RESTORE_NOTE,
     MSG_SET_NOTE_FOLDER,
     MSG_SET_NOTE_PRIVACY,
+    MSG_SET_REMINDER,
+    MSG_SET_NOTICE,
+    MSG_SEEN,
+    MSG_WIDGET_PUT,
+    MSG_WIDGET_OP,
     MSG_UPDATE_FOLDER,
     MSG_UPDATE_NOTE,
     make,
@@ -129,3 +134,22 @@ class HostLocalClient(ClientBase):
 
     def empty_trash(self) -> None:
         self._server.handle_from_local(make(MSG_EMPTY_TRASH))
+
+    def set_reminder(self, note_id: str, reminder: dict | None,
+                     done: bool = False) -> None:
+        payload: dict = {"note_id": note_id, "reminder": reminder}
+        if done:
+            payload["done"] = True
+        self._server.handle_from_local(make(MSG_SET_REMINDER, **payload))
+
+    def set_notice(self, note_id: str, on: bool) -> None:
+        self._server.handle_from_local(make(MSG_SET_NOTICE, note_id=note_id, on=bool(on)))
+
+    def send_seen(self, note_id: str, version: int) -> None:
+        self._server.handle_from_local(make(MSG_SEEN, note_id=note_id, version=int(version)))
+
+    def put_widget(self, note_id: str, widget_id: str, data: dict) -> None:
+        self._server.handle_from_local(make(MSG_WIDGET_PUT, note_id=note_id, widget_id=widget_id, data=data))
+
+    def widget_op(self, widget_id: str, op: dict) -> None:
+        self._server.handle_from_local(make(MSG_WIDGET_OP, widget_id=widget_id, op=op))

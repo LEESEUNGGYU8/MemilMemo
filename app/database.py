@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
 from .models import Folder, HistoryEntry, Note, new_id, now_ms
+from .reminders import shared_from_dict
 
 _SCHEMA_TABLES = """
 CREATE TABLE IF NOT EXISTS notes (
@@ -56,12 +58,56 @@ CREATE TABLE IF NOT EXISTS trash (
   deleted_at INTEGER NOT NULL,
   deleted_by TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS note_reminders (
+  note_id TEXT PRIMARY KEY,
+  data    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS note_notices (
+  note_id TEXT PRIMARY KEY,
+  owner   TEXT NOT NULL,
+  set_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS note_seen (
+  note_id TEXT NOT NULL,
+  user    TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  seen_at INTEGER NOT NULL,
+  PRIMARY KEY (note_id, user)
+);
+
+CREATE TABLE IF NOT EXISTS note_widgets (
+  widget_id  TEXT PRIMARY KEY,
+  note_id    TEXT NOT NULL,
+  data       TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS participants (
+  name      TEXT PRIMARY KEY,
+  last_seen INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS note_mentions (
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  user    TEXT NOT NULL,
+  note_id TEXT NOT NULL,
+  by_user TEXT NOT NULL,
+  at      INTEGER NOT NULL
+);
 """
 # 휴지통은 표를 따로 둔다. notes 에 열을 더하면 옛 버전이 그 파일을 읽다가
 # 죽는다(모르는 열을 Note 에 그대로 넘긴다). 표가 하나 더 있는 것은 옛 버전이
 # 보지 않는다. 휴지통에 든 메모는 notes 에 deleted = 1 로 남아 있고, 이 표에는
 # 언제 누가 버렸는지만 적는다. 이 표에 없는 지운 메모(이 기능이 생기기 전에 지운
 # 것, 옛 버전이 지운 것)는 휴지통에 보이지 않고 저절로 지워지지도 않는다.
+# 공유 알림(note_reminders)도 같은 까닭으로 표를 따로 둔다. 한 줄에 알림 하나를
+# JSON 으로 적는다(reminders.shared_from_dict). 메모를 휴지통에 넣어도 남고,
+# 휴지통에서 지울 때 함께 지운다.
+# 공지(note_notices), 공지를 본 기록(note_seen), 아직 전하지 못한 @이름 알림
+# (note_mentions)도 같다(1.2). 옛 버전은 이 표들을 보지 않는다.
 
 # 인덱스를 테이블 생성과 분리해 둔다.
 # 구버전 notes 테이블에는 folder_id 컬럼이 없어,
@@ -365,8 +411,148 @@ class SqliteRepository:
         self._conn.execute(
             "DELETE FROM notes WHERE id = ? AND deleted = 1", (note_id,))
         self._conn.execute("DELETE FROM trash WHERE note_id = ?", (note_id,))
+        self._conn.execute("DELETE FROM note_reminders WHERE note_id = ?", (note_id,))
+        for table in ("note_notices", "note_seen", "note_mentions", "note_widgets"):
+            self._conn.execute(f"DELETE FROM {table} WHERE note_id = ?", (note_id,))
         self._conn.commit()
         return True
+
+    # ── 공유 알림 ──
+
+    def list_reminders(self) -> dict[str, dict]:
+        """메모 id 에서 공유 알림으로. 읽을 수 없는 줄은 건너뛴다."""
+        out: dict[str, dict] = {}
+        for row in self._conn.execute("SELECT note_id, data FROM note_reminders"):
+            try:
+                entry = shared_from_dict(json.loads(row[1]))
+            except (TypeError, ValueError):
+                continue
+            if entry is not None:
+                out[str(row[0])] = entry
+        return out
+
+    def set_reminder(self, note_id: str, entry: dict) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO note_reminders (note_id, data) VALUES (?, ?)",
+            (note_id, json.dumps(entry, ensure_ascii=False)))
+        self._conn.commit()
+
+    def delete_reminder(self, note_id: str) -> bool:
+        cur = self._conn.execute(
+            "DELETE FROM note_reminders WHERE note_id = ?", (note_id,))
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    # ── 공지, 읽음, @이름 (1.2) ──
+
+    def list_notices(self) -> dict[str, str]:
+        """공지인 메모 id 에서 만든 사람으로."""
+        return {str(r[0]): str(r[1]) for r in
+                self._conn.execute("SELECT note_id, owner FROM note_notices")}
+
+    def set_notice(self, note_id: str, owner: str) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO note_notices (note_id, owner, set_at) VALUES (?, ?, ?)",
+            (note_id, owner, now_ms()))
+        self._conn.commit()
+
+    def delete_notice(self, note_id: str) -> bool:
+        cur = self._conn.execute("DELETE FROM note_notices WHERE note_id = ?", (note_id,))
+        self._conn.execute("DELETE FROM note_seen WHERE note_id = ?", (note_id,))
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def set_seen(self, note_id: str, user: str, version: int) -> None:
+        """그 사람이 그 판(version)까지 봤다. 더 옛 판으로 돌려 적지 않는다."""
+        row = self._conn.execute(
+            "SELECT version FROM note_seen WHERE note_id = ? AND user = ?",
+            (note_id, user)).fetchone()
+        if row is not None and int(row[0]) >= version:
+            return
+        self._conn.execute(
+            "INSERT OR REPLACE INTO note_seen (note_id, user, version, seen_at) "
+            "VALUES (?, ?, ?, ?)", (note_id, user, int(version), now_ms()))
+        self._conn.commit()
+
+    def list_seen(self, note_id: str) -> dict[str, dict]:
+        return {str(r[0]): {"version": int(r[1]), "at": int(r[2])} for r in
+                self._conn.execute(
+                    "SELECT user, version, seen_at FROM note_seen WHERE note_id = ?",
+                    (note_id,))}
+
+    def list_widgets(self) -> dict[str, tuple[str, dict]]:
+        """위젯 id → (메모 id, 데이터). 읽을 수 없는 줄은 건너뛴다."""
+        out: dict[str, tuple[str, dict]] = {}
+        for row in self._conn.execute("SELECT widget_id, note_id, data FROM note_widgets"):
+            try:
+                data = json.loads(row[2])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(data, dict):
+                out[str(row[0])] = (str(row[1]), data)
+        return out
+
+    def get_widget(self, widget_id: str) -> tuple[str, dict] | None:
+        row = self._conn.execute(
+            "SELECT note_id, data FROM note_widgets WHERE widget_id = ?", (widget_id,)).fetchone()
+        if row is None:
+            return None
+        try:
+            data = json.loads(row[1])
+        except (TypeError, ValueError):
+            return None
+        return (str(row[0]), data) if isinstance(data, dict) else None
+
+    def count_widgets(self, note_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM note_widgets WHERE note_id = ?", (note_id,)).fetchone()
+        return int(row[0]) if row else 0
+
+    def put_widget(self, widget_id: str, note_id: str, data: dict) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO note_widgets (widget_id, note_id, data, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (widget_id, note_id, json.dumps(data, ensure_ascii=False), now_ms()))
+        self._conn.commit()
+
+    def touch_participant(self, name: str) -> None:
+        """이 공유에 붙은 적이 있는 사람(이름 부르기와 이름 고르기에 쓴다)."""
+        if name:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO participants (name, last_seen) VALUES (?, ?)",
+                (name, now_ms()))
+            self._conn.commit()
+
+    def list_authors(self) -> set[str]:
+        """메모를 만들거나 고친 사람(본문은 읽지 않는다)."""
+        rows = self._conn.execute(
+            "SELECT created_by FROM notes UNION SELECT updated_by FROM notes")
+        return {str(r[0]) for r in rows if r[0]}
+
+    def list_participants(self) -> list[str]:
+        return [str(r[0]) for r in self._conn.execute(
+            "SELECT name FROM participants ORDER BY last_seen DESC")]
+
+    def add_mention(self, user: str, note_id: str, by: str) -> None:
+        self._conn.execute(
+            "INSERT INTO note_mentions (user, note_id, by_user, at) VALUES (?, ?, ?, ?)",
+            (user, note_id, by, now_ms()))
+        # 한 사람에게 쌓이는 알림은 최근 50개까지.
+        self._conn.execute(
+            "DELETE FROM note_mentions WHERE user = ? AND id NOT IN ("
+            "SELECT id FROM note_mentions WHERE user = ? ORDER BY id DESC LIMIT 50)",
+            (user, user))
+        self._conn.commit()
+
+    def take_mentions(self, user: str) -> list[dict]:
+        """그 사람에게 아직 전하지 못한 알림을 꺼낸다(꺼낸 것은 지운다)."""
+        rows = self._conn.execute(
+            "SELECT note_id, by_user, at FROM note_mentions WHERE user = ? ORDER BY id",
+            (user,)).fetchall()
+        if rows:
+            self._conn.execute("DELETE FROM note_mentions WHERE user = ?", (user,))
+            self._conn.commit()
+        return [{"note_id": str(r[0]), "by": str(r[1]), "at": int(r[2])} for r in rows]
 
     def purge_trash(self, before_ms: int) -> list[str]:
         """``before_ms`` 보다 먼저 버린 메모를 메모 파일에서 지운다. 지운 메모의 id."""

@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import i18n
+from . import window_frame
 from .theme import refresh_style
 
 # 열마다의 색조. 화면에 읽히는 이름은 ``ink.<이름>`` 이다.
@@ -691,6 +692,7 @@ class ColorPicker(QDialog):
         root.addLayout(buttons)
 
         self.set_color(self._color)
+        window_frame.install(self, window_frame.DIALOG)
         self.setFixedSize(self.sizeHint())
 
     def color(self) -> QColor:

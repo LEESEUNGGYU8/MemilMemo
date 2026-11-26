@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from .. import config, i18n
 from ..local_state import UserRecord
+from . import window_frame
 from .icons import svg_icon
 from .theme import RoundedScrollBar
 
@@ -291,6 +292,7 @@ class SessionsDialog(QDialog):
         bottom.addStretch(1)
         bottom.addWidget(buttons)
         root.addLayout(bottom)
+        window_frame.install(self, window_frame.DIALOG)
 
     def refresh(
         self,

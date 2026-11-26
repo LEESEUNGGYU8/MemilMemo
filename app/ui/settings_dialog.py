@@ -4,9 +4,10 @@ import os
 import platform
 from pathlib import Path
 
-from PySide6.QtCore import QRectF, QSize, Qt, QVariantAnimation, Signal
+from PySide6.QtCore import QEvent, QRectF, QSize, Qt, QVariantAnimation, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
+    QSizePolicy,
     QButtonGroup,
     QCheckBox,
     QComboBox,
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
     QToolButton,
     QVBoxLayout,
     QWidget,
+    QScrollArea,
 )
 
 from .. import config, i18n, packaging, shell_menu
@@ -35,13 +37,15 @@ from ..settings import (
     AppSettings,
     autostart_supported,
     clamp_animation_speed,
+    clamp_transparency,
     get_windows_autostart,
     set_windows_autostart,
 )
+from . import window_frame
 from . import note_fold
 from .icons import color_swatch_icon, svg_icon
 from .number_field import DecimalField, IntField, with_unit
-from .theme import COLOR_FOCUS, color_name, refresh_style
+from .theme import COLOR_FOCUS, RoundedScrollBar, color_name, refresh_style
 
 
 _DIALOG_BUTTON_WIDTH = 112
@@ -195,6 +199,8 @@ class _Row(QWidget):
     def __init__(self, label: str, control: QWidget | None, hint: str = "",
                  *, below: bool = False, parent: QWidget | None = None):
         super().__init__(parent)
+        # 줄이 많으면 쪽이 굴러가야 한다(줄을 눌러 칸을 찌그러뜨리지 않는다).
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self._switch = control if isinstance(control, Switch) else None
         if self._switch is not None:
             self.setCursor(Qt.PointingHandCursor)
@@ -253,9 +259,29 @@ class _Page(QWidget):
     def __init__(self, title: str, note: str = "",
                  parent: QWidget | None = None):
         super().__init__(parent)
-        self._v = QVBoxLayout(self)
+        # 줄이 많으면 쪽이 굴러간다(줄을 눌러 줄이지 않는다).
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self._scroll = QScrollArea(self)
+        self._scroll.setObjectName("PageScroll")
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setVerticalScrollBar(RoundedScrollBar())
+        self._scroll.setStyleSheet("QScrollArea#PageScroll { background: transparent; }")
+        content = QWidget()
+        content.setObjectName("PageContent")
+        content.setAttribute(Qt.WA_StyledBackground, False)
+        self._scroll.setWidget(content)
+        self._scroll.viewport().setAutoFillBackground(False)
+        outer.addWidget(self._scroll)
+        self._v = QVBoxLayout(content)
         self._v.setContentsMargins(28, 22, 28, 12)
         self._v.setSpacing(0)
+        # 굴러가는 칸은 내용을 보이는 높이까지 눌러 막대를 피하려 한다. 줄이 찌그러지지
+        # 않게 내용의 가장 작은 높이를 원래 높이로 둔다(넘치면 굴러간다).
+        self._content = content
+        content.installEventFilter(self)
         heading = QLabel(title)
         heading.setObjectName("PageTitle")
         self._v.addWidget(heading)
@@ -268,6 +294,17 @@ class _Page(QWidget):
         self._v.addSpacing(8)
         self._rows = 0
 
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if obj is getattr(self, "_content", None) and event.type() in (
+                QEvent.LayoutRequest, QEvent.Resize, QEvent.Show):
+            lay = self._v
+            width = obj.width()
+            need = (lay.totalHeightForWidth(width) if lay.hasHeightForWidth() and width > 0
+                    else lay.sizeHint().height())
+            if obj.minimumHeight() != need:
+                obj.setMinimumHeight(need)
+        return super().eventFilter(obj, event)
+
     def add_row(self, label: str, control: QWidget | None = None,
                 hint: str = "", *, below: bool = False) -> _Row:
         if self._rows:
@@ -279,6 +316,16 @@ class _Page(QWidget):
         self._v.addWidget(row)
         self._rows += 1
         return row
+
+    def add_section(self, title: str) -> None:
+        """뜻이 다른 줄들을 나누는 작은 회색 제목. 그 아래 첫 줄 위에는 선이 없다."""
+        if self._rows:
+            self._v.addSpacing(18)
+        label = QLabel(title)
+        label.setProperty("role", "sectionHeader")
+        self._v.addWidget(label)
+        self._v.addSpacing(2)
+        self._rows = 0
 
     def add_layout(self, layout, top: int = 0) -> None:
         if top:
@@ -350,8 +397,8 @@ class SettingsDialog(QDialog):
                  parent: QWidget | None = None, *, solo: bool = False):
         """``solo`` 는 공유하지 않고 혼자 쓰는 중인가(그때 ``role`` 은 "host" 다)."""
         super().__init__(parent)
-        self.setWindowTitle(i18n.t("settings.window_title", app=i18n.t("app.name")))
-        self.setMinimumSize(700, 500)
+        self.setWindowTitle(i18n.t("settings.window_title"))
+        self.setMinimumSize(700, 560)
         self.setStyleSheet(_QSS)
         self._settings = settings
         self._role = role
@@ -370,7 +417,9 @@ class SettingsDialog(QDialog):
 
         for icon, title, build in (
             ("settings", i18n.t("settings.tab_general"), self._build_general_page),
+            ("keyboard", i18n.t("settings.tab_hotkeys"), self._build_hotkey_page),
             ("note", i18n.t("settings.tab_memo"), self._build_memo_page),
+            ("attach", i18n.t("settings.tab_attach"), self._build_attach_page),
             ("fold", i18n.t("settings.tab_fold"), self._build_fold_page),
             ("bell", i18n.t("settings.tab_notify"), self._build_notify_page),
             ("network", i18n.t("settings.tab_network"), self._build_network_page),
@@ -425,6 +474,9 @@ class SettingsDialog(QDialog):
         root.setSpacing(0)
         root.addWidget(nav)
         root.addLayout(right, 1)
+        bar = window_frame.install(self, window_frame.DIALOG)
+        # 내용의 최소 높이는 그대로 두고 상단바만큼 창을 늘린다.
+        self.setMinimumHeight(560 + bar.height())
 
     def show_page(self, index: int) -> None:
         """``index`` 번째 구역을 보인다."""
@@ -487,6 +539,116 @@ class SettingsDialog(QDialog):
         page.add_stretch()
         return page
 
+    # ── 단축키 ──
+
+    def set_hotkey_probe(self, probe) -> None:
+        """``probe(조합 글) -> bool``: 다른 프로그램이 쓰지 않는 키보드 조합인가."""
+        self._hotkey_probe = probe
+        self._check_hotkeys()
+
+    def _build_hotkey_page(self, title: str) -> QWidget:
+        from .. import hotkeys
+        from .global_keys import HotkeyField
+        page = _Page(title)
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 2)
+        head.setSpacing(8)
+        head.addStretch(1)
+        for key in ("hotkey.col_key", "hotkey.col_mouse"):
+            label = QLabel(i18n.t(key))
+            label.setObjectName("RowHint")
+            label.setFixedWidth(HotkeyField.WIDTH)
+            head.addWidget(label)
+        page.add_layout(head, top=6)
+        self._hotkey_probe = None
+        self._hotkey_fields: dict = {}
+        current = hotkeys.clean_bindings(self._settings.hotkeys)
+        for action in hotkeys.ACTIONS:
+            pair = QWidget()
+            pair.setFixedWidth(2 * HotkeyField.WIDTH + 8)
+            h = QHBoxLayout(pair)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(8)
+            key = HotkeyField(False, current[action]["key"], pair)
+            mouse = HotkeyField(True, current[action]["mouse"], pair)
+            h.addWidget(key)
+            h.addWidget(mouse)
+            row = page.add_row(i18n.t("hotkey.act_" + action), pair)
+            row.hint.setStyleSheet("color: #DC2626;")
+            key.changed.connect(self._check_hotkeys)
+            mouse.changed.connect(self._check_hotkeys)
+            self._hotkey_fields[action] = (key, mouse, row)
+        page.add_stretch()
+        self._check_hotkeys()
+        return page
+
+    def hotkey_values(self) -> dict:
+        return {a: {"key": k.value(), "mouse": m.value()}
+                for a, (k, m, _row) in self._hotkey_fields.items()}
+
+    def _check_hotkeys(self, *_args) -> None:
+        """다른 프로그램이 쓰는 조합과 두 일에 겹친 조합을 칸 아래에 알린다."""
+        from .. import hotkeys
+        fields = getattr(self, "_hotkey_fields", None)
+        if not fields:
+            return
+        dup = hotkeys.duplicates(self.hotkey_values())
+        probe = getattr(self, "_hotkey_probe", None)
+        for key, mouse, row in fields.values():
+            busy = bool(key.value()) and probe is not None and not probe(key.value())
+            key_dup = key.value() in dup
+            mouse_dup = mouse.value() in dup
+            key.set_problem(busy or key_dup)
+            mouse.set_problem(mouse_dup)
+            # 빨간 칸마다 까닭을 하나씩 적는다(둘 다면 두 줄).
+            lines = []
+            if busy:
+                lines.append(i18n.t("hotkey.busy"))
+            if key_dup or mouse_dup:
+                lines.append(i18n.t("hotkey.dup"))
+            row.hint.setText("\n".join(lines))
+            row.hint.setVisible(bool(lines))
+
+    # 설정에서 고를 수 있는 첨부 종류(방식이 둘 이상인 것).
+    _ATTACH_KINDS = ("text", "markdown", "table", "folder", "document", "mail", "url", "image")
+
+    def _build_attach_page(self, title: str) -> QWidget:
+        page = _Page(title)
+        page.add_section(i18n.t("settings.section_attach_files"))
+        self._build_attach_rows(page)
+        page.add_section(i18n.t("settings.section_widgets"))
+        self._widget_games = self._switch(self._settings.widget_games)
+        page.add_row(i18n.t("settings.check_widget_games"), self._widget_games)
+        page.add_stretch()
+        return page
+
+    def _build_attach_rows(self, page) -> None:
+        """'파일을 첨부할 때': 종류마다 기본 방식."""
+        from .. import file_insert
+        self._attach_boxes: dict = {}
+        current = dict(self._settings.attach_modes or {})
+        for kind in self._ATTACH_KINDS:
+            modes = file_insert.modes_for(kind)
+            if len(modes) < 2:
+                continue
+            box = QComboBox()
+            for mode in modes:
+                box.addItem(i18n.t("attach.mode_" + mode), userData=mode)
+            index = box.findData(file_insert.default_mode(kind, current))
+            box.setCurrentIndex(max(0, index))
+            page.add_row(i18n.t("attach.kind_" + kind), _field(box))
+            self._attach_boxes[kind] = box
+
+    def attach_values(self) -> dict:
+        """기본과 다르게 고른 종류만."""
+        from .. import file_insert
+        out = {}
+        for kind, box in getattr(self, "_attach_boxes", {}).items():
+            mode = box.currentData()
+            if mode and mode != file_insert.default_mode(kind, None):
+                out[kind] = mode
+        return out
+
     def _build_memo_page(self, title: str) -> QWidget:
         page = _Page(title)
 
@@ -509,10 +671,19 @@ class SettingsDialog(QDialog):
         page.add_row(i18n.t("settings.label_new_note_scope"),
                      _field(self._new_note_scope))
 
+        self._transparency = IntField(0, 100 - config.MIN_NOTE_OPACITY)
+        self._transparency.setValue(self._settings.note_transparency)
+        page.add_row(i18n.t("settings.label_transparency"),
+                     _field(with_unit(self._transparency, "%")))
+        self._opacity_hover = self._switch(self._settings.opacity_hover_solid)
+        page.add_row(i18n.t("settings.check_opacity_hover"), self._opacity_hover)
+
         self._move_checked_to_bottom = self._switch(
             self._settings.move_checked_to_bottom)
         page.add_row(i18n.t("settings.check_move_checked_to_bottom"),
                      self._move_checked_to_bottom)
+        self._word_wrap = self._switch(self._settings.word_wrap)
+        page.add_row(i18n.t("settings.check_word_wrap"), self._word_wrap)
 
         self._image_viewer = QComboBox()
         self._image_viewer.addItem(i18n.t("settings.image_viewer_builtin"),
@@ -554,17 +725,27 @@ class SettingsDialog(QDialog):
 
         self._dock_on_top = self._switch(self._settings.dock_on_top)
         page.add_row(i18n.t("settings.check_dock_on_top"), self._dock_on_top)
+        # 프로그램 창에 붙이기(실험): 메모를 둘 곳의 하나라 접기 쪽에 둔다.
+        self._window_attach = self._switch(self._settings.window_attach)
+        page.add_row(i18n.t("settings.check_window_attach"), self._window_attach)
         page.add_stretch()
         return page
 
     def _build_notify_page(self, title: str) -> QWidget:
         page = _Page(title)
+        page.add_section(i18n.t("settings.section_notify_get"))
         self._notify_new_note = self._switch(self._settings.notify_new_note)
         page.add_row(i18n.t("settings.check_notify_new_note"),
                      self._notify_new_note)
         self._notify_note_edit = self._switch(self._settings.notify_note_edit)
         page.add_row(i18n.t("settings.check_notify_note_edit"),
                      self._notify_note_edit)
+        self._reminder_sound = self._switch(self._settings.reminder_sound)
+        page.add_row(i18n.t("settings.check_reminder_sound"), self._reminder_sound)
+        page.add_section(i18n.t("settings.section_read"))
+        # 켜 두면 공지를 읽었다는 것을 만든 사람에게 알린다(설정 값은 '알리지 않기').
+        self._send_read = self._switch(not self._settings.hide_read_receipts)
+        page.add_row(i18n.t("settings.check_send_read"), self._send_read)
         page.add_stretch()
         return page
 
@@ -579,21 +760,9 @@ class SettingsDialog(QDialog):
         self._heartbeat.setValue(self._settings.default_heartbeat_ms / 1000)
         page.add_row(i18n.t("settings.label_heartbeat"), _field(with_unit(
             self._heartbeat, i18n.t("connect.unit_seconds"))))
+        # '접속 정보 바꾸기'와 '공유 시작'은 메인 창 상단바의 본인 아이콘(접속 정보)과
+        # 트레이 메뉴에 있다.
         page.add_stretch()
-
-        actions = QHBoxLayout()
-        actions.setContentsMargins(0, 0, 0, 0)
-        actions.setSpacing(8)
-        actions.addStretch(1)
-        if self._solo:
-            # 혼자 쓰던 메모를 다른 PC 와 나눈다. 그다음부터는 공유 PC 로 켜진다.
-            actions.addWidget(self._action_button(
-                i18n.t("settings.btn_share_start"), self.shareRequested.emit))
-        # 다음에 켤 때 시작 방식을 다시 고른다(트레이 메뉴에도 있다).
-        actions.addWidget(self._action_button(
-            i18n.t("main.tray_change_connection"),
-            self.resetConnectionRequested.emit))
-        page.add_layout(actions, top=8)
         return page
 
     def _build_backup_page(self, title: str) -> QWidget:
@@ -781,12 +950,22 @@ class SettingsDialog(QDialog):
             shell_menu.set_registered(
                 want_menu, i18n.t("shell.new_note_title"),
                 i18n.t("shell.link_note_title"),
-                i18n.t("shell.new_folder_title"))
+                i18n.t("shell.new_folder_title"),
+                i18n.t("shell.clip_note_title"))
 
         s.new_note_private = bool(self._new_note_scope.currentData())
         s.notify_new_note = self._notify_new_note.isChecked()
         s.notify_note_edit = self._notify_note_edit.isChecked()
+        s.reminder_sound = self._reminder_sound.isChecked()
+        s.hide_read_receipts = not self._send_read.isChecked()
+        s.hotkeys = self.hotkey_values()
+        s.attach_modes = self.attach_values()
+        s.window_attach = self._window_attach.isChecked()
+        s.widget_games = self._widget_games.isChecked()
         s.move_checked_to_bottom = self._move_checked_to_bottom.isChecked()
+        s.word_wrap = self._word_wrap.isChecked()
+        s.note_transparency = clamp_transparency(self._transparency.value())
+        s.opacity_hover_solid = self._opacity_hover.isChecked()
         s.image_viewer = self._image_viewer.currentData() or IMAGE_VIEWER_BUILTIN
         s.fold_style = self._fold_style.currentData() or "slip"
         s.fold_animation = self._fold_animation.isChecked()

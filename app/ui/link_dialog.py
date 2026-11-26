@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 
 from .. import file_links as fl
 from .. import i18n
+from . import window_frame
 from .link_icons import link_icon_pixmap
 
 # 번역 키 검사기가 글자 그대로 적힌 호출만 세므로, 표에 키 이름만 두지 않고
@@ -175,6 +176,7 @@ class LinkDialog(QDialog):
             self._text_edit.setFocus()
         elif not href:
             self._target_edit.setFocus()
+        window_frame.install(self, window_frame.DIALOG)
 
     # ── 찾아보기 ────────────────────────────────────────────────────────
 

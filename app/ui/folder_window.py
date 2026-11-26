@@ -37,6 +37,7 @@ from ..settings import (
     VIEW_LIST,
     VIEW_STANDARD,
 )
+from . import window_frame
 from . import edit_menu
 from . import note_fold as nf
 from .icons import svg_icon
@@ -394,6 +395,7 @@ class FolderWindow(QWidget):
 
         self._has_notes = False
         self._refresh_view()
+        window_frame.install(self, window_frame.WINDOW)
 
     @staticmethod
     def _scroller(inner: QWidget, background: str) -> QScrollArea:
