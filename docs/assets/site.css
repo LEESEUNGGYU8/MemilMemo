@@ -318,6 +318,9 @@ h2 {
   line-height: 1.25; font-weight: 800;
 }
 :lang(ja) h2 { letter-spacing: -0.01em; }
+/* 구역 제목 아래의 한 줄 소개. */
+h2 + .intro { margin: -14px 0 18px; max-width: 46em; color: var(--ink-soft); font-size: 17px; }
+.intro a { color: var(--ink); font-weight: 600; }
 
 /* ── 시작하기 ──
    단계마다 메밀메모의 메모 창 한 장이다. 색(메모 색과 그보다 옅은 머리 줄),
@@ -433,6 +436,7 @@ footer {
 .doc .lead { margin: 26px 0 0; font-weight: 700; font-size: 20px; }
 /* 형광펜: 첫 화면의 제목과 같은 방식이다. */
 .doc .lead span { background: linear-gradient(var(--paper), var(--paper)) no-repeat 0 88% / 100% 0.42em; }
+.doc .intro { margin: 12px 0 0; color: var(--ink-soft); }
 .doc h2 { margin: 0 0 6px; font-size: 20px; letter-spacing: -0.02em; line-height: inherit; font-weight: 700; }
 .doc section { padding: 22px 0; }
 .doc section:first-of-type { margin-top: 30px; }
